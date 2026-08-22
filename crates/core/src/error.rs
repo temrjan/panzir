@@ -55,4 +55,16 @@ pub enum Error {
     /// HOME не установлен или пуст — путь симлинка построить нельзя.
     #[error("HOME is unset or empty")]
     NoHome,
+
+    /// Другой процесс panzir уже запущен (advisory flock не получен).
+    #[error("panzir is already running")]
+    AlreadyRunning,
+
+    /// Запись с такой меткой не найдена в реестре.
+    #[error("vault not found: {0}")]
+    VaultNotFound(String),
+
+    /// Метка уже занята в реестре.
+    #[error("duplicate vault label: {0}")]
+    DuplicateLabel(String),
 }

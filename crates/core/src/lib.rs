@@ -9,6 +9,11 @@
 pub mod create;
 pub mod deps;
 pub mod error;
+pub mod header;
+pub mod keyslot;
+pub mod mountpoint;
+pub mod passphrase;
+pub mod registry;
 pub mod udisks;
 pub mod vault;
 

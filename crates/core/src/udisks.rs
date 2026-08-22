@@ -142,6 +142,11 @@ trait Block {
     /// на расшифрованном устройстве, а параметры шифрования уходят опциями
     /// `encrypt.type` / `encrypt.passphrase`.
     fn format(&self, type_: &str, options: Options<'_>) -> zbus::Result<()>;
+
+    /// Пересканировать заголовок устройства. Нужен после внешних изменений
+    /// заголовка LUKS (например, `cryptsetup luksAddKey`), чтобы udisks2
+    /// снова предоставил интерфейс `Encrypted`.
+    fn rescan(&self, options: Options<'_>) -> zbus::Result<()>;
 }
 
 #[proxy(
@@ -315,6 +320,16 @@ impl Udisks {
     pub async fn lock(&self, block_object: &ObjPath) -> Result<()> {
         let enc = self.encrypted_proxy(block_object).await?;
         Ok(enc.lock(no_interaction_options()).await?)
+    }
+
+    /// Пересканировать блочное устройство (после изменения LUKS-заголовка
+    /// вне udisks2, например `cryptsetup luksAddKey`).
+    pub async fn rescan(&self, block_object: &ObjPath) -> Result<()> {
+        let block = BlockProxy::builder(&self.conn)
+            .path(block_object.as_zbus()?)?
+            .build()
+            .await?;
+        Ok(block.rescan(no_options()).await?)
     }
 
     /// Штатное закрытие зашифрованного тома на loop-контейнере.
