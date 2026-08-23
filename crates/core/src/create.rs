@@ -71,10 +71,11 @@ async fn fs_type(path: &Path) -> Result<String> {
 /// с `noexec`.
 ///
 /// # Errors
-/// Все системные шаги могут упасть: см. [`Error`]. При ЛЮБОЙ ошибке после
-/// создания файла мастер убирает за собой полностью (unmount → autoclear →
-/// lock → loop → файл) и возвращает исходную ошибку — недоделанных
-/// контейнеров и занятых путей не остаётся.
+/// Все системные шаги могут упасть: см. [`Error`]. При любой ошибке до
+/// поднятия loop-устройства файл удаляется здесь. При ошибке после поднятия
+/// loop уборку выполняет [`teardown_file_container`], которая удаляет файл
+/// только после подтверждения отвязки loop от sysfs. Исходная ошибка
+/// возвращается наружу в любом случае.
 pub async fn create_file_container(
     ud: &Udisks,
     path: &Path,
@@ -118,10 +119,9 @@ pub async fn create_file_container(
 
 /// Ошибка создания с фазой, на которой она произошла: до или после поднятия
 /// loop-устройства. Фаза определяет, кто и когда может удалить файл контейнера.
-#[allow(dead_code)]
 enum SetupError {
     BeforeLoop { source: Error },
-    AfterLoop { loop_object: ObjPath, source: Error },
+    AfterLoop { source: Error },
 }
 
 /// Всё после создания файла: подготовка ФС и работа с устройством.
@@ -181,10 +181,7 @@ async fn prepare_and_format(
             if let Err(e) = teardown_file_container(ud, &loop_object, path).await {
                 tracing::warn!("prepare_and_format: teardown after error: {e}");
             }
-            Err(SetupError::AfterLoop {
-                loop_object,
-                source,
-            })
+            Err(SetupError::AfterLoop { source })
         }
     }
 }
@@ -220,10 +217,14 @@ pub async fn teardown_file_container(
 
     // 4. Только после подтверждения отвязки удаляем файл.
     if crate::udisks::loop_detached_in_sysfs(loop_object) {
-        if let Err(e) = tokio::fs::remove_file(container).await {
-            tracing::warn!("teardown: failed to remove {}: {e}", container.display());
+        match tokio::fs::remove_file(container).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                tracing::warn!("teardown: failed to remove {}: {e}", container.display());
+                Err(Error::from(e))
+            }
         }
-        Ok(())
     } else {
         Err(Error::UnexpectedUdisksState(format!(
             "stale loop device left for {loop_object}; refusing to remove {}",

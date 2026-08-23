@@ -5,6 +5,38 @@ POLKIT_RULE="/etc/polkit-1/rules.d/99-panzir-test.rules"
 ORIG_AUTOMOUNT=""
 USER_NAME=$(id -un)
 
+# T-3 (btrfs) ищет каталог в PANZIR_IT_DIR. Если переменная не задана, а $HOME
+# лежит на btrfs — используем его, чтобы тест бежал из коробки на Fedora.
+if [[ -z "${PANZIR_IT_DIR:-}" ]] && command -v stat >/dev/null; then
+    if [[ "$(stat -f -c %T "$HOME")" == "btrfs" ]]; then
+        export PANZIR_IT_DIR="$HOME"
+    fi
+fi
+
+# Проверяет, что путь — наш тестовый контейнер (не продуктовый vault).
+# Разрешённые места: /tmp/.tmpXXXXX/ или $PANZIR_IT_DIR/.
+# Разрешённое имя: panzir-tN.vault или panzir-tN-PID.vault (T-3).
+is_our_test_container() {
+    local path="$1"
+    local dir base
+    dir=$(dirname "$path")
+    base=$(basename "$path")
+
+    local in_tmp=false
+    if [[ "$dir" == /tmp || "$dir" == /tmp/* ]]; then
+        in_tmp=true
+    fi
+    local in_it_dir=false
+    if [[ -n "${PANZIR_IT_DIR:-}" && ( "$dir" == "$PANZIR_IT_DIR" || "$dir" == "$PANZIR_IT_DIR"/* ) ]]; then
+        in_it_dir=true
+    fi
+
+    if [[ "$in_tmp" == false && "$in_it_dir" == false ]]; then
+        return 1
+    fi
+    [[ "$base" =~ ^panzir-t[0-9]+(-[0-9]+)?\.vault$ ]]
+}
+
 sweep_panzir() {
     if ! command -v udisksctl >/dev/null; then
         return
@@ -16,47 +48,52 @@ sweep_panzir() {
     while [[ "$changed" == true && $attempt -lt 10 ]]; do
         changed=false
         for backing in /sys/block/loop*/loop/backing_file; do
-            if [[ -f "$backing" ]] && grep -qE "panzir-.*\.vault" "$backing" 2>/dev/null; then
-                loop_name=$(basename "$(dirname "$(dirname "$backing")")")
-                loop_dev="/dev/$loop_name"
-
-                # Запоминаем путь к файлу контейнера до разрушения loop.
-                local vault_path=""
-                vault_path=$(cat "$backing" 2>/dev/null | sed 's/ (deleted)$//')
-
-                # Сначала размонтировать детей (dm-crypt / точка монтирования), не сам loop.
-                for child in $(lsblk -nro PATH "$loop_dev" | tail -n +2); do
-                    udisksctl unmount -b "$child" --no-user-interaction || true
-                done
-
-                udisksctl lock -b "$loop_dev" --no-user-interaction || true
-                udisksctl loop-delete -b "$loop_dev" --no-user-interaction || true
-
-                # Удаляем файл по пути из backing_file, если он ещё не удалён.
-                if [[ -n "$vault_path" && -f "$vault_path" ]]; then
-                    rm -f "$vault_path" || true
-                fi
-
-                changed=true
+            if [[ ! -f "$backing" ]]; then
+                continue
             fi
+            local vault_path=""
+            vault_path=$(cat "$backing" 2>/dev/null | sed 's/ (deleted)$//' || true)
+            if [[ -z "$vault_path" ]] || ! is_our_test_container "$vault_path"; then
+                continue
+            fi
+
+            local loop_name loop_dev
+            loop_name=$(basename "$(dirname "$(dirname "$backing")")")
+            loop_dev="/dev/$loop_name"
+
+            # Сначала размонтировать детей (dm-crypt / точка монтирования), не сам loop.
+            for child in $(lsblk -nro PATH "$loop_dev" | tail -n +2); do
+                udisksctl unmount -b "$child" --no-user-interaction || true
+            done
+
+            udisksctl lock -b "$loop_dev" --no-user-interaction || true
+            udisksctl loop-delete -b "$loop_dev" --no-user-interaction || true
+
+            # Удаляем файл по пути из backing_file, если он ещё не удалён.
+            if [[ -f "$vault_path" ]]; then
+                rm -f "$vault_path" || true
+            fi
+
+            changed=true
         done
         ((attempt++)) || true
         sleep 1
     done
 
-    # 2. Убрать оставшиеся .vault-файлы.
-    find /tmp -maxdepth 2 -name 'panzir-*.vault' -delete 2>/dev/null || true
+    # 2. Убрать оставшиеся .vault-файлы в разрешённых каталогах.
+    find /tmp -maxdepth 2 -name 'panzir-t[0-9]*.vault' -delete 2>/dev/null || true
     if [[ -n "${PANZIR_IT_DIR:-}" ]]; then
-        find "$PANZIR_IT_DIR" -maxdepth 1 -name 'panzir-*.vault' -delete 2>/dev/null || true
+        find "$PANZIR_IT_DIR" -maxdepth 1 -name 'panzir-t[0-9]*.vault' -delete 2>/dev/null || true
     fi
-    find "$HOME" -maxdepth 1 -name 'panzir-*' -type l -delete 2>/dev/null || true
 }
 
 cleanup() {
     sweep_panzir
 
-    # Восстановление настроек.
-    if [[ -f "$POLKIT_RULE" ]] && grep -q "panzir-test-rule" "$POLKIT_RULE"; then
+    # Восстановление настроек. Свип выполнен первым: loop-delete после Lock
+    # работает только пока polkit-правило даёт нашему uid право на операции
+    # с loop-устройством.
+    if sudo test -f "$POLKIT_RULE"; then
         sudo rm -f "$POLKIT_RULE"
     fi
     if [[ -n "$ORIG_AUTOMOUNT" ]] && command -v gsettings >/dev/null; then

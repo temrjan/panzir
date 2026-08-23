@@ -576,6 +576,46 @@ pub(crate) fn loop_detached_in_sysfs(loop_object: &ObjPath) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::TryInto as _;
+    use zbus::Message;
+
+    fn dummy_udisks_error(name: &str, desc: Option<&str>) -> zbus::Error {
+        let msg = Message::method_call("/org/freedesktop/UDisks2", "Lock")
+            .expect("dummy method call")
+            .build(&())
+            .expect("dummy message");
+        zbus::Error::MethodError(
+            name.to_owned().try_into().expect("valid error name"),
+            desc.map(|s| s.to_owned()),
+            msg,
+        )
+    }
+
+    #[test]
+    fn is_retryable_unmount_recognizes_busy_and_stale_mount() {
+        assert!(Udisks::is_retryable_unmount(&Error::Udisks(
+            dummy_udisks_error("org.freedesktop.UDisks2.Error.DeviceBusy", None,)
+        )));
+        assert!(Udisks::is_retryable_unmount(&Error::Udisks(
+            dummy_udisks_error(
+                "org.freedesktop.UDisks2.Error.Failed",
+                Some("Failed to deactivate device: Device or resource busy"),
+            )
+        )));
+        assert!(Udisks::is_retryable_unmount(&Error::UnexpectedUdisksState(
+            "still mounted after unmount: /org/freedesktop/UDisks2/block_devices/dm_2d0".to_owned(),
+        )));
+
+        assert!(!Udisks::is_retryable_unmount(&Error::Udisks(
+            dummy_udisks_error(
+                "org.freedesktop.UDisks2.Error.Failed",
+                Some("some other failure"),
+            )
+        )));
+        assert!(!Udisks::is_retryable_unmount(&Error::Io(
+            std::io::Error::other("device or resource busy")
+        )));
+    }
 
     #[test]
     fn loop_sysfs_path_parsing() {
