@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{FlockOperation, flock};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use tokio::io::AsyncWriteExt as _;
 use tokio::task;
 
 use crate::vault::{Label, VaultKind, VaultState};
@@ -135,6 +136,10 @@ impl Registry {
     /// Загрузить реестр из указанного пути. Если файла нет — вернуть пустой.
     pub async fn load_from(path: &Path) -> Result<Self> {
         match fs::read_to_string(path).await {
+            Ok(text) if text.trim().is_empty() => Ok(Self {
+                path: path.to_owned(),
+                entries: Vec::new(),
+            }),
             Ok(text) => Self::parse(path, &text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {
                 path: path.to_owned(),
@@ -145,9 +150,8 @@ impl Registry {
     }
 
     fn parse(path: &Path, text: &str) -> Result<Self> {
-        let stored: StoredRegistry = toml::from_str(text).map_err(|e| {
-            Error::UnexpectedUdisksState(format!("cannot parse registry {path:?}: {e}"))
-        })?;
+        let stored: StoredRegistry = toml::from_str(text)
+            .map_err(|e| Error::Registry(format!("cannot parse registry {path:?}: {e}")))?;
         let entries = stored
             .vaults
             .into_iter()
@@ -190,9 +194,9 @@ impl Registry {
     where
         F: FnOnce(&mut Registry) -> Result<T>,
     {
-        let parent = path.parent().ok_or_else(|| {
-            Error::UnexpectedUdisksState("registry path has no parent".to_owned())
-        })?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Registry("registry path has no parent".to_owned()))?;
         fs::create_dir_all(parent).await.map_err(Error::Io)?;
         fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
             .await
@@ -242,10 +246,14 @@ impl Registry {
         .map_err(|e| Error::Io(std::io::Error::other(e)))?
         .map_err(Error::Io)?;
 
-        let mut registry = Self::parse(path, &text).unwrap_or_else(|_| Self {
-            path: path.to_owned(),
-            entries: Vec::new(),
-        });
+        let mut registry = if text.trim().is_empty() {
+            Self {
+                path: path.to_owned(),
+                entries: Vec::new(),
+            }
+        } else {
+            Self::parse(path, &text)?
+        };
 
         let result = f(&mut registry);
 
@@ -283,12 +291,36 @@ impl Registry {
         let text = toml::to_string(&stored)
             .map_err(|e| Error::UnexpectedUdisksState(format!("cannot serialize registry: {e}")))?;
 
-        let temp = self.path.with_extension("tmp");
-        fs::write(&temp, text).await.map_err(Error::Io)?;
-        fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
-            .await
-            .map_err(Error::Io)?;
-        fs::rename(&temp, &self.path).await.map_err(Error::Io)?;
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp = self
+            .path
+            .with_extension(format!("tmp.{}-{}", std::process::id(), uniq));
+
+        let write_result = async {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temp)
+                .await?;
+            file.write_all(text.as_bytes()).await?;
+            file.flush().await?;
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&temp).await;
+            return Err(Error::Io(e));
+        }
+
+        if let Err(e) = fs::rename(&temp, &self.path).await {
+            let _ = fs::remove_file(&temp).await;
+            return Err(Error::Io(e));
+        }
         Ok(())
     }
 

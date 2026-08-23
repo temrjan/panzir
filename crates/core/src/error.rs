@@ -52,6 +52,10 @@ pub enum Error {
     #[error("unexpected udisks2 state: {0}")]
     UnexpectedUdisksState(String),
 
+    /// Ошибка реестра (парсинг, сохранение, повреждение).
+    #[error("registry: {0}")]
+    Registry(String),
+
     /// HOME не установлен или пуст — путь симлинка построить нельзя.
     #[error("HOME is unset or empty")]
     NoHome,

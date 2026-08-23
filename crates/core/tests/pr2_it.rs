@@ -6,6 +6,15 @@
 //! Т-9 (No_COW на btrfs) покрыт в `create_it.rs` (PR-1) и здесь не дублируется.
 //!
 //! Запуск на целевой Fedora:
+//! `scripts/run-it-tests.sh` — готовит среду (polkit-правило, отключает GNOME-автомонт)
+//! и запускает оба IT-сьюта.
+//!
+//! Ручной запуск требует:
+//! - установленного `/etc/polkit-1/rules.d/99-panzir-test.rules` для нашего uid,
+//! - отключённого GNOME-автомонта: `gsettings set org.gnome.desktop.media-handling automount false`,
+//! - переменной `PANZIR_IT=1`.
+//!
+//! Прямая команда:
 //! `PANZIR_IT=1 cargo test -p panzir-core --test pr2_it -- --ignored`
 
 // expect/unwrap в тестах — осознанно (закон №3: unwrap/expect только в тестах и main).
@@ -15,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use futures_util::StreamExt as _;
-use panzir_core::create::{CreatedVault, create_file_container};
+use panzir_core::create::{CreatedVault, create_file_container, teardown_file_container};
 use panzir_core::header::{HeaderBackupWarning, backup_header_from_file};
 use panzir_core::keyslot::add_keyslot_to_file;
 use panzir_core::mountpoint::{create_symlink, read_symlink, remove_symlink};
@@ -34,41 +43,17 @@ fn sh(cmd: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
 }
 
 fn require_it_flag() {
-    if std::env::var_os("PANZIR_IT").is_none() {
-        eprintln!("SKIP: set PANZIR_IT=1 to run live integration tests");
-        std::process::exit(0);
-    }
-}
-
-/// Есть ли loop, привязанный к этому файлу — по sysfs.
-fn loop_attached_to(container: &Path) -> bool {
-    std::fs::read_dir("/sys/block")
-        .into_iter()
-        .flatten()
-        .filter_map(std::result::Result::ok)
-        .filter_map(|e| std::fs::read_to_string(e.path().join("loop/backing_file")).ok())
-        .any(|backing| {
-            backing.trim().trim_end_matches(" (deleted)") == container.display().to_string()
-        })
+    assert!(
+        std::env::var_os("PANZIR_IT").is_some(),
+        "PANZIR_IT=1 is required to run live integration tests"
+    );
 }
 
 /// Штатная уборка за тестом — тот же продовый путь, что в `create_it.rs`.
 async fn cleanup(ud: &Udisks, created: &CreatedVault, container: &Path) {
-    if let Err(e) = ud.close_encrypted(&created.loop_object).await {
-        eprintln!("cleanup: close_encrypted failed: {e}");
-    }
-    let mut stale = true;
-    for _ in 0..25 {
-        if !loop_attached_to(container) {
-            stale = false;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    if let Err(e) = std::fs::remove_file(container) {
-        eprintln!("cleanup: remove file failed: {e}");
-    }
-    assert!(!stale, "stale loop device left behind for {container:?}");
+    teardown_file_container(ud, &created.loop_object, container)
+        .await
+        .expect("cleanup must not leave a stale loop");
 }
 
 /// Т-3: второй keyslot реально работает — `luksDump` видит 2 слота,
@@ -186,14 +171,10 @@ async fn t3_second_keyslot_works() {
         .await
         .expect("unmount after second unlock");
 
-    // cleanup для нового loop: close_encrypted удалит и loop, и файл.
-    let dummy_mount = PathBuf::from("/tmp/panzir-t3-dummy");
-    let created_for_cleanup = CreatedVault {
-        loop_object: new_loop,
-        cleartext_object: ct2,
-        mount_point: dummy_mount,
-    };
-    cleanup(&ud, &created_for_cleanup, &container).await;
+    // cleanup для нового loop: teardown_file_container удалит и loop, и файл.
+    teardown_file_container(&ud, &new_loop, &container)
+        .await
+        .expect("cleanup must not leave a stale loop");
 }
 
 /// Т-4: два хранилища, симлинки, уникальность метки, защита чужого пути,
@@ -638,7 +619,7 @@ async fn t12_device_removed_marks_disconnected() {
         "registry entry must be Disconnected"
     );
 
-    if let Err(e) = std::fs::remove_file(&container) {
-        eprintln!("cleanup: remove file failed: {e}");
-    }
+    teardown_file_container(&ud, &created.loop_object, &container)
+        .await
+        .expect("cleanup must not leave a stale loop");
 }

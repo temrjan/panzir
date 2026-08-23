@@ -9,6 +9,7 @@
 //! передаётся через `--key-file` / `--new-keyfile`.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio::fs;
 use tokio::io::AsyncWriteExt as _;
@@ -16,6 +17,48 @@ use tokio::process::Command;
 
 use crate::passphrase::Passphrase;
 use crate::{Error, Result};
+
+/// Временный keyfile с секретом. Удаляет файл в `Drop`, даже если future
+/// отменена (Б-2 ревью PR-2).
+struct TempKeyfile(PathBuf);
+
+impl TempKeyfile {
+    async fn from_passphrase(passphrase: &Passphrase) -> Result<Self> {
+        let dir = std::env::temp_dir();
+        fs::create_dir_all(&dir).await.map_err(Error::Io)?;
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let file = dir.join(format!(
+            "panzir-keyfile-{}-{}.tmp",
+            std::process::id(),
+            uniq
+        ));
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&file)
+            .await
+            .map_err(Error::Io)?
+            .write_all(passphrase.as_str().as_bytes())
+            .await
+            .map_err(Error::Io)?;
+        Ok(Self(file))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempKeyfile {
+    fn drop(&mut self) {
+        // Синхронное удаление вне async-контекста — допустимо для файла.
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 /// Результат добавления keyslot.
 #[derive(Debug, Clone)]
@@ -46,72 +89,49 @@ pub async fn add_keyslot_to_device(
     luks_add_key(device, existing, new, true).await
 }
 
-/// Создать временный keyfile с mode 0600, содержащий ровно passphrase.
-async fn keyfile_from_passphrase(passphrase: &Passphrase) -> Result<PathBuf> {
-    let dir = std::env::temp_dir();
-    fs::create_dir_all(&dir).await.map_err(Error::Io)?;
-    let uniq = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let file = dir.join(format!(
-        "panzir-keyfile-{}-{}.tmp",
-        std::process::id(),
-        uniq
-    ));
-    fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&file)
-        .await
-        .map_err(Error::Io)?
-        .write_all(passphrase.as_str().as_bytes())
-        .await
-        .map_err(Error::Io)?;
-    Ok(file)
-}
-
 async fn luks_add_key(
     path: &Path,
     existing: &Passphrase,
     new: &Passphrase,
     use_pkexec: bool,
 ) -> Result<AddedKeyslot> {
-    let existing_file = keyfile_from_passphrase(existing).await?;
-    let new_file = keyfile_from_passphrase(new).await?;
+    let existing_key = TempKeyfile::from_passphrase(existing).await?;
+    let new_key = TempKeyfile::from_passphrase(new).await?;
 
-    let result = async {
-        let mut cmd = if use_pkexec {
-            let mut c = Command::new("pkexec");
-            c.arg("cryptsetup");
-            c
-        } else {
-            Command::new("cryptsetup")
-        };
+    let mut cmd = if use_pkexec {
+        let mut c = Command::new("pkexec");
+        c.arg("cryptsetup");
+        c
+    } else {
+        Command::new("cryptsetup")
+    };
 
-        cmd.arg("luksAddKey")
-            .arg("--key-file")
-            .arg(&existing_file)
-            .arg("--new-keyfile")
-            .arg(&new_file)
-            .arg(path);
+    cmd.arg("luksAddKey")
+        .arg("--key-file")
+        .arg(existing_key.path())
+        .arg("--new-keyfile")
+        .arg(new_key.path())
+        .arg(path);
 
-        let status = cmd.status().await.map_err(Error::Io)?;
-        if status.success() {
-            Ok(AddedKeyslot)
-        } else {
-            Err(Error::Command {
+    let mut child = cmd.spawn().map_err(Error::Io)?;
+    let status = match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => return Err(Error::Io(e)),
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(Error::Command {
                 cmd: format!("cryptsetup luksAddKey {}", path.display()),
-                status: status.to_string(),
-            })
+                status: "timeout".to_owned(),
+            });
         }
+    };
+
+    if status.success() {
+        Ok(AddedKeyslot)
+    } else {
+        Err(Error::Command {
+            cmd: format!("cryptsetup luksAddKey {}", path.display()),
+            status: status.to_string(),
+        })
     }
-    .await;
-
-    // Лучшая попытка убрать секрет с диска в любом случае.
-    let _ = fs::remove_file(&existing_file).await;
-    let _ = fs::remove_file(&new_file).await;
-
-    result
 }

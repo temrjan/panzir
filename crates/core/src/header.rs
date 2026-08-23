@@ -8,6 +8,7 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::fs;
 use tokio::process::Command;
@@ -54,13 +55,15 @@ async fn backup_header(
     let same_fs = same_filesystem(source, parent).await?;
     let warning = same_fs.then_some(HeaderBackupWarning::SameFilesystem);
 
-    // Создаём родительский каталог с правильными правами, если нужно.
+    // Создаём родительский каталог с правильными правами, если его не было.
     // Сам backup-файл создаёт cryptsetup: он отказывается перезаписывать
     // существующий файл. Mode 0600 выставляем после.
-    fs::create_dir_all(parent).await.map_err(Error::Io)?;
-    fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-        .await
-        .map_err(Error::Io)?;
+    if fs::metadata(parent).await.is_err() {
+        fs::create_dir_all(parent).await.map_err(Error::Io)?;
+        fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(Error::Io)?;
+    }
 
     let mut cmd = if use_pkexec {
         let mut c = Command::new("pkexec");
@@ -85,7 +88,21 @@ async fn backup_header(
         .ok_or_else(|| Error::Io(std::io::Error::other("stdin not piped")))?;
     passphrase.write_to_stdin(&mut stdin).await?;
 
-    let status = child.wait().await.map_err(Error::Io)?;
+    let status = match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => return Err(Error::Io(e)),
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(Error::Command {
+                cmd: format!(
+                    "cryptsetup luksHeaderBackup {} {}",
+                    source.display(),
+                    backup.display()
+                ),
+                status: "timeout".to_owned(),
+            });
+        }
+    };
     if !status.success() {
         return Err(Error::Command {
             cmd: format!(
