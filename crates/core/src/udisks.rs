@@ -26,6 +26,15 @@ fn no_options() -> Options<'static> {
     HashMap::new()
 }
 
+/// Опции, запрещающие D-Bus показывать интерактивные диалоги авторизации.
+/// Все teardown-вызовы идут с этой опцией, чтобы уборка не могла открыть
+/// модальное окно в проде (план cleanup-PR, инвариант №3).
+fn no_interaction_options() -> Options<'static> {
+    let mut opts = Options::new();
+    opts.insert("auth.no_user_interaction", Value::from(true));
+    opts
+}
+
 /// D-Bus ошибка-метод с заданным именем (таксономия udisks2 — только здесь).
 fn dbus_error_is(e: &zbus::Error, name: &str) -> bool {
     matches!(e, zbus::Error::MethodError(n, _, _) if n.as_str() == name)
@@ -233,7 +242,7 @@ impl Udisks {
     /// `SetupByUID` в 0, и любые операции с loop требуют пароль админа.
     pub async fn set_autoclear(&self, loop_object: &ObjPath) -> Result<()> {
         let lp = self.loop_proxy(loop_object).await?;
-        Ok(lp.set_autoclear(true, no_options()).await?)
+        Ok(lp.set_autoclear(true, no_interaction_options()).await?)
     }
 
     /// Удалить loop-устройство напрямую. `pub(crate)`: снаружи крейта эта
@@ -251,7 +260,7 @@ impl Udisks {
     /// а не по ошибке: после ошибки ждём исчезновения из sysfs.
     pub(crate) async fn loop_delete(&self, loop_object: &ObjPath) -> Result<()> {
         let lp = self.loop_proxy(loop_object).await?;
-        match lp.delete(no_options()).await {
+        match lp.delete(no_interaction_options()).await {
             Ok(()) => Ok(()),
             Err(first) => {
                 for _ in 0..15 {
@@ -305,7 +314,7 @@ impl Udisks {
     /// [`Udisks::close_encrypted`]: она оркестрирует unmount/lock с ретраями.
     pub async fn lock(&self, block_object: &ObjPath) -> Result<()> {
         let enc = self.encrypted_proxy(block_object).await?;
-        Ok(enc.lock(no_options()).await?)
+        Ok(enc.lock(no_interaction_options()).await?)
     }
 
     /// Штатное закрытие зашифрованного тома на loop-контейнере.
@@ -319,23 +328,56 @@ impl Udisks {
     pub async fn close_encrypted(&self, loop_object: &ObjPath) -> Result<()> {
         self.set_autoclear(loop_object).await?;
         let mut last_err: Option<Error> = None;
-        for _ in 0..8 {
+        for iteration in 0..8 {
             // Если том отперт — сначала размонтировать и дождаться.
             if let Ok(cleartext) = self.cleartext_device(loop_object).await {
-                self.unmount_wait(&cleartext).await?;
+                match self.unmount_wait(&cleartext).await {
+                    Ok(()) => {}
+                    Err(e) if Self::is_retryable_unmount(&e) => {
+                        tracing::warn!(
+                            "close_encrypted: unmount_wait retryable on iteration {iteration}: {e}"
+                        );
+                        last_err = Some(e);
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             match self.lock(loop_object).await {
                 Ok(()) => return Ok(()),
                 Err(e) if matches!(&e, Error::Udisks(z) if is_device_busy(z)) => {
+                    tracing::warn!("close_encrypted: lock busy on iteration {iteration}: {e}");
                     last_err = Some(e);
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
                 Err(e) => return Err(e),
             }
         }
+        let cleartext = self.cleartext_device(loop_object).await.ok();
+        let mount_points = match &cleartext {
+            Some(c) => self.mount_points(c).await.ok(),
+            None => None,
+        };
+        let backing_file = self.loop_backing_file(loop_object).await.ok();
+        tracing::error!(
+            loop_object = %loop_object,
+            cleartext_device = ?cleartext.as_ref().map(|c| c.to_string()),
+            mount_points = ?mount_points,
+            backing_file = ?backing_file.as_ref().map(|b| String::from_utf8_lossy(b)),
+            "close_encrypted: retry budget spent"
+        );
         Err(last_err.unwrap_or_else(|| {
             Error::UnexpectedUdisksState(format!("cannot close {loop_object}: retry budget spent"))
         }))
+    }
+
+    fn is_retryable_unmount(e: &Error) -> bool {
+        match e {
+            Error::Udisks(z) => is_device_busy(z),
+            Error::UnexpectedUdisksState(msg) => msg.contains("still mounted after unmount"),
+            _ => false,
+        }
     }
 
     /// Смонтировать ФС с `noexec` (параметр вызова, allow-лист udisks2 —
@@ -374,7 +416,7 @@ impl Udisks {
     /// Размонтировать ФС. Идемпотентно: «уже не смонтировано» — успех.
     pub async fn unmount(&self, block_object: &ObjPath) -> Result<()> {
         let fs = self.fs_proxy(block_object).await?;
-        match fs.unmount(no_options()).await {
+        match fs.unmount(no_interaction_options()).await {
             Ok(()) => Ok(()),
             Err(e) if is_not_mounted(&e) => Ok(()),
             Err(e) => Err(Error::from(e)),
@@ -459,6 +501,11 @@ impl Udisks {
             .build()
             .await?)
     }
+
+    async fn loop_backing_file(&self, loop_object: &ObjPath) -> Result<Vec<u8>> {
+        let lp = self.loop_proxy(loop_object).await?;
+        Ok(lp.backing_file().await?)
+    }
 }
 
 /// Событие снятия интерфейсов с объекта udisks2.
@@ -522,7 +569,7 @@ fn loop_backing_sysfs(name: &str) -> Option<PathBuf> {
 }
 
 /// Отвязан ли loop от backing-файла по sysfs (ядреная правда, не D-Bus).
-fn loop_detached_in_sysfs(loop_object: &ObjPath) -> bool {
+pub(crate) fn loop_detached_in_sysfs(loop_object: &ObjPath) -> bool {
     loop_backing_sysfs(loop_object.basename()).is_some_and(|p| !p.exists())
 }
 
