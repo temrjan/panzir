@@ -216,6 +216,56 @@ async fn t3_container_on_btrfs_is_nocow() {
     );
 }
 
+/// Т-4 (регрессионный): panic внутри проверок не пропускает teardown.
+/// Если assert упал, `catch_unwind` ловит панику, teardown_file_container
+/// всё равно бежит, и после него loop не остаётся в sysfs, а файла нет.
+#[tokio::test]
+#[ignore = "regression: panic must still trigger teardown"]
+async fn t4_panic_inside_checks_does_not_leak() {
+    let _serial = UDISKS_LOCK.lock().await;
+    let ud = Udisks::connect().await.expect("udisks2 on the bus");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let container = dir.path().join("panzir-t4.vault");
+
+    let created = create_file_container(
+        &ud,
+        &container,
+        64 * 1024 * 1024,
+        &Label::new("panzir-t4").expect("label"),
+        &SecretString::from("test-passphrase-t4"),
+    )
+    .await
+    .expect("container created");
+
+    let verdict = std::panic::AssertUnwindSafe(async {
+        panic!("intentional panic to verify teardown");
+    })
+    .catch_unwind()
+    .await;
+
+    let teardown = teardown_file_container(&ud, &created.loop_object, &container).await;
+
+    match (verdict, teardown) {
+        (Err(_payload), Ok(())) => {
+            // Ожидаемо: panic пойман, teardown отработал.
+            assert!(
+                !loop_attached_to(&container),
+                "loop still attached after panic + teardown"
+            );
+            assert!(
+                !container.exists(),
+                "vault file still exists after panic + teardown"
+            );
+        }
+        (Err(_payload), Err(e)) => {
+            panic!("teardown failed after intentional panic: {e}");
+        }
+        (Ok(()), _) => {
+            panic!("intentional panic did not fire — test is invalid");
+        }
+    }
+}
+
 /// Уборка за тестом — единый teardown-оркестр: close_encrypted с retry,
 /// fallback loop_delete, ожидание sysfs и удаление файла только после
 /// подтверждения отвязки loop.

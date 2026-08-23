@@ -13,7 +13,7 @@ sweep_panzir() {
     # 1. Найти наши loop'ы по backing_file и снять их.
     local changed=true
     local attempt=0
-    while [[ "$changed" == true && $attempt -lt 5 ]]; do
+    while [[ "$changed" == true && $attempt -lt 10 ]]; do
         changed=false
         for backing in /sys/block/loop*/loop/backing_file; do
             if [[ -f "$backing" ]] && grep -qE "panzir-.*\.vault" "$backing" 2>/dev/null; then
@@ -41,11 +41,14 @@ sweep_panzir() {
             fi
         done
         ((attempt++)) || true
-        sleep 0.5
+        sleep 1
     done
 
-    # 2. Убрать оставшиеся .vault-файлы (tempfile создаёт /tmp/.tmpXXXXX/panzir-*.vault).
+    # 2. Убрать оставшиеся .vault-файлы.
     find /tmp -maxdepth 2 -name 'panzir-*.vault' -delete 2>/dev/null || true
+    if [[ -n "${PANZIR_IT_DIR:-}" ]]; then
+        find "$PANZIR_IT_DIR" -maxdepth 1 -name 'panzir-*.vault' -delete 2>/dev/null || true
+    fi
     find "$HOME" -maxdepth 1 -name 'panzir-*' -type l -delete 2>/dev/null || true
 }
 
