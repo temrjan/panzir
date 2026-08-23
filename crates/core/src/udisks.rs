@@ -575,6 +575,9 @@ pub(crate) fn loop_detached_in_sysfs(loop_object: &ObjPath) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // expect в тестах — осознанно (закон №3: unwrap/expect только в тестах и main).
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use std::convert::TryInto as _;
     use zbus::Message;

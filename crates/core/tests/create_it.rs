@@ -235,7 +235,10 @@ async fn t4_panic_inside_checks_does_not_leak() {
         move |_created, container| {
             let captured2 = captured2.clone();
             async move {
-                captured2.lock().unwrap().replace(container.clone());
+                captured2
+                    .lock()
+                    .expect("captured mutex")
+                    .replace(container.clone());
                 assert!(
                     loop_attached_to(&container),
                     "sanity: loop must be attached while the test body runs"
@@ -250,7 +253,7 @@ async fn t4_panic_inside_checks_does_not_leak() {
     assert!(result.is_err(), "intentional panic must propagate");
     let container = captured
         .lock()
-        .unwrap()
+        .expect("captured mutex")
         .take()
         .expect("container path was captured before panic");
     assert!(
