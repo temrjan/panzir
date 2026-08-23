@@ -17,7 +17,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use panzir_core::create::{CreatedVault, create_file_container};
+use futures_util::FutureExt;
+use panzir_core::create::{CreatedVault, create_file_container, teardown_file_container};
 use panzir_core::udisks::Udisks;
 use panzir_core::vault::Label;
 use secrecy::SecretString;
@@ -44,6 +45,46 @@ fn loop_attached_to(container: &Path) -> bool {
         })
 }
 
+/// Создать контейнер, выполнить проверки в `catch_unwind`, затем всегда
+/// вызвать teardown и восстановить исходную панику. Мьютекс UDISKS_LOCK
+/// держится на всём теле хелпера (создание + проверки + teardown).
+async fn with_container<F, Fut>(ud: &Udisks, label: &str, test_fn: F)
+where
+    F: FnOnce(CreatedVault, PathBuf) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let dir = tempfile::tempdir().expect("tempdir");
+    let container = dir.path().join(format!("{label}.vault"));
+
+    let created = create_file_container(
+        ud,
+        &container,
+        64 * 1024 * 1024,
+        &Label::new(label).expect("label"),
+        &SecretString::from(format!("test-passphrase-{label}")),
+    )
+    .await
+    .expect("container created");
+
+    let verdict = std::panic::AssertUnwindSafe(async {
+        test_fn(created.clone(), container.clone()).await;
+    })
+    .catch_unwind()
+    .await;
+
+    let teardown = teardown_file_container(ud, &created.loop_object, &container).await;
+
+    match (verdict, teardown) {
+        (Ok(()), Ok(())) => {}
+        (Ok(()), Err(e)) => panic!("teardown failed: {e}"),
+        (Err(payload), Ok(())) => std::panic::resume_unwind(payload),
+        (Err(payload), Err(e)) => {
+            eprintln!("teardown also failed: {e}");
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
 /// Т-1: созданный контейнер — настоящий LUKS2 с ожидаемыми параметрами
 /// заголовка, И метка ФС та, что просили (обе опции проверяются по
 /// результату, а не по «D-Bus не вернул ошибку»).
@@ -51,76 +92,63 @@ fn loop_attached_to(container: &Path) -> bool {
 #[ignore = "requires live udisks2/polkit; run with --ignored"]
 async fn t1_created_container_is_genuine_luks2() {
     let _serial = UDISKS_LOCK.lock().await;
-    let dir = tempfile::tempdir().expect("tempdir");
-    let container = dir.path().join("t1.vault");
-
     let ud = Udisks::connect().await.expect("udisks2 on the bus");
-    let created = create_file_container(
-        &ud,
-        &container,
-        64 * 1024 * 1024,
-        &Label::new("panzir-t1").expect("label"),
-        &SecretString::from("test-passphrase-t1"),
-    )
-    .await;
-    let created = created.expect("container created");
-    let mut verdict: Result<(), String> = Ok(());
+    with_container(&ud, "panzir-t1", |created, container| async move {
+        // Положительный контроль канала: пока том жив, sysfs ОБЯЗАН знать
+        // backing-файл — иначе страж в cleanup вакуумный.
+        assert!(
+            loop_attached_to(&container),
+            "sysfs does not know the backing file while attached"
+        );
 
-    // Положительный контроль канала: пока том жив, sysfs ОБЯЗАН знать
-    // backing-файл — иначе страж в cleanup вакуумный.
-    if !loop_attached_to(&container) {
-        verdict = Err("sysfs does not know the backing file while attached".into());
-    }
+        // isLuks признаёт файл
+        let is_luks = sh("cryptsetup", &["isLuks", &container.display().to_string()])
+            .expect("cryptsetup runs")
+            .status
+            .success();
+        assert!(
+            is_luks,
+            "cryptsetup isLuks does not recognize the container"
+        );
 
-    // isLuks признаёт файл
-    let is_luks = sh("cryptsetup", &["isLuks", &container.display().to_string()])
-        .expect("cryptsetup runs")
-        .status
-        .success();
-    if !is_luks {
-        verdict = Err("cryptsetup isLuks does not recognize the container".into());
-    }
-
-    let dump = sh(
-        "cryptsetup",
-        &["luksDump", &container.display().to_string()],
-    )
-    .expect("luksDump runs");
-    let dump = String::from_utf8_lossy(&dump.stdout).into_owned();
-    // luksDump разливает колонки пробелами и табуляциями — нормализуем.
-    let flat = dump.split_whitespace().collect::<Vec<_>>().join(" ");
-    for needle in ["Version: 2", "aes-xts-plain64", "512 bits", "argon2id"] {
-        if !flat.contains(needle) {
-            verdict = Err(format!("luksDump header missing {needle:?}:\n{dump}"));
+        let dump = sh(
+            "cryptsetup",
+            &["luksDump", &container.display().to_string()],
+        )
+        .expect("luksDump runs");
+        let dump = String::from_utf8_lossy(&dump.stdout).into_owned();
+        // luksDump разливает колонки пробелами и табуляциями — нормализуем.
+        let flat = dump.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in ["Version: 2", "aes-xts-plain64", "512 bits", "argon2id"] {
+            assert!(
+                flat.contains(needle),
+                "luksDump header missing {needle:?}:\n{dump}"
+            );
         }
-    }
 
-    // Метка ФС — по результату (Гейт-2, Н-6).
-    let label_out = sh(
-        "findmnt",
-        &["-no", "LABEL", &created.mount_point.display().to_string()],
-    )
-    .expect("findmnt runs");
-    let label = String::from_utf8_lossy(&label_out.stdout).trim().to_owned();
-    if label.is_empty() {
-        verdict = Err("findmnt LABEL is empty — channel carries nothing".into());
-    } else if label != "panzir-t1" {
-        verdict = Err(format!("FS label is {label:?}, expected \"panzir-t1\""));
-    }
+        // Метка ФС — по результату (Гейт-2, Н-6).
+        let label_out = sh(
+            "findmnt",
+            &["-no", "LABEL", &created.mount_point.display().to_string()],
+        )
+        .expect("findmnt runs");
+        let label = String::from_utf8_lossy(&label_out.stdout).trim().to_owned();
+        assert!(
+            !label.is_empty(),
+            "findmnt LABEL is empty — channel carries nothing"
+        );
+        assert_eq!(label, "panzir-t1", "FS label mismatch");
 
-    // Права контейнера — 0600 с первой секунды (Гейт-2, Н-2).
-    use std::os::unix::fs::PermissionsExt as _;
-    let mode = std::fs::metadata(&container)
-        .expect("metadata")
-        .permissions()
-        .mode()
-        & 0o777;
-    if mode != 0o600 {
-        verdict = Err(format!("container mode is {mode:o}, expected 600"));
-    }
-
-    cleanup(&ud, &created, &container).await;
-    verdict.expect("T-1 checks");
+        // Права контейнера — 0600 с первой секунды (Гейт-2, Н-2).
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&container)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "container mode is {mode:o}, expected 600");
+    })
+    .await;
 }
 
 /// Т-2: том смонтирован с noexec — по findmnt, не по отсутствию ошибки.
@@ -130,37 +158,25 @@ async fn t1_created_container_is_genuine_luks2() {
 #[ignore = "requires live udisks2/polkit; run with --ignored"]
 async fn t2_mounted_with_noexec_proven_by_findmnt() {
     let _serial = UDISKS_LOCK.lock().await;
-    let dir = tempfile::tempdir().expect("tempdir");
-    let container = dir.path().join("t2.vault");
-
     let ud = Udisks::connect().await.expect("udisks2 on the bus");
-    let created = create_file_container(
-        &ud,
-        &container,
-        64 * 1024 * 1024,
-        &Label::new("panzir-t2").expect("label"),
-        &SecretString::from("test-passphrase-t2"),
-    )
-    .await
-    .expect("container created");
+    with_container(&ud, "panzir-t2", |created, _container| async move {
+        let out = sh(
+            "findmnt",
+            &["-no", "OPTIONS", &created.mount_point.display().to_string()],
+        )
+        .expect("findmnt runs");
+        let options = String::from_utf8_lossy(&out.stdout).into_owned();
 
-    let out = sh(
-        "findmnt",
-        &["-no", "OPTIONS", &created.mount_point.display().to_string()],
-    )
-    .expect("findmnt runs");
-    let options = String::from_utf8_lossy(&out.stdout).into_owned();
-
-    cleanup(&ud, &created, &container).await;
-
-    assert!(
-        options.contains("rw"),
-        "sanity: findmnt must report real options, got {options:?}"
-    );
-    assert!(
-        options.contains("noexec"),
-        "mount must have noexec (план §4.9), got {options:?}"
-    );
+        assert!(
+            options.contains("rw"),
+            "sanity: findmnt must report real options, got {options:?}"
+        );
+        assert!(
+            options.contains("noexec"),
+            "mount must have noexec (план §4.9), got {options:?}"
+        );
+    })
+    .await;
 }
 
 /// Т-3: на btrfs контейнер создаётся с No_COW — по `lsattr`, не по коду
@@ -200,29 +216,61 @@ async fn t3_container_on_btrfs_is_nocow() {
     );
 }
 
-/// Уборка за тестом — ровно штатный поток закрытия файл-контейнера:
-/// unmount → set_autoclear (пока loop наш!) → lock → автосброс loop'а.
-/// Никакого Delete после Lock: SetupByUID уже 0, Delete спросил бы пароль.
-/// Выполняется всегда, даже при провале проверок выше.
+/// Т-4 (регрессионный): panic внутри проверок не пропускает teardown.
+/// `with_container` сам ловит панику внутри тела, всё равно вызывает teardown
+/// и возобновляет панику — мы ловим её на уровне теста и проверяем, что
+/// loop отвязался и файла нет.
+#[tokio::test]
+#[ignore = "regression: panic must still trigger teardown"]
+async fn t4_panic_inside_checks_does_not_leak() {
+    let _serial = UDISKS_LOCK.lock().await;
+    let ud = Udisks::connect().await.expect("udisks2 on the bus");
+
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+    let captured2 = captured.clone();
+
+    let result = std::panic::AssertUnwindSafe(with_container(
+        &ud,
+        "panzir-t4",
+        move |_created, container| {
+            let captured2 = captured2.clone();
+            async move {
+                captured2
+                    .lock()
+                    .expect("captured mutex")
+                    .replace(container.clone());
+                assert!(
+                    loop_attached_to(&container),
+                    "sanity: loop must be attached while the test body runs"
+                );
+                panic!("intentional panic to verify teardown");
+            }
+        },
+    ))
+    .catch_unwind()
+    .await;
+
+    assert!(result.is_err(), "intentional panic must propagate");
+    let container = captured
+        .lock()
+        .expect("captured mutex")
+        .take()
+        .expect("container path was captured before panic");
+    assert!(
+        !loop_attached_to(&container),
+        "loop still attached after panic + teardown"
+    );
+    assert!(
+        !container.exists(),
+        "vault file still exists after panic + teardown"
+    );
+}
+
+/// Уборка за тестом — единый teardown-оркестр: close_encrypted с retry,
+/// fallback loop_delete, ожидание sysfs и удаление файла только после
+/// подтверждения отвязки loop.
 async fn cleanup(ud: &Udisks, created: &CreatedVault, container: &Path) {
-    // Оркестрированное закрытие — ровно продовый путь (Гейт-2, Н-26):
-    // unmount с ожиданием → lock с ретраями по busy → повтор, если
-    // автомонтёр успел перемонтировать между попытками.
-    if let Err(e) = ud.close_encrypted(&created.loop_object).await {
-        eprintln!("cleanup: close_encrypted failed: {e}");
-    }
-    // Страж зависшего loop — ДО remove_file, пока путь ещё существует
-    // (Гейт-2, Н-5); autoclear отвязывает устройство с задержкой — ждём.
-    let mut stale = true;
-    for _ in 0..25 {
-        if !loop_attached_to(container) {
-            stale = false;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    if let Err(e) = std::fs::remove_file(container) {
-        eprintln!("cleanup: remove file failed: {e}");
-    }
-    assert!(!stale, "stale loop device left behind for {container:?}");
+    teardown_file_container(ud, &created.loop_object, container)
+        .await
+        .expect("cleanup must not leave a stale loop");
 }

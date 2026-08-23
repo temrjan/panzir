@@ -71,10 +71,11 @@ async fn fs_type(path: &Path) -> Result<String> {
 /// с `noexec`.
 ///
 /// # Errors
-/// Все системные шаги могут упасть: см. [`Error`]. При ЛЮБОЙ ошибке после
-/// создания файла мастер убирает за собой полностью (unmount → autoclear →
-/// lock → loop → файл) и возвращает исходную ошибку — недоделанных
-/// контейнеров и занятых путей не остаётся.
+/// Все системные шаги могут упасть: см. [`Error`]. При любой ошибке до
+/// поднятия loop-устройства файл удаляется здесь. При ошибке после поднятия
+/// loop уборку выполняет [`teardown_file_container`], которая удаляет файл
+/// только после подтверждения отвязки loop от sysfs. Исходная ошибка
+/// возвращается наружу в любом случае.
 pub async fn create_file_container(
     ud: &Udisks,
     path: &Path,
@@ -100,15 +101,27 @@ pub async fn create_file_container(
         .into_std()
         .await;
 
-    let result = prepare_and_format(ud, file, path, size_bytes, on_btrfs, label, passphrase).await;
-    if result.is_err() {
-        // Cleanup без маскировки исходной ошибки; файл — последним,
-        // после того как отработал cleanup устройств.
-        if let Err(e) = tokio::fs::remove_file(path).await {
-            tracing::warn!("cleanup: failed to remove {}: {e}", path.display());
+    match prepare_and_format(ud, file, path, size_bytes, on_btrfs, label, passphrase).await {
+        Ok(created) => Ok(created),
+        Err(SetupError::BeforeLoop { source }) => {
+            // loop ещё не был создан — безопасно удалить файл здесь.
+            if let Err(e) = tokio::fs::remove_file(path).await {
+                tracing::warn!(
+                    "create_file_container: failed to remove {}: {e}",
+                    path.display()
+                );
+            }
+            Err(source)
         }
+        Err(SetupError::AfterLoop { source, .. }) => Err(source),
     }
-    result
+}
+
+/// Ошибка создания с фазой, на которой она произошла: до или после поднятия
+/// loop-устройства. Фаза определяет, кто и когда может удалить файл контейнера.
+enum SetupError {
+    BeforeLoop { source: Error },
+    AfterLoop { source: Error },
 }
 
 /// Всё после создания файла: подготовка ФС и работа с устройством.
@@ -121,12 +134,14 @@ async fn prepare_and_format(
     on_btrfs: bool,
     label: &Label,
     passphrase: &SecretString,
-) -> Result<CreatedVault> {
+) -> std::result::Result<CreatedVault, SetupError> {
     if on_btrfs {
         // +C на пустой файл, ДО fallocate (план §4.8).
-        run("chattr", &[OsStr::new("+C"), path.as_os_str()]).await?;
+        if let Err(e) = run("chattr", &[OsStr::new("+C"), path.as_os_str()]).await {
+            return Err(SetupError::BeforeLoop { source: e });
+        }
     }
-    run(
+    if let Err(e) = run(
         "fallocate",
         &[
             OsStr::new("-l"),
@@ -134,9 +149,15 @@ async fn prepare_and_format(
             path.as_os_str(),
         ],
     )
-    .await?;
+    .await
+    {
+        return Err(SetupError::BeforeLoop { source: e });
+    }
 
-    let loop_object = ud.loop_setup(file).await?;
+    let loop_object = match ud.loop_setup(file).await {
+        Ok(lo) => lo,
+        Err(e) => return Err(SetupError::BeforeLoop { source: e }),
+    };
 
     let result = async {
         ud.format_luks2(&loop_object, label.as_str(), passphrase)
@@ -153,21 +174,61 @@ async fn prepare_and_format(
     }
     .await;
 
-    if result.is_err() {
-        teardown_partial(ud, &loop_object).await;
+    match result {
+        Ok(created) => Ok(created),
+        Err(source) => {
+            // loop уже создан — уборку и удаление файла делает teardown_file_container.
+            if let Err(e) = teardown_file_container(ud, &loop_object, path).await {
+                tracing::warn!("prepare_and_format: teardown after error: {e}");
+            }
+            Err(SetupError::AfterLoop { source })
+        }
     }
-    result
 }
 
-/// Откат при ошибке ПОСЛЕ Format: том может быть отперт и смонтирован.
-/// Тот же оркестрированный порядок закрытия, что в проде (Гейт-2,
-/// Н-1 + Н-26): close_encrypted; на живом dm-crypt loop_delete бессилен,
-/// поэтому он — только страховка после, для случая «заперто, но loop жив».
-async fn teardown_partial(ud: &Udisks, loop_object: &ObjPath) {
+/// Убрать файл-контейнер: закрыть зашифрованный том, отвязать loop,
+/// дождаться исчезновения из sysfs и только потом удалить файл.
+/// Публичная для интеграционных тестов, но скрыта из API крейта.
+#[doc(hidden)]
+pub async fn teardown_file_container(
+    ud: &Udisks,
+    loop_object: &ObjPath,
+    container: &Path,
+) -> Result<()> {
+    // 1. Оркестрированное закрытие (close_encrypted делает unmount/lock/retries).
     if let Err(e) = ud.close_encrypted(loop_object).await {
         tracing::warn!("teardown: close_encrypted failed: {e}");
     }
-    if let Err(e) = ud.loop_delete(loop_object).await {
+
+    // 2. Fallback Delete только если loop всё ещё виден в sysfs.
+    if !crate::udisks::loop_detached_in_sysfs(loop_object)
+        && let Err(e) = ud.loop_delete(loop_object).await
+    {
         tracing::warn!("teardown: loop_delete failed: {e}");
+    }
+
+    // 3. Ждём исчезновения из sysfs, макс. 5 с.
+    for _ in 0..25 {
+        if crate::udisks::loop_detached_in_sysfs(loop_object) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // 4. Только после подтверждения отвязки удаляем файл.
+    if crate::udisks::loop_detached_in_sysfs(loop_object) {
+        match tokio::fs::remove_file(container).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                tracing::warn!("teardown: failed to remove {}: {e}", container.display());
+                Err(Error::from(e))
+            }
+        }
+    } else {
+        Err(Error::UnexpectedUdisksState(format!(
+            "stale loop device left for {loop_object}; refusing to remove {}",
+            container.display()
+        )))
     }
 }
