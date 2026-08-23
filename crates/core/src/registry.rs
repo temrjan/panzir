@@ -58,6 +58,7 @@ impl VaultEntry {
         let allowed = matches!(
             (&self.state, &state),
             (VaultState::Closed, VaultState::Open { .. })
+                | (VaultState::Disconnected, VaultState::Open { .. })
                 | (VaultState::Open { .. }, VaultState::Closed)
                 | (VaultState::Open { .. }, VaultState::Disconnected)
                 | (VaultState::Closed, VaultState::Disconnected)
@@ -308,6 +309,7 @@ impl Registry {
                 .await?;
             file.write_all(text.as_bytes()).await?;
             file.flush().await?;
+            file.sync_all().await?;
             Ok::<(), std::io::Error>(())
         }
         .await;
@@ -418,20 +420,80 @@ mod tests {
         e.set_state(VaultState::Closed).expect("open -> closed");
         e.set_state(VaultState::Disconnected)
             .expect("closed -> disconnected");
+        // Переоткрытие после извлечения — штатный путь (спека п.11).
+        e.set_state(VaultState::Open {
+            mount_point: PathBuf::from("/run/m"),
+        })
+        .expect("disconnected -> open");
         e.set_state(VaultState::Closed)
-            .expect("disconnected -> closed");
+            .expect("open -> closed after reconnect");
     }
 
     #[test]
     fn state_transition_rejected() {
         let mut e = entry("x");
         assert!(e.set_state(VaultState::Disconnected).is_ok());
-        // Disconnected -> Open запрещён.
+        // Disconnected -> Disconnected запрещён.
+        assert!(e.set_state(VaultState::Disconnected).is_err());
+    }
+
+    #[tokio::test]
+    async fn load_empty_file_returns_empty_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        tokio::fs::write(&path, "").await.expect("write empty");
+        let reg = Registry::load_from(&path).await.expect("load empty");
+        assert!(reg.entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_corrupted_registry_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        tokio::fs::write(&path, "not-valid-toml-at-all")
+            .await
+            .expect("write garbage");
+        let err = Registry::load_from(&path)
+            .await
+            .expect_err("parse must fail");
         assert!(
-            e.set_state(VaultState::Open {
-                mount_point: PathBuf::from("/run/m")
-            })
-            .is_err()
+            matches!(err, Error::Registry(_)),
+            "expected Registry error, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn save_atomic_creates_temp_with_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        Registry::with_write_lock_at(&path, |r| {
+            r.add(VaultEntry::new(
+                Label::new("x").expect("label"),
+                VaultKind::File(PathBuf::from("/tmp/x.vault")),
+                VaultState::Closed,
+            ))
+        })
+        .await
+        .expect("write registry");
+
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "registry file mode is {mode:o}, expected 600");
+
+        // Временный файл не должен остаться рядом.
+        let mut leftovers = tokio::fs::read_dir(dir.path()).await.expect("read dir");
+        let mut count = 0;
+        while let Ok(Some(e)) = leftovers.next_entry().await {
+            let name = e.file_name().to_string_lossy().to_string();
+            assert!(!name.ends_with(".tmp"), "temp file left behind: {name}");
+            count += 1;
+        }
+        assert_eq!(count, 1, "only vaults.toml should remain");
     }
 }

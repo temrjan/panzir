@@ -298,13 +298,8 @@ async fn t4_flock_stress_two_processes() {
         .expect("core is at crates/core inside workspace")
         .to_path_buf();
     let worker = workspace_root.join("target/debug/examples/t4_worker");
-    assert!(
-        worker.exists(),
-        "worker binary not found at {}",
-        worker.display()
-    );
 
-    // Собираем воркера явно, чтобы путь существовал.
+    // Собираем воркера явно: на чистом checkout бинаря ещё нет.
     let build = tokio::process::Command::new("cargo")
         .args([
             "build",

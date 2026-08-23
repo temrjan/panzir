@@ -19,11 +19,11 @@ use crate::passphrase::Passphrase;
 use crate::{Error, Result};
 
 /// Временный keyfile с секретом. Удаляет файл в `Drop`, даже если future
-/// отменена (Б-2 ревью PR-2).
-struct TempKeyfile(PathBuf);
+/// отменена (Б-2 ревью PR-2). Публичен внутри крейта для header.rs.
+pub(crate) struct TempKeyfile(PathBuf);
 
 impl TempKeyfile {
-    async fn from_passphrase(passphrase: &Passphrase) -> Result<Self> {
+    pub(crate) async fn from_passphrase(passphrase: &Passphrase) -> Result<Self> {
         let dir = std::env::temp_dir();
         fs::create_dir_all(&dir).await.map_err(Error::Io)?;
         let uniq = std::time::SystemTime::now()
@@ -35,20 +35,22 @@ impl TempKeyfile {
             std::process::id(),
             uniq
         ));
-        fs::OpenOptions::new()
+        let mut handle = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
             .open(&file)
             .await
-            .map_err(Error::Io)?
+            .map_err(Error::Io)?;
+        handle
             .write_all(passphrase.as_str().as_bytes())
             .await
             .map_err(Error::Io)?;
+        handle.flush().await.map_err(Error::Io)?;
         Ok(Self(file))
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 }
@@ -111,7 +113,8 @@ async fn luks_add_key(
         .arg(existing_key.path())
         .arg("--new-keyfile")
         .arg(new_key.path())
-        .arg(path);
+        .arg(path)
+        .kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(Error::Io)?;
     let status = match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
