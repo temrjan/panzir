@@ -52,7 +52,23 @@ pub enum Error {
     #[error("unexpected udisks2 state: {0}")]
     UnexpectedUdisksState(String),
 
+    /// Ошибка реестра (парсинг, сохранение, повреждение).
+    #[error("registry: {0}")]
+    Registry(String),
+
     /// HOME не установлен или пуст — путь симлинка построить нельзя.
     #[error("HOME is unset or empty")]
     NoHome,
+
+    /// Другой процесс panzir уже запущен (advisory flock не получен).
+    #[error("panzir is already running")]
+    AlreadyRunning,
+
+    /// Запись с такой меткой не найдена в реестре.
+    #[error("vault not found: {0}")]
+    VaultNotFound(String),
+
+    /// Метка уже занята в реестре.
+    #[error("duplicate vault label: {0}")]
+    DuplicateLabel(String),
 }

@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Error, Result};
 
 /// Метка хранилища: валидированная пользовательская строка.
@@ -55,7 +57,8 @@ impl std::fmt::Display for Label {
 }
 
 /// Вид хранилища (спека: файл-контейнер или физический носитель).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VaultKind {
     /// Файл-контейнер на диске.
     File(PathBuf),
@@ -68,7 +71,8 @@ pub enum VaultKind {
 }
 
 /// Состояние хранилища.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VaultState {
     /// Закрыто: том заперт, содержимого ни у кого нет.
     Closed,
@@ -137,9 +141,11 @@ impl Vault {
 
     /// Чистая часть построения пути (шов для тестов: env в тесте не
     /// поменять — `set_var` unsafe, а у нас `forbid(unsafe_code)`).
+    /// Обёртка над [`crate::mountpoint::symlink_path`], чтобы формула жила
+    /// в одном месте.
     fn symlink_path_in(home: Option<std::ffi::OsString>, label: &Label) -> Result<PathBuf> {
         let home = home.filter(|h| !h.is_empty()).ok_or(Error::NoHome)?;
-        Ok(PathBuf::from(home).join(format!("panzir-{label}")))
+        Ok(crate::mountpoint::symlink_path(&PathBuf::from(home), label))
     }
 
     /// `Closed | Disconnected -> Open`.
@@ -176,17 +182,17 @@ impl Vault {
         }
     }
 
-    /// `Open -> Disconnected` (носитель извлечён на живом приложении).
+    /// `Open | Closed -> Disconnected` (носитель недоступен в udisks2).
     ///
     /// # Errors
-    /// [`Error::InvalidState`], если хранилище не открыто.
+    /// [`Error::InvalidState`], если хранилище уже отключено.
     pub fn mark_disconnected(&mut self) -> Result<()> {
         match self.state {
-            VaultState::Open { .. } => {
+            VaultState::Open { .. } | VaultState::Closed => {
                 self.state = VaultState::Disconnected;
                 Ok(())
             }
-            _ => Err(Error::InvalidState {
+            VaultState::Disconnected => Err(Error::InvalidState {
                 from: self.state.name(),
                 to: "disconnected",
             }),
@@ -276,12 +282,13 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_only_from_open() {
+    fn disconnect_from_open_or_closed() {
         let mut v = vault();
-        assert!(
-            v.mark_disconnected().is_err(),
-            "closed -> disconnected must fail"
-        );
+        // Closed -> Disconnected разрешён (PR-2, Н-2).
+        v.mark_disconnected().expect("closed -> disconnected");
+        assert_eq!(v.state(), &VaultState::Disconnected);
+
+        let mut v = vault();
         v.mark_open(PathBuf::from("/run/media/u/panzir-work"))
             .expect("open");
         v.mark_disconnected().expect("open -> disconnected");
@@ -289,6 +296,13 @@ mod tests {
         // Переоткрытие после извлечения — штатный путь (спека п.11).
         v.mark_open(PathBuf::from("/run/media/u/panzir-work"))
             .expect("disconnected -> open");
+    }
+
+    #[test]
+    fn disconnect_from_disconnected_is_rejected() {
+        let mut v = vault();
+        v.mark_disconnected().expect("closed -> disconnected");
+        assert!(v.mark_disconnected().is_err());
     }
 
     #[test]
