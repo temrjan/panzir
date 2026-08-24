@@ -138,9 +138,14 @@ if find /tmp -maxdepth 2 -name 'panzir-*.vault' -print -quit 2>/dev/null | grep 
 fi
 
 # 4. Run tests.
-PANZIR_IT=1 cargo test -p panzir-core --test create_it -- --ignored
-PANZIR_IT=1 cargo test -p panzir-core --test pr2_it -- --ignored
-PANZIR_IT=1 cargo test -p panzir-core --test lifecycle_it -- --ignored
+# Необязательный аргумент — фильтр имени теста. Нужен для мутаций: инвариант
+# проверяется прогоном ОДНОГО теста в подготовленной среде, а не всего набора
+# (иначе каждая мутация стоит трёх сьютов). Без аргумента поведение прежнее.
+FILTER="${1:-}"
+
+PANZIR_IT=1 cargo test -p panzir-core --test create_it -- --ignored $FILTER
+PANZIR_IT=1 cargo test -p panzir-core --test pr2_it -- --ignored $FILTER
+PANZIR_IT=1 cargo test -p panzir-core --test lifecycle_it -- --ignored $FILTER
 
 # 5. Post-run sanity check (same as pre-flight).
 if command -v losetup >/dev/null && [[ -n $(losetup -a) ]]; then
