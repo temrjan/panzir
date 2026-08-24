@@ -20,7 +20,12 @@ use crate::{Error, Result};
 
 /// Временный keyfile с секретом. Удаляет файл в `Drop`, даже если future
 /// отменена (Б-2 ревью PR-2). Публичен внутри крейта для header.rs.
-pub(crate) struct TempKeyfile(PathBuf);
+pub(crate) struct TempKeyfile {
+    path: PathBuf,
+    // Handle держим открытым, чтобы guard существовал сразу после open.
+    // Если future отменится между open и write/flush, файл всё равно удалится.
+    _file: fs::File,
+}
 
 impl TempKeyfile {
     pub(crate) async fn from_passphrase(passphrase: &Passphrase) -> Result<Self> {
@@ -30,35 +35,38 @@ impl TempKeyfile {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let file = dir.join(format!(
+        let path = dir.join(format!(
             "panzir-keyfile-{}-{}.tmp",
             std::process::id(),
             uniq
         ));
-        let mut handle = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
-            .open(&file)
+            .open(&path)
             .await
             .map_err(Error::Io)?;
-        handle
+        // Guard конструируется сразу после open (М-*).
+        let mut guard = Self { path, _file: file };
+        guard
+            ._file
             .write_all(passphrase.as_str().as_bytes())
             .await
             .map_err(Error::Io)?;
-        handle.flush().await.map_err(Error::Io)?;
-        Ok(Self(file))
+        guard._file.flush().await.map_err(Error::Io)?;
+        Ok(guard)
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 }
 
 impl Drop for TempKeyfile {
     fn drop(&mut self) {
         // Синхронное удаление вне async-контекста — допустимо для файла.
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 

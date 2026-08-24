@@ -400,10 +400,14 @@ async fn t10_header_backup_readable_and_warns_same_fs() {
         "backup must start with LUKS magic"
     );
 
-    // Попытка записать бэкап на другую ФС. /dev/shm — tmpfs, если контейнер
-    // не там же. Если совпала — тест мягко принимает любой результат.
-    let other_dir = tempfile::tempdir_in("/dev/shm")
-        .unwrap_or_else(|_| tempfile::tempdir().expect("fallback tempdir"));
+    // Попытка записать бэкап на другую ФС. На этой машине $HOME — btrfs,
+    // /tmp и /dev/shm — tmpfs. Используем $HOME, если он есть и отличается;
+    // иначе громко пропускаем assert, а не прячем факт совпадения ФС.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let other_dir = home
+        .as_ref()
+        .and_then(|h| tempfile::tempdir_in(h).ok())
+        .unwrap_or_else(|| tempfile::tempdir().expect("fallback tempdir"));
     let backup_other = other_dir.path().join("t10-header-other.backup");
     let warning2 = backup_header_from_file(
         &container,
@@ -429,6 +433,11 @@ async fn t10_header_backup_readable_and_warns_same_fs() {
         assert!(
             warning2.is_none(),
             "different fs must not produce same-fs warning"
+        );
+    } else {
+        eprintln!(
+            "SKIP: /tmp and {} are on the same filesystem ({same}); different-fs assert not run",
+            other_dir.path().display()
         );
     }
 
@@ -461,6 +470,31 @@ async fn t11_passphrase_does_not_leak_to_proc() {
     let secret = "panzir-leak-test-secret-42";
     let existing = Passphrase::new(SecretString::from("initial-pass-t11"));
     let new = Passphrase::new(SecretString::from(secret));
+
+    // Положительный контроль сканера: дочерний процесс с секретом в environ
+    // должен быть обнаружен. Доказывает, что scan_for_secret вообще работает.
+    let control_secret = "panzir-positive-control-secret-99";
+    let mut control_child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .env("PANZIR_LEAK_CONTROL", control_secret)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn control process");
+
+    let mut found = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if scan_for_secret(control_secret).await {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        found,
+        "scanner must detect positive control (secret in child environ)"
+    );
+    let _ = control_child.kill().await;
 
     let container_for_task = container.clone();
     let add_task =

@@ -290,7 +290,7 @@ impl Registry {
                 .collect(),
         };
         let text = toml::to_string(&stored)
-            .map_err(|e| Error::UnexpectedUdisksState(format!("cannot serialize registry: {e}")))?;
+            .map_err(|e| Error::Registry(format!("cannot serialize registry: {e}")))?;
 
         let uniq = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
