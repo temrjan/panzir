@@ -92,7 +92,9 @@ pub async fn probe_file_vault(ud: &Udisks, container: &Path) -> Result<VaultProb
         });
     }
 
-    let mut loops = crate::udisks::find_loops_for_backing_file(container)?.into_iter();
+    let mut loops = crate::udisks::find_loops_for_backing_file(container)
+        .await?
+        .into_iter();
     let Some(loop_object) = loops.next() else {
         return Ok(VaultProbe::Detached);
     };
@@ -104,6 +106,20 @@ pub async fn probe_file_vault(ud: &Udisks, container: &Path) -> Result<VaultProb
         });
     }
 
+    // Кто владеет loop. Любой uid, кроме нашего, — чужой, включая 0.
+    //
+    // Ревью раунда 1 (Б-4) требовало считать `uid == 0` «своим, просто со
+    // сброшенным владельцем» — на основании doc-комментариев `udisks.rs`,
+    // утверждающих, что `Lock` обнуляет `SetupByUID`. **Замер 24.08 это
+    // опровергает:** loop, поднятый нами, сохраняет `SetupByUID = 1000` и
+    // после `luksFormat`, и после `Unlock`, и после `Lock` (четыре
+    // последовательных чтения через `busctl`). Положительный контроль в том же
+    // прогоне: loop, поднятый root напрямую (`sudo losetup -f`), даёт `0` —
+    // значит канал измерения живой, а не отдаёт константу.
+    //
+    // Поэтому `0` здесь означает ровно то, что написано: loop поднят не нашим
+    // пользователем (root, системная служба). Трактовать его как свой — значит
+    // пытаться распоряжаться чужим устройством.
     let uid = ud.loop_setup_by_uid(&loop_object).await?;
     if uid != crate::udisks::current_uid() {
         return Ok(VaultProbe::Foreign { loop_object, uid });
@@ -133,6 +149,96 @@ pub async fn probe_file_vault(ud: &Udisks, container: &Path) -> Result<VaultProb
     }
 }
 
+/// Страховка на частично открытое хранилище.
+///
+/// Открытие идёт шагами: поднять loop → отпереть → смонтировать → поставить
+/// симлинк. Провал ЛЮБОГО шага после первого оставляет систему в промежуточном
+/// состоянии, и откатывать надо ровно то, что успели сделать мы, — не больше
+/// (чужой loop не наш, чтобы его отвязывать) и не меньше (снять loop из-под
+/// живой dm-crypt не значит закрыть том: `Loop.Delete` отвечает `Ok`, а
+/// устройства остаются — проверено живым экспериментом Ревьюера, раунд 1, Б-1).
+///
+/// Guard закрывает обе дороги: **ошибку** — явным `cleanup().await` на месте,
+/// **отмену future** — в `Drop`. Второе важно не гипотетически: `keyslot.rs`
+/// уже носит `TempKeyfile` с `Drop` именно потому, что этот класс дыры в
+/// проекте уже оплачен (Б-2 ревью PR-2).
+struct OpenGuard {
+    ud: Udisks,
+    loop_object: ObjPath,
+    /// loop подняли МЫ — значит нам его и отвязывать.
+    owns_loop: bool,
+    /// том отперли МЫ — значит нам его и запирать.
+    unlocked_by_us: bool,
+    /// том смонтировали МЫ и не отпирали — размонтировать, но не запирать.
+    mounted_by_us: Option<ObjPath>,
+    disarmed: bool,
+}
+
+impl OpenGuard {
+    fn new(ud: &Udisks, loop_object: ObjPath, owns_loop: bool) -> Self {
+        Self {
+            ud: ud.clone(),
+            loop_object,
+            owns_loop,
+            unlocked_by_us: false,
+            mounted_by_us: None,
+            disarmed: false,
+        }
+    }
+
+    /// Открытие дошло до конца — откатывать нечего.
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+
+    /// Откатить ровно то, что сделали мы. Порядок обратный порядку действий.
+    async fn cleanup(&self) {
+        if self.unlocked_by_us || self.owns_loop {
+            // close_encrypted переживает обе фазы: и «отперт и смонтирован»,
+            // и «отперт, но не смонтирован» — различать вручную не нужно.
+            if let Err(e) = self.ud.close_encrypted(&self.loop_object).await {
+                tracing::warn!("OpenGuard: close_encrypted failed: {e}");
+            }
+        } else if let Some(cleartext) = &self.mounted_by_us {
+            // Отпирали не мы — запирать чужое не наше дело; снимаем только
+            // собственное монтирование.
+            if let Err(e) = self.ud.unmount_wait(cleartext).await {
+                tracing::warn!("OpenGuard: unmount_wait failed: {e}");
+            }
+        }
+        if self.owns_loop
+            && let Err(e) = self.ud.ensure_loop_detached(&self.loop_object).await
+        {
+            tracing::warn!("OpenGuard: ensure_loop_detached failed: {e}");
+        }
+    }
+}
+
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        // Сюда попадаем только при отмене future: на ошибке уборка уже
+        // сделана явно и guard разоружён. Синхронно закрыть том нельзя —
+        // это D-Bus, — поэтому отдаём задачу рантайму и говорим об этом
+        // громко: молча потерянный loop и был исходным инцидентом 23.08.
+        tracing::warn!(
+            loop_object = %self.loop_object,
+            "OpenGuard: future cancelled mid-open, cleaning up in background"
+        );
+        let guard = Self {
+            ud: self.ud.clone(),
+            loop_object: self.loop_object.clone(),
+            owns_loop: self.owns_loop,
+            unlocked_by_us: self.unlocked_by_us,
+            mounted_by_us: self.mounted_by_us.clone(),
+            disarmed: true,
+        };
+        tokio::spawn(async move { guard.cleanup().await });
+    }
+}
+
 /// Открыть существующее хранилище: до смонтированного тома и симлинка.
 ///
 /// Идемпотентна: на уже открытом хранилище возвращает его же, второго
@@ -154,56 +260,14 @@ pub async fn open_file_vault(
     passphrase: &SecretString,
     home: &Path,
 ) -> Result<OpenedVault> {
-    match probe_file_vault(ud, container).await? {
-        VaultProbe::Foreign { uid, .. } => Err(Error::VaultAlreadyAttached {
-            path: container.display().to_string(),
-            uid,
-        }),
-
-        // Ветки Attached*: loop подняли не мы → loop_was_reused = true,
-        // и при ошибке мы его не отвязываем.
-        VaultProbe::AttachedOpen {
-            loop_object,
-            cleartext_object,
-            mount_point,
-        } => {
-            crate::mountpoint::create_symlink(home, label, &mount_point).await?;
-            Ok(OpenedVault {
-                loop_object,
-                cleartext_object,
-                mount_point,
-                loop_was_reused: true,
-            })
+    // Стартовая точка: что система уже сделала — и что предстоит сделать нам.
+    let (mut guard, cleartext, mount_point) = match probe_file_vault(ud, container).await? {
+        VaultProbe::Foreign { uid, .. } => {
+            return Err(Error::VaultAlreadyAttached {
+                path: container.display().to_string(),
+                uid,
+            });
         }
-
-        VaultProbe::AttachedUnlocked {
-            loop_object,
-            cleartext_object,
-        } => {
-            let mount_point = ud.mount_noexec(&cleartext_object).await?;
-            crate::mountpoint::create_symlink(home, label, &mount_point).await?;
-            Ok(OpenedVault {
-                loop_object,
-                cleartext_object,
-                mount_point,
-                loop_was_reused: true,
-            })
-        }
-
-        VaultProbe::AttachedLocked { loop_object } => {
-            let cleartext_object = ud.unlock(&loop_object, passphrase).await?;
-            let mount_point = ud.mount_noexec(&cleartext_object).await?;
-            crate::mountpoint::create_symlink(home, label, &mount_point).await?;
-            Ok(OpenedVault {
-                loop_object,
-                cleartext_object,
-                mount_point,
-                loop_was_reused: true,
-            })
-        }
-
-        // Единственная ветка, где loop поднимаем МЫ → loop_was_reused = false,
-        // и только здесь действует уборка при ошибке.
         VaultProbe::Detached => {
             let file = tokio::fs::OpenOptions::new()
                 .read(true)
@@ -213,42 +277,152 @@ pub async fn open_file_vault(
                 .map_err(Error::Io)?
                 .into_std()
                 .await;
-
+            // С этого момента есть что убирать — guard создаётся сразу после
+            // подъёма loop, без единого `await` между ними.
             let loop_object = ud.loop_setup(file).await?;
+            (OpenGuard::new(ud, loop_object, true), None, None)
+        }
+        VaultProbe::AttachedLocked { loop_object } => {
+            (OpenGuard::new(ud, loop_object, false), None, None)
+        }
+        VaultProbe::AttachedUnlocked {
+            loop_object,
+            cleartext_object,
+        } => (
+            OpenGuard::new(ud, loop_object, false),
+            Some(cleartext_object),
+            None,
+        ),
+        VaultProbe::AttachedOpen {
+            loop_object,
+            cleartext_object,
+            mount_point,
+        } => (
+            OpenGuard::new(ud, loop_object, false),
+            Some(cleartext_object),
+            Some(mount_point),
+        ),
+    };
 
-            let result = async {
-                let cleartext_object = ud.unlock(&loop_object, passphrase).await?;
-                let mount_point = ud.mount_noexec(&cleartext_object).await?;
-                crate::mountpoint::create_symlink(home, label, &mount_point).await?;
-                Ok(OpenedVault {
-                    loop_object: loop_object.clone(),
-                    cleartext_object,
-                    mount_point,
-                    loop_was_reused: false,
-                })
-            }
-            .await;
+    let loop_was_reused = !guard.owns_loop;
+    let loop_object = guard.loop_object.clone();
 
-            match result {
-                Ok(opened) => Ok(opened),
-                Err(source) => {
-                    // Наш loop — наша уборка. Исходная ошибка важнее ошибки
-                    // уборки, поэтому вторая только логируется.
-                    if let Err(e) = ud.ensure_loop_detached(&loop_object).await {
-                        tracing::warn!("open_file_vault: cleanup after error: {e}");
-                    }
-                    Err(source)
-                }
-            }
+    match open_steps(
+        ud,
+        &mut guard,
+        container,
+        label,
+        passphrase,
+        home,
+        cleartext,
+        mount_point,
+    )
+    .await
+    {
+        Ok((cleartext_object, mount_point)) => {
+            guard.disarm();
+            Ok(OpenedVault {
+                loop_object,
+                cleartext_object,
+                mount_point,
+                loop_was_reused,
+            })
+        }
+        Err(source) => {
+            // Ошибка: убираем ЗДЕСЬ и синхронно — надёжнее, чем полагаться на
+            // `Drop`. Guard разоружается после уборки, чтобы она не повторилась
+            // фоновой задачей.
+            guard.cleanup().await;
+            guard.disarm();
+            Err(source)
         }
     }
 }
 
+/// Шаги открытия поверх любой стартовой точки; guard отмечает, что сделали МЫ.
+///
+/// Вынесено из веток `open_file_vault`, чтобы хвост «отпереть → смонтировать →
+/// поставить симлинк» существовал в одном экземпляре: четыре его копии
+/// разошлись бы при первой же правке.
+#[allow(clippy::too_many_arguments)] // все аргументы — данные одной операции
+async fn open_steps(
+    ud: &Udisks,
+    guard: &mut OpenGuard,
+    container: &Path,
+    label: &Label,
+    passphrase: &SecretString,
+    home: &Path,
+    cleartext: Option<ObjPath>,
+    mount_point: Option<PathBuf>,
+) -> Result<(ObjPath, PathBuf)> {
+    let loop_object = guard.loop_object.clone();
+
+    let cleartext_object = match cleartext {
+        // Том отперт не нами. Фразу всё равно проверяем: иначе поле
+        // «парольная фраза» перестаёт быть проверкой в этих состояниях, а
+        // пользователь об этом не узнаёт (Б-7).
+        Some(existing) => {
+            crate::keyslot::verify_passphrase(
+                container,
+                &crate::passphrase::Passphrase::new(passphrase.clone()),
+            )
+            .await?;
+            existing
+        }
+        None => {
+            let opened = ud.unlock(&loop_object, passphrase).await?;
+            guard.unlocked_by_us = true;
+            opened
+        }
+    };
+
+    let mount_point = match mount_point {
+        // Том смонтирован не нами — а значит, возможно, и без `noexec`
+        // (штатный автомонт рабочего стола монтирует именно так). Проверяем
+        // по ядру и перемонтируем только если гарантии нет (М-12).
+        Some(existing) if mount_has_noexec(&existing) => existing,
+        Some(_) | None => {
+            let mounted = ud.mount_noexec(&cleartext_object).await?;
+            if !guard.unlocked_by_us {
+                guard.mounted_by_us = Some(cleartext_object.clone());
+            }
+            mounted
+        }
+    };
+
+    crate::mountpoint::create_symlink(home, label, &mount_point).await?;
+    Ok((cleartext_object, mount_point))
+}
+
+/// Смонтирована ли точка с `noexec` — по `/proc/self/mountinfo`, то есть по
+/// ядру, а не по нашему намерению.
+///
+/// Отсутствие записи трактуем как «гарантии нет»: лучше лишний раз
+/// перемонтировать, чем отдать пользователю том, на котором можно исполнять код.
+fn mount_has_noexec(mount_point: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let target = mount_point.to_string_lossy();
+    text.lines().any(|line| {
+        let mut fields = line.split(' ');
+        // mountinfo: 3-е поле — major:minor, 4-е — root, 5-е — точка монтирования.
+        let mount_field = fields.nth(4);
+        mount_field.is_some_and(|m| m == target) && line.contains("noexec")
+    })
+}
+
 /// Закрыть хранилище, ОСТАВИВ файл контейнера на месте.
 ///
-/// Отличие от [`crate::create::teardown_file_container`] ровно одно: та
-/// удаляет файл (уборка тестового контейнера), эта — не трогает его никогда.
-/// Общий путь у них один и тот же, чтобы не разойтись.
+/// Отличие от [`crate::create::teardown_file_container`] ровно одно: та удаляет
+/// файл (уборка тестового контейнера), эта — не трогает его никогда. Общий путь
+/// у них один и тот же, чтобы не разойтись.
+///
+/// `detach_loop` — брать из [`OpenedVault::loop_was_reused`] инверсией: loop,
+/// который подняли не мы, мы и не отвязываем (М-6 ревью раунда 1). Запереть том
+/// всё равно нужно — этого пользователь и просит, нажимая «Закрыть»; но
+/// принудительно сносить чужое устройство не наше дело, после запирания его
+/// уберёт `autoclear`.
 ///
 /// # Errors
 /// [`Error::UnexpectedUdisksState`], если loop не удалось отвязать; ошибки
@@ -258,18 +432,40 @@ pub async fn close_file_vault(
     loop_object: &ObjPath,
     label: &Label,
     home: &Path,
+    detach_loop: bool,
 ) -> Result<()> {
     let close_result = ud.close_encrypted(loop_object).await;
-    let detach_result = ud.ensure_loop_detached(loop_object).await;
+
+    let detach_result = if detach_loop {
+        ud.ensure_loop_detached(loop_object).await
+    } else {
+        // Чужой loop: не подталкиваем Delete, но убеждаемся, что autoclear
+        // сделал своё дело — иначе «закрыто» было бы утверждением без свидетеля.
+        Ok(())
+    };
 
     match (close_result, detach_result) {
-        // Loop отвязан — том закрыт фактически, что бы ни ответил close.
-        (_, Ok(())) => {
+        // Закрытие состоялось. Если `close_encrypted` при этом жаловался —
+        // говорим об этом в лог: он мог потратить весь бюджет ретраев (~40 с),
+        // и терять этот сигнал молча нельзя (М-10).
+        (close, Ok(())) => {
+            if let Err(e) = close {
+                tracing::warn!("close_file_vault: close_encrypted reported: {e}");
+            }
             crate::mountpoint::remove_symlink(home, label).await?;
             Ok(())
         }
-        // Не отвязан: исходная причина информативнее «stale loop».
+        // Том заперт и размонтирован, но loop остался. Для пользователя
+        // хранилище закрыто, и симлинк обязан уйти вместе с ним: иначе он
+        // повиснет на исчезнувшей точке монтирования и следующее открытие
+        // упадёт на «путь занят, и он не наш» (М-11).
+        (Ok(()), Err(detach)) => {
+            if let Err(e) = crate::mountpoint::remove_symlink(home, label).await {
+                tracing::warn!("close_file_vault: remove_symlink after detach failure: {e}");
+            }
+            Err(detach)
+        }
+        // Не закрылось и не отвязалось: исходная причина информативнее.
         (Err(source), Err(_)) => Err(source),
-        (Ok(()), Err(detach)) => Err(detach),
     }
 }

@@ -204,24 +204,24 @@ pub async fn teardown_file_container(
     // исчезновения из sysfs. Общий шаг с продуктовым закрытием
     // (`lifecycle::close_file_vault`) — разойтись в нём два вызывающих
     // не имеют права.
+    //
+    // Успех этого шага УЖЕ означает, что loop исчез из sysfs, — повторно
+    // спрашивать ядро незачем (М-9 ревью раунда 1).
     if let Err(e) = ud.ensure_loop_detached(loop_object).await {
         tracing::warn!("teardown: ensure_loop_detached: {e}");
+        return Err(Error::UnexpectedUdisksState(format!(
+            "stale loop device left for {loop_object}; refusing to remove {}",
+            container.display()
+        )));
     }
 
     // 4. Только после подтверждения отвязки удаляем файл.
-    if crate::udisks::loop_detached_in_sysfs(loop_object) {
-        match tokio::fs::remove_file(container).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => {
-                tracing::warn!("teardown: failed to remove {}: {e}", container.display());
-                Err(Error::from(e))
-            }
+    match tokio::fs::remove_file(container).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            tracing::warn!("teardown: failed to remove {}: {e}", container.display());
+            Err(Error::from(e))
         }
-    } else {
-        Err(Error::UnexpectedUdisksState(format!(
-            "stale loop device left for {loop_object}; refusing to remove {}",
-            container.display()
-        )))
     }
 }

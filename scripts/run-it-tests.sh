@@ -128,7 +128,11 @@ if command -v losetup >/dev/null && [[ -n $(losetup -a) ]]; then
     echo "ERROR: leftover loop devices" >&2
     exit 1
 fi
-if findmnt -t ext4 -o LABEL | grep -q '^panzir-'; then
+# Метки ФС тестов бывают двух видов: 'panzir-tN' (create_it) и 'tN'
+# (lifecycle_it — там метка ещё и строит путь симлинка ~/panzir-<метка>,
+# поэтому префикс в ней был бы задвоен). Страж обязан видеть оба, иначе он
+# ослеп ровно на новый сьют (М-13 ревью раунда 1).
+if findmnt -t ext4 -o LABEL | grep -qE '^(panzir-t|t)[0-9]+'; then
     echo "ERROR: leftover panzir mounts" >&2
     exit 1
 fi
@@ -152,7 +156,7 @@ if command -v losetup >/dev/null && [[ -n $(losetup -a) ]]; then
     echo "ERROR: tests left behind loop devices" >&2
     exit 1
 fi
-if findmnt -t ext4 -o LABEL | grep -q '^panzir-'; then
+if findmnt -t ext4 -o LABEL | grep -qE '^(panzir-t|t)[0-9]+'; then
     echo "ERROR: tests left behind panzir mounts" >&2
     exit 1
 fi

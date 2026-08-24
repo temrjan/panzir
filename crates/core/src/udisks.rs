@@ -222,6 +222,12 @@ trait ObjectManager {
 
 /// Клиент udisks2. Создаётся через [`Udisks::connect`], который заодно
 /// проверяет присутствие демона на шине.
+///
+/// `Clone` дешёвый: `zbus::Connection` внутри — счётчик ссылок, не новое
+/// соединение. Нужен, чтобы RAII-страховка на частично открытом хранилище
+/// (`lifecycle::OpenGuard`) могла унести клиента в `Drop`, где ссылок на
+/// вызывающего уже нет.
+#[derive(Clone)]
 pub struct Udisks {
     conn: Connection,
     /// Версия демона — доказательство, что udisks2 жив (для diagnostics).
@@ -266,9 +272,16 @@ impl Udisks {
     /// Включить autoclear — поток закрытия файл-контейнера:
     /// `unmount → set_autoclear → lock`, и устройство отвяжется само.
     ///
-    /// Звать строго ДО `lock` (замер 22.08): пока loop наш
-    /// (`SetupByUID == наш uid`) — молча; после `Lock` udisks2 сбрасывает
-    /// `SetupByUID` в 0, и любые операции с loop требуют пароль админа.
+    /// Звать строго ДО `lock` (замер 22.08): пока loop наш, операции идут молча.
+    ///
+    /// **Уточнение по замеру 24.08.** Прежняя редакция этого комментария
+    /// объясняла необходимость порядка тем, что «после `Lock` udisks2
+    /// сбрасывает `SetupByUID` в 0». Это неверно: четыре последовательных
+    /// чтения свойства через `busctl` (после `LoopSetup`, `luksFormat`,
+    /// `Unlock` и `Lock`) дают неизменное `1000`; положительный контроль —
+    /// loop, поднятый root напрямую, отдаёт `0`. Само наблюдение «после `Lock`
+    /// `Delete` начинает спрашивать пароль» не опровергнуто — опровергнуто
+    /// только это объяснение, и порядок вызовов остаётся обязательным.
     pub async fn set_autoclear(&self, loop_object: &ObjPath) -> Result<()> {
         let lp = self.loop_proxy(loop_object).await?;
         Ok(lp.set_autoclear(true, no_interaction_options()).await?)
@@ -279,8 +292,10 @@ impl Udisks {
     /// иначе случайный вызов из GUI покажет пользователю диалог polkit.
     ///
     /// Только для СВОИХ loop (SetupByUID = наш uid — тогда молча). После
-    /// Lock loop «чужой», и Delete спросит пароль — в штатном закрытии
-    /// используйте [`Udisks::set_autoclear`].
+    /// `Lock` `Delete` наблюдался как требующий пароль; механизм не в
+    /// обнулении `SetupByUID` (замер 24.08 это опроверг, см.
+    /// [`Udisks::set_autoclear`]) — в штатном закрытии всё равно используйте
+    /// [`Udisks::set_autoclear`] до запирания.
     ///
     /// Каприз udisks2 2.11 (наблюдено вживую 22.08): `Loop.Delete` нередко
     /// ВОЗВРАЩАЕТ ошибку ENXIO («Failed to detach the backing file»), потому
@@ -654,15 +669,36 @@ pub(crate) fn loop_detached_in_sysfs(loop_object: &ObjPath) -> bool {
     loop_backing_sysfs(loop_object.basename()).is_some_and(|p| !p.exists())
 }
 
-/// Очистить содержимое `loop/backing_file` до пути.
+/// Разобранная бирка `loop/backing_file`.
+struct BackingFile<'a> {
+    /// Путь без служебных хвостов.
+    path: &'a str,
+    /// Ядро пометило файл как удалённый: привязка жива, инода уже нет.
+    deleted: bool,
+}
+
+/// Очистить содержимое `loop/backing_file` до пути и признака удаления.
 ///
 /// Ядро пишет туда путь с завершающим переводом строки (замер 24.08:
 /// `od -c` → `… t . v a u l t \n`), а для файла, удалённого при живой
 /// привязке, добавляет суффикс `" (deleted)"`. Не срезать перевод строки —
 /// значит не совпасть НИ РАЗУ, ни с одним контейнером.
-fn clean_backing_file(raw: &str) -> &str {
+///
+/// Признак удаления **выносится наружу, а не выбрасывается**: loop на удалённой
+/// иноде не имеет отношения к новому файлу, который позже занял то же имя пути
+/// (Б-6 ревью раунда 1).
+fn clean_backing_file(raw: &str) -> BackingFile<'_> {
     let trimmed = raw.trim_end_matches(['\n', '\r']);
-    trimmed.strip_suffix(" (deleted)").unwrap_or(trimmed)
+    match trimmed.strip_suffix(" (deleted)") {
+        Some(path) => BackingFile {
+            path,
+            deleted: true,
+        },
+        None => BackingFile {
+            path: trimmed,
+            deleted: false,
+        },
+    }
 }
 
 /// UID текущего процесса.
@@ -683,7 +719,16 @@ pub(crate) fn current_uid() -> u32 {
 /// `ObjectManager` в этом крейте объявляет только сигнал, а бирку по шине
 /// udisks2 отдаёт байтами с завершающим NUL. sysfs — ядерная правда, на
 /// которую крейт уже опирается в [`loop_detached_in_sysfs`].
-pub(crate) fn find_loops_for_backing_file(container: &Path) -> Result<Vec<ObjPath>> {
+pub(crate) async fn find_loops_for_backing_file(container: &Path) -> Result<Vec<ObjPath>> {
+    // sysfs читается синхронно, но это всё же файловый ввод-вывод в async-пути:
+    // уводим его в блокирующий пул, чтобы не занимать исполнитель (М-1).
+    let container = container.to_owned();
+    tokio::task::spawn_blocking(move || find_loops_blocking(&container))
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?
+}
+
+fn find_loops_blocking(container: &Path) -> Result<Vec<ObjPath>> {
     let target_canon = std::fs::canonicalize(container).ok();
     let mut found = Vec::new();
 
@@ -700,13 +745,20 @@ pub(crate) fn find_loops_for_backing_file(container: &Path) -> Result<Vec<ObjPat
         let Ok(raw) = std::fs::read_to_string(&backing_path) else {
             continue;
         };
-        let candidate = Path::new(clean_backing_file(&raw));
+        let backing = clean_backing_file(&raw);
+        let candidate = Path::new(backing.path);
 
-        let same = match (&target_canon, std::fs::canonicalize(candidate).ok()) {
-            (Some(target), Some(cand)) => *target == cand,
-            // Файл мог быть удалён при живой привязке — канонизировать нечего,
-            // сравниваем как есть.
-            _ => candidate == container,
+        let same = if backing.deleted {
+            // Привязка к удалённой иноде. Совпадением её можно считать только
+            // если ЦЕЛЕВОЙ файл тоже отсутствует: иначе новый, здоровый
+            // контейнер по тому же пути навсегда получил бы диагноз
+            // «два loop» из-за чужого мертвеца (Б-6).
+            target_canon.is_none() && candidate == container
+        } else {
+            match (&target_canon, std::fs::canonicalize(candidate).ok()) {
+                (Some(target), Some(cand)) => *target == cand,
+                _ => candidate == container,
+            }
         };
         if same {
             found.push(ObjPath::block_device(name));
@@ -741,22 +793,24 @@ mod tests {
     fn clean_backing_file_strips_newline_and_deleted_suffix() {
         // Замер 24.08 (`od -c`): ядро пишет путь с завершающим \n. Без обрезки
         // сравнение не совпадёт НИ РАЗУ — защита от второго loop станет немой.
-        assert_eq!(
-            clean_backing_file("/tmp/panzir-t99.vault\n"),
-            "/tmp/panzir-t99.vault"
-        );
-        // Файл удалён при живой привязке.
-        assert_eq!(
-            clean_backing_file("/tmp/panzir-t99.vault (deleted)\n"),
-            "/tmp/panzir-t99.vault"
-        );
+        let live = clean_backing_file("/tmp/panzir-t99.vault\n");
+        assert_eq!(live.path, "/tmp/panzir-t99.vault");
+        assert!(!live.deleted, "живой файл не помечен удалённым");
+
+        // Файл удалён при живой привязке — признак обязан дойти до вызывающего.
+        let gone = clean_backing_file("/tmp/panzir-t99.vault (deleted)\n");
+        assert_eq!(gone.path, "/tmp/panzir-t99.vault");
+        assert!(gone.deleted, "удалённый файл обязан быть помечен");
+
         // Без хвостов — как есть.
-        assert_eq!(clean_backing_file("/tmp/x.vault"), "/tmp/x.vault");
+        let plain = clean_backing_file("/tmp/x.vault");
+        assert_eq!(plain.path, "/tmp/x.vault");
+        assert!(!plain.deleted);
+
         // " (deleted)" внутри имени файла не трогаем — суффикс только в конце.
-        assert_eq!(
-            clean_backing_file("/tmp/a (deleted) b.vault\n"),
-            "/tmp/a (deleted) b.vault"
-        );
+        let tricky = clean_backing_file("/tmp/a (deleted) b.vault\n");
+        assert_eq!(tricky.path, "/tmp/a (deleted) b.vault");
+        assert!(!tricky.deleted);
     }
 
     #[test]
