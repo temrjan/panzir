@@ -26,6 +26,10 @@ allow = [
     "CC0-1.0",
     "0BSD",
     "MIT-0",
+    # Шрифты из графа egui (epaint_default_fonts): Hack, Noto Emoji.
+    "OFL-1.1",
+    # Шрифт Ubuntu-Light оттуда же.
+    "Ubuntu-font-1.0",
 ]
 confidence-threshold = 0.8
 # Пока зависимостей нет, любая строка allow — «unmatched»; warn вместо deny,

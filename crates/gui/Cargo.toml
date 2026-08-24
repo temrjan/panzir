@@ -3,8 +3,45 @@ name = "panzir-gui"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
+description = "panzir GUI — LUKS2 vault manager over udisks2"
 
 [lints]
 workspace = true
 
 [dependencies]
+panzir-core = { path = "../core" }
+
+# Вариант C шипа GUI-стека: единственный набор фич, при котором зелены все
+# четыре проверки cargo-deny. Замеры — DocHub, 2026-08-24-panzir-gui-stack-spike.md.
+eframe = { version = "0.36", default-features = false, features = [
+    "accesskit",
+    "links",
+    "wayland",
+    "x11",
+    "glow",
+    "default_fonts",
+] }
+
+# Прямая зависимость winit нужна НЕ ради вызовов — мы его не зовём.
+# Она выбирает декорации окна без шрифтового парсера: фича
+# wayland-csd-adwaita-notitle даёт sctk-adwaita без ab_glyph, а с ним уходит
+# ttf-parser и красный гейт Security Audit (RUSTSEC-2026-0192, «no safe
+# upgrade available»). Удалить как «неиспользуемую» — вернуть себе advisory.
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "x11",
+    "wayland",
+    "wayland-dlopen",
+    "wayland-csd-adwaita-notitle",
+] }
+
+# Фичи названы явно, а не получены объединением из графа: панель зовёт
+# tokio::time::timeout и владеет рантаймом сама. Уберут "time" из ядра —
+# ломаться должно там, а не здесь.
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["eframe"] }
+tempfile = "3"

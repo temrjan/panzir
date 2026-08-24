@@ -82,12 +82,39 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@a4d2d701318fdc1c6ae17ba8cea8f329c5110eb2 # v2.0.17
         with: { command: check licenses bans sources }
 
+  smoke:
+    name: Window Smoke (Xvfb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
+      # Пакеты нужны только для ЗАПУСКА окна, не для сборки: бинарь линкуется
+      # лишь с libc/libm/libgcc (замер objdump -p), а X11, Wayland и GL
+      # грузятся в рантайме через dlopen. Список — кандидат: он проверяется
+      # этой джобой, и её падение назовёт недостающее.
+      - name: Runtime libraries for the window
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libgl1 libegl1 libx11-6 libxkbcommon-x11-0 libgl1-mesa-dri
+      - run: cargo build -p panzir-gui
+      # Т-13б: окно создаётся, рисует три кадра и закрывается само.
+      # Провал различим по причине: ненулевой код — стек не поднялся или
+      # паника в кадре; код 124 — кадры не идут и сработал таймаут.
+      - name: T-13b — window opens, draws and closes itself
+        env:
+          PANZIR_SMOKE_FRAMES: "3"
+          RUST_LOG: warn
+        run: timeout 60 xvfb-run -a --server-args="-screen 0 1280x800x24" ./target/debug/panzir-gui
+
   release:
     name: Release Build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [fmt, clippy, test, audit, deny]
+    needs: [fmt, clippy, test, audit, deny, smoke]
     permissions:
       contents: write
     steps:
