@@ -90,7 +90,7 @@ async fn t14_open_close_open_keeps_container_file() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = fake_home(dir.path());
     let container = dir.path().join("panzir-t14.vault");
-    let label = Label::new("panzir-t14").expect("label");
+    let label = Label::new("t14").expect("label");
     let pass = SecretString::from("t14-passphrase");
 
     let ud = Udisks::connect().await.expect("udisks2 on the bus");
@@ -151,7 +151,7 @@ async fn t15_second_open_does_not_raise_second_loop() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = fake_home(dir.path());
     let container = dir.path().join("panzir-t15.vault");
-    let label = Label::new("panzir-t15").expect("label");
+    let label = Label::new("t15").expect("label");
     let pass = SecretString::from("t15-passphrase");
 
     let ud = Udisks::connect().await.expect("udisks2 on the bus");
@@ -193,7 +193,7 @@ async fn t16_probe_classifies_live_states() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = fake_home(dir.path());
     let container = dir.path().join("panzir-t16.vault");
-    let label = Label::new("panzir-t16").expect("label");
+    let label = Label::new("t16").expect("label");
     let pass = SecretString::from("t16-passphrase");
 
     let ud = Udisks::connect().await.expect("udisks2 on the bus");
@@ -264,7 +264,7 @@ async fn t17_wrong_passphrase_leaves_no_stale_loop() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = fake_home(dir.path());
     let container = dir.path().join("panzir-t17.vault");
-    let label = Label::new("panzir-t17").expect("label");
+    let label = Label::new("t17").expect("label");
     let pass = SecretString::from("t17-correct-passphrase");
 
     let ud = Udisks::connect().await.expect("udisks2 on the bus");
@@ -307,7 +307,7 @@ async fn t19_two_loops_on_one_container_are_reported() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = fake_home(dir.path());
     let container = dir.path().join("panzir-t19.vault");
-    let label = Label::new("panzir-t19").expect("label");
+    let label = Label::new("t19").expect("label");
     let pass = SecretString::from("t19-passphrase");
 
     let ud = Udisks::connect().await.expect("udisks2 on the bus");
