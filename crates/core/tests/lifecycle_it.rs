@@ -158,7 +158,11 @@ async fn t15_second_open_does_not_raise_second_loop() {
     let created = create_file_container(&ud, &container, 64 * 1024 * 1024, &label, &pass)
         .await
         .expect("container created");
-    assert_eq!(count_loops_by_sysfs(&container), 1, "exactly one loop so far");
+    assert_eq!(
+        count_loops_by_sysfs(&container),
+        1,
+        "exactly one loop so far"
+    );
 
     let opened = open_file_vault(&ud, &container, &label, &pass, &home)
         .await
@@ -245,7 +249,9 @@ async fn t16_probe_classifies_live_states() {
     // 5. Смонтирован → снова AttachedOpen.
     let mount_point = ud.mount_noexec(&cleartext).await.expect("mount");
     match probe_file_vault(&ud, &container).await.expect("probe") {
-        VaultProbe::AttachedOpen { mount_point: mp, .. } => assert_eq!(mp, mount_point),
+        VaultProbe::AttachedOpen {
+            mount_point: mp, ..
+        } => assert_eq!(mp, mount_point),
         other => panic!("expected AttachedOpen after mount, got {other:?}"),
     }
 

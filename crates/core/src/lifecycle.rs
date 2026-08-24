@@ -120,12 +120,7 @@ pub async fn probe_file_vault(ud: &Udisks, container: &Path) -> Result<VaultProb
         Err(e) => return Err(e),
     };
 
-    match ud
-        .mount_points(&cleartext_object)
-        .await?
-        .into_iter()
-        .next()
-    {
+    match ud.mount_points(&cleartext_object).await?.into_iter().next() {
         Some(mount_point) => Ok(VaultProbe::AttachedOpen {
             loop_object,
             cleartext_object,
