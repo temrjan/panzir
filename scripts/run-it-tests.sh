@@ -128,7 +128,11 @@ if command -v losetup >/dev/null && [[ -n $(losetup -a) ]]; then
     echo "ERROR: leftover loop devices" >&2
     exit 1
 fi
-if findmnt -t ext4 -o LABEL | grep -q '^panzir-'; then
+# Метки ФС тестов бывают двух видов: 'panzir-tN' (create_it) и 'tN'
+# (lifecycle_it — там метка ещё и строит путь симлинка ~/panzir-<метка>,
+# поэтому префикс в ней был бы задвоен). Страж обязан видеть оба, иначе он
+# ослеп ровно на новый сьют (М-13 ревью раунда 1).
+if findmnt -t ext4 -o LABEL | grep -qE '^(panzir-t|t)[0-9]+'; then
     echo "ERROR: leftover panzir mounts" >&2
     exit 1
 fi
@@ -138,15 +142,21 @@ if find /tmp -maxdepth 2 -name 'panzir-*.vault' -print -quit 2>/dev/null | grep 
 fi
 
 # 4. Run tests.
-PANZIR_IT=1 cargo test -p panzir-core --test create_it -- --ignored
-PANZIR_IT=1 cargo test -p panzir-core --test pr2_it -- --ignored
+# Необязательный аргумент — фильтр имени теста. Нужен для мутаций: инвариант
+# проверяется прогоном ОДНОГО теста в подготовленной среде, а не всего набора
+# (иначе каждая мутация стоит трёх сьютов). Без аргумента поведение прежнее.
+FILTER="${1:-}"
+
+PANZIR_IT=1 cargo test -p panzir-core --test create_it -- --ignored $FILTER
+PANZIR_IT=1 cargo test -p panzir-core --test pr2_it -- --ignored $FILTER
+PANZIR_IT=1 cargo test -p panzir-core --test lifecycle_it -- --ignored $FILTER
 
 # 5. Post-run sanity check (same as pre-flight).
 if command -v losetup >/dev/null && [[ -n $(losetup -a) ]]; then
     echo "ERROR: tests left behind loop devices" >&2
     exit 1
 fi
-if findmnt -t ext4 -o LABEL | grep -q '^panzir-'; then
+if findmnt -t ext4 -o LABEL | grep -qE '^(panzir-t|t)[0-9]+'; then
     echo "ERROR: tests left behind panzir mounts" >&2
     exit 1
 fi

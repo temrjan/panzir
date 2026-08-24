@@ -9,6 +9,7 @@
 //! передаётся через `--key-file` / `--new-keyfile`.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::fs;
@@ -97,6 +98,60 @@ pub async fn add_keyslot_to_device(
     new: &Passphrase,
 ) -> Result<AddedKeyslot> {
     luks_add_key(device, existing, new, true).await
+}
+
+/// Проверить, подходит ли парольная фраза к заголовку LUKS, **не отпирая** том.
+///
+/// Нужна там, где том уже отперт кем-то другим (штатной утилитой дисков, вторым
+/// экземпляром приложения): без этой проверки поле «парольная фраза» в интерфейсе
+/// перестало бы быть проверкой, а пользователь об этом не узнал бы (Б-7 ревью
+/// раунда 1). Привилегий не добавляет — читает только заголовок.
+///
+/// Стоит одного прохода argon2: это секунды, и они тратятся один раз на нажатие
+/// кнопки «Открыть».
+///
+/// # Errors
+/// [`Error::Command`], если фраза не подходит либо `cryptsetup` не отработал.
+/// Секрет уходит через stdin и в argv/env не попадает.
+pub async fn verify_passphrase(container: &Path, passphrase: &Passphrase) -> Result<()> {
+    let mut child = Command::new("cryptsetup")
+        .arg("luksOpen")
+        .arg("--test-passphrase")
+        .arg("--key-file")
+        .arg("-")
+        .arg(container)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(Error::Io)?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        passphrase.write_to_stdin(&mut stdin).await?;
+        drop(stdin);
+    }
+
+    let status = match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => return Err(Error::Io(e)),
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(Error::Command {
+                cmd: "cryptsetup luksOpen --test-passphrase".to_owned(),
+                status: "timeout".to_owned(),
+            });
+        }
+    };
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::Command {
+            cmd: "cryptsetup luksOpen --test-passphrase".to_owned(),
+            status: status.to_string(),
+        })
+    }
 }
 
 async fn luks_add_key(

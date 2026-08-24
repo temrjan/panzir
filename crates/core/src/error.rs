@@ -47,8 +47,10 @@ pub enum Error {
         status: String,
     },
 
-    /// udisks2 не вернул ожидаемые данные (например, том заперт, когда ждали
-    /// отпертый: сентинел CleartextDevice == "/").
+    /// udisks2 не вернул ожидаемые данные (объект пропал, поле не того вида
+    /// и т.п.). Случай «том заперт» сюда НЕ входит — у него собственный
+    /// вариант [`Error::VolumeLocked`], чтобы вызывающий отличал «заперто»
+    /// от «шина отвалилась» матчем по типу, а не по тексту сообщения.
     #[error("unexpected udisks2 state: {0}")]
     UnexpectedUdisksState(String),
 
@@ -71,4 +73,44 @@ pub enum Error {
     /// Метка уже занята в реестре.
     #[error("duplicate vault label: {0}")]
     DuplicateLabel(String),
+
+    /// Файла контейнера нет на диске: запись в реестре есть, а хранилище
+    /// переименовали или удалили мимо приложения.
+    #[error("container file is missing: {path}")]
+    ContainerMissing {
+        /// Путь, по которому контейнер ожидался.
+        path: String,
+    },
+
+    /// Контейнер уже подключён loop-устройством ДРУГОГО пользователя.
+    /// Второй loop на тот же файл поднимать нельзя: это две dm-crypt поверх
+    /// одного LUKS-тома, то есть порча данных.
+    #[error("container is already attached by uid {uid}: {path}")]
+    VaultAlreadyAttached {
+        /// Путь контейнера.
+        path: String,
+        /// Владелец существующего loop (`SetupByUID`).
+        uid: u32,
+    },
+
+    /// Том заперт: udisks2 отдаёт сентинел `CleartextDevice == "/"`.
+    /// Отдельный вариант, а не текст в [`Error::UnexpectedUdisksState`], —
+    /// иначе «заперто» неотличимо от сбоя шины (страж на механизм, не на
+    /// значение).
+    #[error("volume is locked: {object}")]
+    VolumeLocked {
+        /// Объект блочного устройства с интерфейсом Encrypted.
+        object: String,
+    },
+
+    /// На одном файле контейнера найдено больше одного loop-устройства.
+    /// Это уже случившаяся порча (две dm-crypt поверх одного тома), а не
+    /// предупреждение: молчать и брать первый нельзя.
+    #[error("container has {count} loop devices attached (data corruption risk): {path}")]
+    MultipleLoopsAttached {
+        /// Путь контейнера.
+        path: String,
+        /// Сколько loop-устройств указывают на него.
+        count: usize,
+    },
 }
