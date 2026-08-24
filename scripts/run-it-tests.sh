@@ -140,6 +140,7 @@ fi
 # 4. Run tests.
 PANZIR_IT=1 cargo test -p panzir-core --test create_it -- --ignored
 PANZIR_IT=1 cargo test -p panzir-core --test pr2_it -- --ignored
+PANZIR_IT=1 cargo test -p panzir-core --test lifecycle_it -- --ignored
 
 # 5. Post-run sanity check (same as pre-flight).
 if command -v losetup >/dev/null && [[ -n $(losetup -a) ]]; then

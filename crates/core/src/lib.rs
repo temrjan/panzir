@@ -11,6 +11,7 @@ pub mod deps;
 pub mod error;
 pub mod header;
 pub mod keyslot;
+pub mod lifecycle;
 pub mod mountpoint;
 pub mod passphrase;
 pub mod registry;

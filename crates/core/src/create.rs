@@ -200,19 +200,12 @@ pub async fn teardown_file_container(
         tracing::warn!("teardown: close_encrypted failed: {e}");
     }
 
-    // 2. Fallback Delete только если loop всё ещё виден в sysfs.
-    if !crate::udisks::loop_detached_in_sysfs(loop_object)
-        && let Err(e) = ud.loop_delete(loop_object).await
-    {
-        tracing::warn!("teardown: loop_delete failed: {e}");
-    }
-
-    // 3. Ждём исчезновения из sysfs, макс. 5 с.
-    for _ in 0..25 {
-        if crate::udisks::loop_detached_in_sysfs(loop_object) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // 2-3. Подтолкнуть Delete, если autoclear не сработал, и дождаться
+    // исчезновения из sysfs. Общий шаг с продуктовым закрытием
+    // (`lifecycle::close_file_vault`) — разойтись в нём два вызывающих
+    // не имеют права.
+    if let Err(e) = ud.ensure_loop_detached(loop_object).await {
+        tracing::warn!("teardown: ensure_loop_detached: {e}");
     }
 
     // 4. Только после подтверждения отвязки удаляем файл.
