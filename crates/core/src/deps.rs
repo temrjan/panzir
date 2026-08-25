@@ -53,49 +53,18 @@ fn in_path(bin: &str) -> bool {
     in_path_in(std::env::var_os("PATH").as_deref(), bin)
 }
 
-/// Известные polkit-агенты аутентификации (процесс диалога ввода пароля).
-const POLKIT_AGENTS: &[&str] = &[
-    "polkit-gnome-authentication-agent",
-    "gcr-prompter",
-    "polkit-kde-authentication-agent",
-    "lxqt-policykit-agent",
-    "mate-polkit",
-    "pantheon-agent-polkit",
-    "polkit-efl-authentication-agent",
-];
-
-/// Совпадает ли cmdline с известным агентом — по basename argv[0], не по
-/// подстроке: `grep mate-polkit notes.md` не должен считаться агентом.
-fn cmdline_is_polkit_agent(cmdline: &[u8]) -> bool {
-    let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or(cmdline);
-    let base = argv0.rsplit(|&b| b == b'/').next().unwrap_or(argv0);
-    let Ok(base) = std::str::from_utf8(base) else {
-        return false;
-    };
-    POLKIT_AGENTS.contains(&base)
-}
-
-/// Жив ли хоть один polkit-агент сессии (обход /proc/*/cmdline).
-fn polkit_agent_alive() -> bool {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    entries
-        .filter_map(std::result::Result::ok)
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .chars()
-                .all(|c| c.is_ascii_digit())
-        })
-        .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
-        .any(|cmdline| cmdline_is_polkit_agent(&cmdline))
-}
-
 /// Проверяет локальные зависимости: утилиты, которыми пользуется прод-путь
 /// (stat/chattr/fallocate — создание контейнера; cryptsetup — keyslot/backup,
-/// PR-2), pkexec и polkit-агента. udisks2 проверяется отдельно — он требует
-/// async-контекста (см. [`crate::udisks::Udisks::connect`]).
+/// PR-2) и `pkexec`. udisks2 проверяется отдельно — он требует async-контекста
+/// (см. [`crate::udisks::Udisks::connect`]).
+///
+/// Агента аутентификации polkit здесь нет намеренно, и заводить обратно его
+/// не нужно: единственный способ наблюдать регистрацию средствами polkit —
+/// попытаться зарегистрировать своего, то есть занять единственный слот
+/// агента сессии. У сессии без агента — ровно там, ради чего проверка и
+/// существовала бы, — такая проба сама создаёт неисправность, которую должна
+/// ловить. Отсутствие прав доходит до человека реактивно, в момент операции
+/// (инвариант 10 `CLAUDE.md`).
 #[must_use]
 pub fn check_local_deps() -> DepsReport {
     let mut statuses = Vec::new();
@@ -112,13 +81,6 @@ pub fn check_local_deps() -> DepsReport {
             hint: format!("установите пакет {hint} (dnf install {hint})"),
         });
     }
-    statuses.push(DepStatus {
-        name: "polkit agent",
-        ok: polkit_agent_alive(),
-        hint: "войдите в графическую сессию с агентом аутентификации polkit \
-               (в GNOME он встроен)"
-            .to_owned(),
-    });
     DepsReport { statuses }
 }
 
@@ -127,6 +89,23 @@ pub fn check_local_deps() -> DepsReport {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Плашка обязана называть только то, что получено измерением.
+    ///
+    /// Порядок в ожидании значим намеренно: это порядок строк плашки, которые
+    /// увидит человек. Замена на сравнение множеств тихо потеряет эту
+    /// проверку — тест останется зелёным, а строки на экране смогут
+    /// переставиться.
+    #[test]
+    fn report_names_only_what_is_actually_measured() {
+        let names: Vec<&str> = check_local_deps().statuses.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            ["stat", "chattr", "fallocate", "cryptsetup", "pkexec"],
+            "плашка обязана называть только то, что проверено измерением: \
+             запись, чьё значение получено догадкой, — ложная тревога при каждом запуске"
+        );
+    }
 
     #[test]
     fn in_path_finds_and_rejects_deterministically() {
@@ -142,20 +121,6 @@ mod tests {
         assert!(!in_path_in(Some(&paths), "fallocate"));
         // PATH отсутствует вовсе.
         assert!(!in_path_in(None, "cryptsetup"));
-    }
-
-    #[test]
-    fn polkit_agent_cmdline_matches_argv0_basename_only() {
-        // Настоящий агент: полный путь в argv[0].
-        assert!(cmdline_is_polkit_agent(
-            b"/usr/libexec/polkit-gnome-authentication-agent\0".as_slice()
-        ));
-        // Декой: имя агента в аргументе, не в argv[0].
-        assert!(!cmdline_is_polkit_agent(
-            b"grep\0mate-polkit\0notes.md\0".as_slice()
-        ));
-        // Пустой cmdline (kernel thread) — не агент.
-        assert!(!cmdline_is_polkit_agent(b"".as_slice()));
     }
 
     #[test]
