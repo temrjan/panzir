@@ -17,6 +17,7 @@ use panzir_core::registry::{Registry, VaultEntry};
 use panzir_core::udisks::{ObjPath, Udisks};
 use panzir_core::vault::{Label, VaultKind, VaultState};
 use secrecy::SecretString;
+use secrecy::zeroize::Zeroize as _;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
@@ -413,6 +414,22 @@ impl App {
         }
     }
 
+    /// Набранная фраза не переживает уход с карточки.
+    ///
+    /// Одно место на все пути: свернули карточку, раскрыли другую, список
+    /// перечитался — черновик перестал соответствовать раскрытой записи и
+    /// затирается. Без этого начатый и брошенный ввод просто выпадал бы из
+    /// памяти нетронутым (находка ревью Гейта-2).
+    fn forget_stale_passphrase(&mut self) {
+        let matches_card = match (&self.unlock, &self.expanded) {
+            (Some(draft), Some(label)) => draft.target.as_str() == label.as_str(),
+            _ => false,
+        };
+        if !matches_card && let Some(mut draft) = self.unlock.take() {
+            draft.text.zeroize();
+        }
+    }
+
     /// Путь контейнера записи. `None` — это носитель, а не файл.
     fn container_of(&self, label: &Label) -> Option<PathBuf> {
         self.entries
@@ -449,8 +466,15 @@ impl App {
                     .filter(|d| d.target.as_str() == label.as_str())
                     .map(|d| std::mem::take(&mut d.text));
                 self.unlock = None;
-                let Some(typed) = typed else { return };
-                let passphrase = SecretString::from(typed);
+                let Some(mut typed) = typed else { return };
+                // Секрет строится из `&str`: `SecretString` копирует его в
+                // собственный буфер, который затирает при уничтожении, — а
+                // исходную строку мы затираем сами, здесь. Отдать `String`
+                // целиком было бы короче, но перевод `String → Box<str>`
+                // вправе перевыделить память, и тогда незачищенная копия
+                // осталась бы лежать в куче (находка ревью Гейта-2).
+                let passphrase = SecretString::from(typed.as_str());
+                typed.zeroize();
 
                 match self.container_of(&label) {
                     Some(container) => {
@@ -541,6 +565,7 @@ impl eframe::App for App {
             let ctx = ui.ctx().clone();
             self.handle(&ctx, action);
         }
+        self.forget_stale_passphrase();
 
         self.tick_smoke(ui.ctx());
     }
@@ -919,6 +944,42 @@ mod tests {
                 .accesskit_node()
                 .is_disabled(),
             "во время операции действие карточки осталось доступным"
+        );
+    }
+
+    /// Начатый и брошенный ввод не остаётся в памяти: свернули карточку —
+    /// черновик снят.
+    ///
+    /// # Что этот тест доказывает, а что нет
+    /// Доказывает, что черновик **снят** при уходе с карточки. Что его буфер
+    /// при этом **затёрт**, тест доказать не может: содержимое освобождённой
+    /// памяти из безопасного Rust не прочитать, а `unsafe_code = "forbid"`
+    /// не пустит попытку. Затирание держится вызовом `zeroize` в
+    /// [`App::forget_stale_passphrase`] и читается глазами на ревью.
+    #[test]
+    fn an_abandoned_passphrase_does_not_survive_leaving_the_card() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_typing_passphrase(&mut harness);
+
+        harness
+            .state_mut()
+            .unlock
+            .as_mut()
+            .expect("черновик ввода")
+            .text = "начал-и-передумал".to_owned();
+        harness.run();
+        assert!(
+            harness.state().unlock.is_some(),
+            "черновика нет до опыта — проверять нечего"
+        );
+
+        harness.get_by_label("Свернуть").click();
+        harness.run();
+
+        assert!(
+            harness.state().unlock.is_none(),
+            "брошенный ввод пережил уход с карточки"
         );
     }
 

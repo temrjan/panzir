@@ -6,6 +6,7 @@
 use eframe::egui;
 use panzir_core::registry::VaultEntry;
 use panzir_core::vault::{Label, VaultKind, VaultState};
+use secrecy::zeroize::Zeroize as _;
 
 use crate::app::{EnvLine, kind_text, state_text};
 
@@ -251,8 +252,11 @@ fn show_card(
                 action = Some(ListAction::Open(label.clone()));
             }
             if ui.button("Отмена").clicked() {
-                // Отмена — тоже уход секрета из памяти виджета, не только
-                // закрытие поля.
+                // Отмена — уход секрета из памяти, а не закрытие поля: буфер
+                // затирается ДО того, как черновик выпадет из области видимости.
+                if let Some(draft) = unlock.as_mut() {
+                    draft.text.zeroize();
+                }
                 *unlock = None;
             }
         } else if ui.button("Открыть").clicked() {
