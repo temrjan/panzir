@@ -39,6 +39,12 @@ winit = { version = "0.30", default-features = false, features = [
 # tokio::time::timeout и владеет рантаймом сама. Уберут "time" из ядра —
 # ломаться должно там, а не здесь.
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
+# Прямая связь с крейтом, который УЖЕ в графе (его тянет panzir-core).
+# Новых крейтов в сборку не приходит — только объявленное ребро: окну нужен
+# `SecretString`, потому что `lifecycle::open_file_vault` принимает именно его.
+# Держать пароль в обычной `String` до самого ядра было бы хуже.
+secrecy = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
