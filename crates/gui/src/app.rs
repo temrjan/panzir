@@ -199,6 +199,7 @@ pub struct App {
     bus_probe: Option<JoinHandle<UdisksStatus>>,
     message: Option<String>,
     rename: Option<RenameDraft>,
+    expanded: Option<Label>,
 }
 
 impl App {
@@ -236,6 +237,7 @@ impl App {
             bus_probe: None,
             message: None,
             rename: None,
+            expanded: None,
         };
         app.rebuild_env();
         app.spawn_op(&cc.egui_ctx, Op::Reload);
@@ -428,6 +430,7 @@ impl eframe::App for App {
                 message: self.message.as_deref(),
                 busy: self.pending.is_some(),
                 rename: &mut self.rename,
+                expanded: &mut self.expanded,
             },
         );
         if let Some(action) = action {
@@ -604,6 +607,44 @@ mod tests {
         }))
         .expect("записать фикстуру");
         registry
+    }
+
+    /// Фикстура с ОТКРЫТЫМ хранилищем: отдельная от `fixture`, чтобы не
+    /// трогать записи, на которые опираются тесты 3b.
+    fn fixture_open(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let registry = dir.join("vaults.toml");
+        let container = dir.join("t-open.vault");
+        std::fs::write(&container, b"").expect("создать файл-пустышку");
+        let mount = dir.join("mnt-t-open");
+        std::fs::create_dir_all(&mount).expect("создать точку монтирования");
+
+        let rt = Runtime::new().expect("рантайм для фикстуры");
+        rt.block_on(Registry::with_write_lock_at(&registry, |r| {
+            r.add(VaultEntry::new(
+                Label::new("t-open").expect("метка"),
+                VaultKind::File(container.clone()),
+                VaultState::Open {
+                    mount_point: mount.clone(),
+                },
+            ))?;
+            Ok(())
+        }))
+        .expect("записать фикстуру");
+        (registry, mount)
+    }
+
+    /// Карточка обязана показывать ФАКТИЧЕСКУЮ точку монтирования, сообщённую
+    /// udisks2 и сохранённую в записи, — а не угаданный путь симлинка.
+    #[test]
+    fn card_shows_the_real_mount_point_when_open() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let (registry, mount) = fixture_open(dir.path());
+        let mut harness = harness_at(registry);
+
+        harness.get_by_label_contains("Подробнее").click();
+        harness.run();
+
+        harness.get_by_label_contains(&mount.display().to_string());
     }
 
     fn harness_at(registry: std::path::PathBuf) -> Harness<'static, App> {

@@ -5,7 +5,7 @@
 
 use eframe::egui;
 use panzir_core::registry::VaultEntry;
-use panzir_core::vault::Label;
+use panzir_core::vault::{Label, VaultKind, VaultState};
 
 use crate::app::{EnvLine, kind_text, state_text};
 
@@ -42,6 +42,10 @@ pub struct ListInput<'a> {
     pub busy: bool,
     /// Начатое переименование.
     pub rename: &'a mut Option<RenameDraft>,
+    /// Метка записи, чья карточка раскрыта. Раскрыта не более одной: операция
+    /// всё равно идёт одна за раз, а два раскрытых поля пароля означали бы два
+    /// секрета в памяти вместо одного.
+    pub expanded: &'a mut Option<Label>,
 }
 
 /// Рисует экран и возвращает намерение человека, если оно было.
@@ -60,7 +64,7 @@ pub fn show(ui: &mut egui::Ui, input: ListInput<'_>) -> Option<ListAction> {
         ui.label("Хранилищ пока нет");
     } else {
         for entry in input.entries {
-            if let Some(a) = show_entry(ui, entry, input.busy, input.rename) {
+            if let Some(a) = show_entry(ui, entry, input.busy, input.rename, input.expanded) {
                 action = Some(a);
             }
         }
@@ -85,9 +89,15 @@ fn show_entry(
     entry: &VaultEntry,
     busy: bool,
     rename: &mut Option<RenameDraft>,
+    expanded: &mut Option<Label>,
 ) -> Option<ListAction> {
     let mut action = None;
     let label = entry.label().clone();
+    // Считаем ДО кнопки: переключение вступает в силу следующим кадром, иначе
+    // карточка раскрывалась бы и схлопывалась в одном и том же кадре.
+    let is_expanded = expanded
+        .as_ref()
+        .is_some_and(|l| l.as_str() == label.as_str());
 
     ui.horizontal(|ui| {
         ui.label(format!(
@@ -135,7 +145,35 @@ fn show_entry(
                 }
             });
         }
+
+        // Раскрытие карточки доступно и во время операции: оно ничего не
+        // меняет ни в системе, ни в реестре — только показывает.
+        if ui
+            .button(if is_expanded { "Свернуть" } else { "Подробнее" })
+            .clicked()
+        {
+            *expanded = if is_expanded { None } else { Some(label.clone()) };
+        }
     });
 
+    if is_expanded {
+        ui.indent(label.as_str(), |ui| show_card(ui, entry));
+    }
+
     action
+}
+
+/// Карточка хранилища: где лежит и где смонтировано.
+fn show_card(ui: &mut egui::Ui, entry: &VaultEntry) {
+    match entry.kind() {
+        VaultKind::File(path) => ui.label(format!("Файл: {}", path.display())),
+        VaultKind::Device { uuid } => ui.label(format!("Носитель, UUID тома: {uuid}")),
+    };
+
+    // Точка монтирования — фактическая, из ответа udisks2, сохранённая в
+    // записи. Путь симлинка сюда не подставляется: симлинк — наша выдумка,
+    // а человеку нужно место, где лежат его файлы.
+    if let VaultState::Open { mount_point } = entry.state() {
+        ui.label(format!("Смонтировано: {}", mount_point.display()));
+    }
 }
