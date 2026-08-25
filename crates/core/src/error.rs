@@ -14,7 +14,7 @@ pub enum Error {
     /// Зависимость не найдена или не работает; подсказка — что установить.
     #[error("dependency missing: {name} — {hint}")]
     MissingDependency {
-        /// Имя зависимости (udisks2, cryptsetup, pkexec, stat/chattr/fallocate, polkit agent).
+        /// Имя зависимости (udisks2, cryptsetup, pkexec, stat/chattr/fallocate).
         name: &'static str,
         /// Человеческая подсказка, как починить.
         hint: String,
