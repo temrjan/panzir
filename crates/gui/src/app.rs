@@ -899,7 +899,10 @@ mod tests {
             .click();
         harness.run();
         assert!(
-            !harness.get_by_label("Открыть").accesskit_node().is_disabled(),
+            !harness
+                .get_by_label("Открыть")
+                .accesskit_node()
+                .is_disabled(),
             "до опыта кнопка уже неактивна — проверка ничего не докажет"
         );
 
@@ -911,7 +914,10 @@ mod tests {
         harness.run();
 
         assert!(
-            harness.get_by_label("Открыть").accesskit_node().is_disabled(),
+            harness
+                .get_by_label("Открыть")
+                .accesskit_node()
+                .is_disabled(),
             "во время операции действие карточки осталось доступным"
         );
     }

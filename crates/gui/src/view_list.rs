@@ -175,10 +175,18 @@ fn show_entry(
         // Раскрытие карточки доступно и во время операции: оно ничего не
         // меняет ни в системе, ни в реестре — только показывает.
         if ui
-            .button(if is_expanded { "Свернуть" } else { "Подробнее" })
+            .button(if is_expanded {
+                "Свернуть"
+            } else {
+                "Подробнее"
+            })
             .clicked()
         {
-            *expanded = if is_expanded { None } else { Some(label.clone()) };
+            *expanded = if is_expanded {
+                None
+            } else {
+                Some(label.clone())
+            };
         }
     });
 
