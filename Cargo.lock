@@ -2185,6 +2185,7 @@ dependencies = [
  "eframe",
  "egui_kittest",
  "panzir-core",
+ "secrecy",
  "tempfile",
  "tokio",
  "tracing",

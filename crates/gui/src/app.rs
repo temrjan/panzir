@@ -16,10 +16,11 @@ use panzir_core::lifecycle::{self, VaultProbe};
 use panzir_core::registry::{Registry, VaultEntry};
 use panzir_core::udisks::{ObjPath, Udisks};
 use panzir_core::vault::{Label, VaultKind, VaultState};
+use secrecy::SecretString;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
-use crate::view_list::{self, ListAction, ListInput, RenameDraft};
+use crate::view_list::{self, ListAction, ListInput, RenameDraft, UnlockDraft};
 
 /// Сколько ждём завершения операции в тестах, прежде чем признать зависание.
 /// Не «пауза для стабилизации»: ожидание идёт по настоящему сигналу завершения
@@ -54,6 +55,16 @@ enum Op {
     Reload,
     /// Убрать запись из реестра. Контейнер на диске не трогается.
     Remove(Label),
+    /// Открыть хранилище набранной фразой.
+    Open {
+        /// Метка записи.
+        label: Label,
+        /// Путь к файлу-контейнеру.
+        container: PathBuf,
+        /// Секрет. Дальше окна в открытом виде не живёт: `SecretString`
+        /// затирает себя при уничтожении.
+        passphrase: SecretString,
+    },
     /// Закрыть хранилище: отпереть нельзя без пароля, а запереть — можно.
     Close {
         /// Метка записи.
@@ -212,6 +223,7 @@ pub struct App {
     message: Option<String>,
     rename: Option<RenameDraft>,
     expanded: Option<Label>,
+    unlock: Option<UnlockDraft>,
 }
 
 impl App {
@@ -254,6 +266,7 @@ impl App {
             message: None,
             rename: None,
             expanded: None,
+            unlock: None,
         };
         app.rebuild_env();
         app.spawn_op(&cc.egui_ctx, Op::Reload);
@@ -400,29 +413,67 @@ impl App {
         }
     }
 
+    /// Путь контейнера записи. `None` — это носитель, а не файл.
+    fn container_of(&self, label: &Label) -> Option<PathBuf> {
+        self.entries
+            .iter()
+            .find(|e| e.label().as_str() == label.as_str())
+            .and_then(|e| match e.kind() {
+                VaultKind::File(path) => Some(path.clone()),
+                VaultKind::Device { .. } => None,
+            })
+    }
+
+    /// Отказ по носителю произносится словами: молчание здесь — тот же дефект,
+    /// что и ложное сообщение (инвариант 10).
+    fn refuse_device(&mut self) {
+        self.message = Some(
+            "носители пока не поддержаны — в этом круге приложение умеет только \
+             файлы-хранилища"
+                .to_owned(),
+        );
+    }
+
     fn handle(&mut self, ctx: &egui::Context, action: ListAction) {
         match action {
+            ListAction::Open(label) => {
+                // Секрет забирается `mem::take`: буфер виджета остаётся пустой
+                // строкой, копии не создаётся, а черновик снимается сразу — и
+                // при успехе, и при отказе. Оставлять фразу в поле «чтобы
+                // поправить опечатку» значило бы не выполнить единственное
+                // обещание, которое мы дали: защитить участок от клавиши до
+                // `SecretString`.
+                let typed = self
+                    .unlock
+                    .as_mut()
+                    .filter(|d| d.target.as_str() == label.as_str())
+                    .map(|d| std::mem::take(&mut d.text));
+                self.unlock = None;
+                let Some(typed) = typed else { return };
+                let passphrase = SecretString::from(typed);
+
+                match self.container_of(&label) {
+                    Some(container) => {
+                        self.spawn_op(
+                            ctx,
+                            Op::Open {
+                                label,
+                                container,
+                                passphrase,
+                            },
+                        );
+                    }
+                    None => self.refuse_device(),
+                }
+            }
             ListAction::Close(label) => {
                 // Путь контейнера берём из записи: в `Op` он приходит уже
                 // разобранным, чтобы фоновая задача не читала реестр второй раз.
-                let container = self
-                    .entries
-                    .iter()
-                    .find(|e| e.label().as_str() == label.as_str())
-                    .and_then(|e| match e.kind() {
-                        VaultKind::File(path) => Some(path.clone()),
-                        VaultKind::Device { .. } => None,
-                    });
-                match container {
+                match self.container_of(&label) {
                     Some(container) => {
                         self.spawn_op(ctx, Op::Close { label, container });
                     }
-                    // Отказ не молчит (инвариант 10): носители в этом круге
-                    // не поддержаны, и человек обязан узнать это словами.
-                    None => {
-                        self.message =
-                            Some("носители пока не поддержаны — умеем только файлы-хранилища".to_owned());
-                    }
+                    None => self.refuse_device(),
                 }
             }
             ListAction::Remove(label) => {
@@ -483,6 +534,7 @@ impl eframe::App for App {
                 busy: self.pending.is_some(),
                 rename: &mut self.rename,
                 expanded: &mut self.expanded,
+                unlock: &mut self.unlock,
             },
         );
         if let Some(action) = action {
@@ -503,6 +555,40 @@ async fn run_op(path: &std::path::Path, home: &std::path::Path, op: Op) -> OpOut
         Op::Remove(label) => write_then_read(path, move |r| r.remove(&label)).await,
         Op::Rename { old, new } => write_then_read(path, move |r| r.rename(&old, new)).await,
         Op::Close { label, container } => run_close(path, home, &label, &container).await,
+        Op::Open {
+            label,
+            container,
+            passphrase,
+        } => run_open(path, home, &label, &container, &passphrase).await,
+    }
+}
+
+/// Открытие: одна задача, один секрет, одно пробуждение окна.
+async fn run_open(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    label: &Label,
+    container: &std::path::Path,
+    passphrase: &SecretString,
+) -> OpOutcome {
+    let ud = match Udisks::connect().await {
+        Ok(ud) => ud,
+        Err(e) => return OpOutcome::Failed(error_text(&e)),
+    };
+    match lifecycle::open_file_vault(&ud, container, label, passphrase, home).await {
+        // Точка монтирования — из ответа udisks2, не угаданная: путь симлинка
+        // сюда не подставляется (спека п.2 скоупа).
+        Ok(opened) => {
+            set_state_then_read(
+                path,
+                label,
+                VaultState::Open {
+                    mount_point: opened.mount_point,
+                },
+            )
+            .await
+        }
+        Err(e) => OpOutcome::Failed(error_text(&e)),
     }
 }
 
@@ -630,7 +716,7 @@ mod tests {
     use std::path::Path;
 
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT as _, Queryable};
     use panzir_core::vault::VaultState;
 
     use super::*;
@@ -758,6 +844,144 @@ mod tests {
         }))
         .expect("записать фикстуру");
         registry
+    }
+
+    /// Раскрыть карточку первой записи и открыть поле ввода фразы.
+    fn start_typing_passphrase(harness: &mut Harness<'static, App>) {
+        harness
+            .get_all_by_label("Подробнее")
+            .next()
+            .expect("кнопка раскрытия первой записи")
+            .click();
+        harness.run();
+        harness.get_by_label("Открыть").click();
+        harness.run();
+    }
+
+    /// Единственное обещание, которое мы дали про секрет, — участок от клавиши
+    /// до `SecretString`. Буфер виджета обязан опустеть при отправке, и это
+    /// проверяется, а не декларируется.
+    #[test]
+    fn passphrase_buffer_is_emptied_on_submit() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_typing_passphrase(&mut harness);
+
+        harness
+            .state_mut()
+            .unlock
+            .as_mut()
+            .expect("черновик ввода")
+            .text = "фраза-которая-не-должна-остаться".to_owned();
+        harness.get_by_label("Открыть").click();
+        harness.run();
+
+        assert!(
+            harness.state().unlock.is_none(),
+            "фраза осталась в состоянии виджета после отправки"
+        );
+    }
+
+    /// Пока операция идёт, действия карточки недоступны: иначе двойной клик
+    /// отправит две правки, а человек не поймёт, какая из них победила.
+    ///
+    /// Занятость наводится задачей, которая **не завершается никогда**, — это
+    /// детерминированно, в отличие от настоящей операции, чей срок зависит от
+    /// загрузки машины.
+    #[test]
+    fn card_actions_are_disabled_while_an_operation_runs() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        harness
+            .get_all_by_label("Подробнее")
+            .next()
+            .expect("кнопка раскрытия первой записи")
+            .click();
+        harness.run();
+        assert!(
+            !harness.get_by_label("Открыть").accesskit_node().is_disabled(),
+            "до опыта кнопка уже неактивна — проверка ничего не докажет"
+        );
+
+        let ctx = harness.ctx.clone();
+        let never = harness
+            .state()
+            .spawn_waking(&ctx, std::future::pending::<OpOutcome>());
+        harness.state_mut().pending = Some(never);
+        harness.run();
+
+        assert!(
+            harness.get_by_label("Открыть").accesskit_node().is_disabled(),
+            "во время операции действие карточки осталось доступным"
+        );
+    }
+
+    /// Отказ ядра не имеет права менять список: мы не знаем, что стало с томом,
+    /// а показать выдуманное состояние хуже, чем оставить прежнее.
+    #[test]
+    fn a_failed_operation_leaves_the_list_untouched_and_says_why() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        let before: Vec<String> = harness
+            .state()
+            .entries
+            .iter()
+            .map(|e| format!("{}:{}", e.label().as_str(), state_text(e.state())))
+            .collect();
+
+        harness
+            .state_mut()
+            .apply(Ok(OpOutcome::Failed("фраза не подошла".to_owned())));
+        harness.run();
+
+        let after: Vec<String> = harness
+            .state()
+            .entries
+            .iter()
+            .map(|e| format!("{}:{}", e.label().as_str(), state_text(e.state())))
+            .collect();
+        assert_eq!(before, after, "отказ изменил список, хотя не имел права");
+        harness.get_by_label_contains("фраза не подошла");
+    }
+
+    /// Таймаут: длительность приходит параметром (инвариант 9), иначе этот тест
+    /// стоил бы минуты ожидания на каждом прогоне. Состояние записи после
+    /// таймаута не меняется — мы не знаем, чем кончилась операция.
+    #[test]
+    fn a_timed_out_operation_says_so_and_leaves_the_record_alone() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_typing_passphrase(&mut harness);
+        // Срок ужимается ЗДЕСЬ, а не при создании окна: таймаут накрывает и
+        // первичную загрузку списка, и с нулём при старте записей просто не
+        // появилось бы — тест падал бы на подготовке, а не на предмете
+        // проверки. Ноль, а не «маленькое число»: миллисекунда соревнуется с
+        // реальной операцией, и исход зависел бы от загрузки машины.
+        harness.state_mut().op_timeout = Duration::ZERO;
+
+        harness
+            .state_mut()
+            .unlock
+            .as_mut()
+            .expect("черновик ввода")
+            .text = "любая".to_owned();
+        harness.get_by_label("Открыть").click();
+        harness.run();
+        harness.state_mut().block_until_idle();
+        harness.run();
+
+        harness.get_by_label_contains("не откликнулось");
+        let alpha = harness
+            .state()
+            .entries
+            .iter()
+            .find(|e| e.label().as_str() == "t-alpha")
+            .expect("запись на месте");
+        assert_eq!(
+            alpha.state(),
+            &VaultState::Closed,
+            "таймаут изменил состояние записи, хотя исход операции неизвестен"
+        );
     }
 
     /// `Detached` — тихий и, вероятно, самый частый случай: том закрыли

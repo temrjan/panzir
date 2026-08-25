@@ -17,8 +17,22 @@ pub struct RenameDraft {
     pub text: String,
 }
 
+/// Начатый ввод парольной фразы: для какой записи и что набрано.
+///
+/// Буфер здесь — обычная `String`: другого способа принять ввод у egui нет.
+/// Живёт он ровно до нажатия кнопки — [`crate::app::App`] забирает содержимое
+/// `mem::take` и сразу кладёт в `SecretString`.
+pub struct UnlockDraft {
+    /// Метка записи, которую открывают.
+    pub target: Label,
+    /// Набранное.
+    pub text: String,
+}
+
 /// Что человек попросил сделать.
 pub enum ListAction {
+    /// Открыть хранилище набранной фразой.
+    Open(Label),
     /// Закрыть хранилище.
     Close(Label),
     /// Убрать запись из списка. Файл на диске не трогается.
@@ -44,6 +58,8 @@ pub struct ListInput<'a> {
     pub busy: bool,
     /// Начатое переименование.
     pub rename: &'a mut Option<RenameDraft>,
+    /// Начатый ввод парольной фразы.
+    pub unlock: &'a mut Option<UnlockDraft>,
     /// Метка записи, чья карточка раскрыта. Раскрыта не более одной: операция
     /// всё равно идёт одна за раз, а два раскрытых поля пароля означали бы два
     /// секрета в памяти вместо одного.
@@ -66,7 +82,14 @@ pub fn show(ui: &mut egui::Ui, input: ListInput<'_>) -> Option<ListAction> {
         ui.label("Хранилищ пока нет");
     } else {
         for entry in input.entries {
-            if let Some(a) = show_entry(ui, entry, input.busy, input.rename, input.expanded) {
+            if let Some(a) = show_entry(
+                ui,
+                entry,
+                input.busy,
+                input.rename,
+                input.expanded,
+                input.unlock,
+            ) {
                 action = Some(a);
             }
         }
@@ -92,6 +115,7 @@ fn show_entry(
     busy: bool,
     rename: &mut Option<RenameDraft>,
     expanded: &mut Option<Label>,
+    unlock: &mut Option<UnlockDraft>,
 ) -> Option<ListAction> {
     let mut action = None;
     let label = entry.label().clone();
@@ -160,7 +184,7 @@ fn show_entry(
 
     if is_expanded
         && let Some(a) = ui
-            .indent(label.as_str(), |ui| show_card(ui, entry, busy))
+            .indent(label.as_str(), |ui| show_card(ui, entry, busy, unlock))
             .inner
     {
         action = Some(a);
@@ -170,7 +194,12 @@ fn show_entry(
 }
 
 /// Карточка хранилища: где лежит, где смонтировано и что с ним можно сделать.
-fn show_card(ui: &mut egui::Ui, entry: &VaultEntry, busy: bool) -> Option<ListAction> {
+fn show_card(
+    ui: &mut egui::Ui,
+    entry: &VaultEntry,
+    busy: bool,
+    unlock: &mut Option<UnlockDraft>,
+) -> Option<ListAction> {
     match entry.kind() {
         VaultKind::File(path) => ui.label(format!("Файл: {}", path.display())),
         VaultKind::Device { uuid } => ui.label(format!("Носитель, UUID тома: {uuid}")),
@@ -183,12 +212,46 @@ fn show_card(ui: &mut egui::Ui, entry: &VaultEntry, busy: bool) -> Option<ListAc
         ui.label(format!("Смонтировано: {}", mount_point.display()));
     }
 
+    let label = entry.label().clone();
     let mut action = None;
+
     ui.add_enabled_ui(!busy, |ui| {
-        if matches!(entry.state(), VaultState::Open { .. })
-            && ui.button("Закрыть").clicked()
-        {
-            action = Some(ListAction::Close(entry.label().clone()));
+        if matches!(entry.state(), VaultState::Open { .. }) {
+            if ui.button("Закрыть").clicked() {
+                action = Some(ListAction::Close(label.clone()));
+            }
+            return;
+        }
+
+        // Закрыто или отключено — предлагаем открыть. Носители в этом круге
+        // не поддержаны; отказ произносится словами в `app.rs`, а не молчанием.
+        let typing = unlock
+            .as_ref()
+            .is_some_and(|d| d.target.as_str() == label.as_str());
+        if typing {
+            if let Some(draft) = unlock.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.label("Парольная фраза:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut draft.text)
+                            .password(true)
+                            .hint_text("фраза хранилища"),
+                    );
+                });
+            }
+            if ui.button("Открыть").clicked() {
+                action = Some(ListAction::Open(label.clone()));
+            }
+            if ui.button("Отмена").clicked() {
+                // Отмена — тоже уход секрета из памяти виджета, не только
+                // закрытие поля.
+                *unlock = None;
+            }
+        } else if ui.button("Открыть").clicked() {
+            *unlock = Some(UnlockDraft {
+                target: label.clone(),
+                text: String::new(),
+            });
         }
     });
     action
