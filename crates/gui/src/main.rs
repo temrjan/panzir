@@ -11,6 +11,15 @@ mod view_list;
 use std::process::ExitCode;
 
 use panzir_core::registry::Registry;
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// Сколько ждём операцию с хранилищем, прежде чем сказать человеку, что оно
+/// не откликается. Замер худшего случая закрытия — около 52 с (черновик
+/// 2026-08-23), запас взят до круглого числа. Значение живёт ЗДЕСЬ, а не
+/// внутри окна: инвариант 9 — иначе тесту нечем подставить своё, и проверка
+/// таймаута стоила бы минуты ожидания на каждый прогон.
+const OP_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn main() -> ExitCode {
     init_tracing();
@@ -19,6 +28,16 @@ fn main() -> ExitCode {
         Ok(path) => path,
         Err(e) => {
             eprintln!("{}", app::error_text(&e));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // HOME читается здесь, в единственном месте встречи с системой: путь
+    // симлинка хранилища строится от него, а окну он приходит параметром.
+    let home = match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        Some(h) => PathBuf::from(h),
+        None => {
+            eprintln!("{}", app::error_text(&panzir_core::Error::NoHome));
             return ExitCode::FAILURE;
         }
     };
@@ -39,7 +58,15 @@ fn main() -> ExitCode {
     match eframe::run_native(
         "panzir",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, registry_path, smoke_frames)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::App::new(
+                cc,
+                registry_path,
+                home,
+                smoke_frames,
+                OP_TIMEOUT,
+            )))
+        }),
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

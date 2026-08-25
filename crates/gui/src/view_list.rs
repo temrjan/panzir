@@ -19,6 +19,8 @@ pub struct RenameDraft {
 
 /// Что человек попросил сделать.
 pub enum ListAction {
+    /// Закрыть хранилище.
+    Close(Label),
     /// Убрать запись из списка. Файл на диске не трогается.
     Remove(Label),
     /// Применить новое имя.
@@ -156,15 +158,19 @@ fn show_entry(
         }
     });
 
-    if is_expanded {
-        ui.indent(label.as_str(), |ui| show_card(ui, entry));
+    if is_expanded
+        && let Some(a) = ui
+            .indent(label.as_str(), |ui| show_card(ui, entry, busy))
+            .inner
+    {
+        action = Some(a);
     }
 
     action
 }
 
-/// Карточка хранилища: где лежит и где смонтировано.
-fn show_card(ui: &mut egui::Ui, entry: &VaultEntry) {
+/// Карточка хранилища: где лежит, где смонтировано и что с ним можно сделать.
+fn show_card(ui: &mut egui::Ui, entry: &VaultEntry, busy: bool) -> Option<ListAction> {
     match entry.kind() {
         VaultKind::File(path) => ui.label(format!("Файл: {}", path.display())),
         VaultKind::Device { uuid } => ui.label(format!("Носитель, UUID тома: {uuid}")),
@@ -176,4 +182,14 @@ fn show_card(ui: &mut egui::Ui, entry: &VaultEntry) {
     if let VaultState::Open { mount_point } = entry.state() {
         ui.label(format!("Смонтировано: {}", mount_point.display()));
     }
+
+    let mut action = None;
+    ui.add_enabled_ui(!busy, |ui| {
+        if matches!(entry.state(), VaultState::Open { .. })
+            && ui.button("Закрыть").clicked()
+        {
+            action = Some(ListAction::Close(entry.label().clone()));
+        }
+    });
+    action
 }

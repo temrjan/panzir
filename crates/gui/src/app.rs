@@ -7,12 +7,14 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use eframe::egui;
 use panzir_core::Error;
 use panzir_core::deps::{self, DepsReport};
+use panzir_core::lifecycle::{self, VaultProbe};
 use panzir_core::registry::{Registry, VaultEntry};
-use panzir_core::udisks::Udisks;
+use panzir_core::udisks::{ObjPath, Udisks};
 use panzir_core::vault::{Label, VaultKind, VaultState};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -52,6 +54,14 @@ enum Op {
     Reload,
     /// Убрать запись из реестра. Контейнер на диске не трогается.
     Remove(Label),
+    /// Закрыть хранилище: отпереть нельзя без пароля, а запереть — можно.
+    Close {
+        /// Метка записи.
+        label: Label,
+        /// Путь к файлу-контейнеру: в реестре объекта loop-устройства нет,
+        /// его приходится искать пробой по контейнеру.
+        container: PathBuf,
+    },
     /// Сменить метку записи.
     Rename {
         /// Текущая метка.
@@ -189,6 +199,8 @@ pub fn kind_text(kind: &VaultKind) -> &'static str {
 pub struct App {
     rt: Runtime,
     registry_path: PathBuf,
+    home: PathBuf,
+    op_timeout: Duration,
     smoke_frames: Option<u32>,
     frames_drawn: u32,
     entries: Vec<VaultEntry>,
@@ -220,13 +232,17 @@ impl App {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         registry_path: PathBuf,
+        home: PathBuf,
         smoke_frames: Option<u32>,
+        op_timeout: Duration,
     ) -> Self {
         let rt = Runtime::new().expect("не удалось создать рантайм tokio");
         let local_deps = deps::check_local_deps();
         let mut app = Self {
             rt,
             registry_path,
+            home,
+            op_timeout,
             smoke_frames,
             frames_drawn: 0,
             entries: Vec::new(),
@@ -276,7 +292,20 @@ impl App {
             return false;
         }
         let path = self.registry_path.clone();
-        self.pending = Some(self.spawn_waking(ctx, async move { run_op(&path, op).await }));
+        let home = self.home.clone();
+        let limit = self.op_timeout;
+        self.pending = Some(self.spawn_waking(ctx, async move {
+            // Таймаут накрывает операцию ЦЕЛИКОМ, включая пробу: человеку не
+            // важно, на каком шаге застряло, ему важно, что окно не висит.
+            match tokio::time::timeout(limit, run_op(&path, &home, op)).await {
+                Ok(outcome) => outcome,
+                Err(_) => OpOutcome::Failed(format!(
+                    "хранилище не откликнулось {}. Возможно, том занят другой программой. \
+                     Состояние записи не изменено — обновите список",
+                    timeout_text(limit)
+                )),
+            }
+        }));
         true
     }
 
@@ -373,6 +402,29 @@ impl App {
 
     fn handle(&mut self, ctx: &egui::Context, action: ListAction) {
         match action {
+            ListAction::Close(label) => {
+                // Путь контейнера берём из записи: в `Op` он приходит уже
+                // разобранным, чтобы фоновая задача не читала реестр второй раз.
+                let container = self
+                    .entries
+                    .iter()
+                    .find(|e| e.label().as_str() == label.as_str())
+                    .and_then(|e| match e.kind() {
+                        VaultKind::File(path) => Some(path.clone()),
+                        VaultKind::Device { .. } => None,
+                    });
+                match container {
+                    Some(container) => {
+                        self.spawn_op(ctx, Op::Close { label, container });
+                    }
+                    // Отказ не молчит (инвариант 10): носители в этом круге
+                    // не поддержаны, и человек обязан узнать это словами.
+                    None => {
+                        self.message =
+                            Some("носители пока не поддержаны — умеем только файлы-хранилища".to_owned());
+                    }
+                }
+            }
             ListAction::Remove(label) => {
                 self.spawn_op(ctx, Op::Remove(label));
             }
@@ -442,7 +494,7 @@ impl eframe::App for App {
     }
 }
 
-async fn run_op(path: &std::path::Path, op: Op) -> OpOutcome {
+async fn run_op(path: &std::path::Path, home: &std::path::Path, op: Op) -> OpOutcome {
     match op {
         Op::Reload => match Registry::load_from(path).await {
             Ok(reg) => OpOutcome::Loaded(reg.entries().to_vec()),
@@ -450,7 +502,106 @@ async fn run_op(path: &std::path::Path, op: Op) -> OpOutcome {
         },
         Op::Remove(label) => write_then_read(path, move |r| r.remove(&label)).await,
         Op::Rename { old, new } => write_then_read(path, move |r| r.rename(&old, new)).await,
+        Op::Close { label, container } => run_close(path, home, &label, &container).await,
     }
+}
+
+/// Закрытие: проба → решение → действие → правда в реестре.
+///
+/// Проба и закрытие — ОДНА задача (инвариант 8): одно пробуждение окна на
+/// завершении, промежуточный результат наружу не выходит.
+async fn run_close(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    label: &Label,
+    container: &std::path::Path,
+) -> OpOutcome {
+    let ud = match Udisks::connect().await {
+        Ok(ud) => ud,
+        Err(e) => return OpOutcome::Failed(error_text(&e)),
+    };
+    let probe = match lifecycle::probe_file_vault(&ud, container).await {
+        Ok(p) => p,
+        Err(e) => return OpOutcome::Failed(error_text(&e)),
+    };
+    match close_decision(probe) {
+        CloseDecision::AlreadyDetached => {
+            // Тихий и, вероятно, самый частый случай: том закрыли штатной
+            // утилитой дисков или приложение падало. Отказа человеку здесь
+            // нет — он просил закрыть, том закрыт, править нечего кроме записи.
+            set_state_then_read(path, label, VaultState::Closed).await
+        }
+        CloseDecision::Foreign(uid) => OpOutcome::Failed(format!(
+            "файл подключён другим пользователем (uid {uid}) — закрывать его отсюда нельзя, \
+             второе подключение испортило бы данные"
+        )),
+        CloseDecision::Close(loop_object) => {
+            match lifecycle::close_file_vault(&ud, &loop_object, label, home, false).await {
+                Ok(()) => set_state_then_read(path, label, VaultState::Closed).await,
+                Err(e) => OpOutcome::Failed(error_text(&e)),
+            }
+        }
+    }
+}
+
+/// Что делать с томом по результату пробы.
+///
+/// Вынесено в чистую функцию намеренно: тест окна не может позвать живой
+/// udisks2, а разбор пяти вариантов — именно то, что обязано быть проверено.
+#[derive(Debug, PartialEq, Eq)]
+enum CloseDecision {
+    /// Файл не подключён: закрывать нечего, привести запись к правде.
+    AlreadyDetached,
+    /// Есть объект loop-устройства — закрываем.
+    Close(ObjPath),
+    /// Подключён чужим uid: не трогаем (инвариант 3).
+    Foreign(u32),
+}
+
+/// `match` без ветки `_`: новый вариант пробы обязан сломать сборку здесь.
+fn close_decision(probe: VaultProbe) -> CloseDecision {
+    match probe {
+        VaultProbe::Detached => CloseDecision::AlreadyDetached,
+        VaultProbe::AttachedLocked { loop_object }
+        | VaultProbe::AttachedUnlocked { loop_object, .. }
+        | VaultProbe::AttachedOpen { loop_object, .. } => CloseDecision::Close(loop_object),
+        VaultProbe::Foreign { uid, .. } => CloseDecision::Foreign(uid),
+    }
+}
+
+/// Как назвать человеку отведённое время. Секунды — для продукта,
+/// «отведённое время» — для тестовых миллисекунд, где число бессмысленно.
+fn timeout_text(limit: Duration) -> String {
+    if limit.as_secs() >= 1 {
+        format!("за {} с", limit.as_secs())
+    } else {
+        "за отведённое время".to_owned()
+    }
+}
+
+/// Привести состояние записи к правде и вернуть свежий список.
+async fn set_state_then_read(
+    path: &std::path::Path,
+    label: &Label,
+    state: VaultState,
+) -> OpOutcome {
+    let label = label.clone();
+    write_then_read(path, move |r| {
+        let Some(entry) = r
+            .entries_mut()
+            .iter_mut()
+            .find(|e| e.label().as_str() == label.as_str())
+        else {
+            // Запись исчезла между кликом и завершением — не наша ошибка и не
+            // повод для отказа: том всё равно закрыт.
+            return Ok(());
+        };
+        if entry.state() == &state {
+            return Ok(());
+        }
+        entry.set_state(state)
+    })
+    .await
 }
 
 /// Правка и чтение результата — под одним локом, одним вызовом.
@@ -609,6 +760,37 @@ mod tests {
         registry
     }
 
+    /// `Detached` — тихий и, вероятно, самый частый случай: том закрыли
+    /// штатной утилитой дисков или приложение падало. Закрывать нечего, и
+    /// звать `close_file_vault` было бы обращением к объекту, которого уже нет.
+    ///
+    /// # Почему проверен только один вариант из пяти
+    /// Остальные четыре несут `ObjPath`, а у него **нет публичного
+    /// конструктора** (`udisks.rs:76-89`: `from_owned` приватен,
+    /// `block_device` — `pub(crate)`). Собрать их вне `panzir-core`
+    /// невозможно. Что закрывает дыру вместо теста: `match` без ветки `_`
+    /// (новый вариант ломает сборку) и живые IT ядра, где ветка `Foreign`
+    /// проверяется на настоящем томе (`t19`). Записано в отчёт Гейта-2 как
+    /// ограничение, а не как достаточное покрытие.
+    #[test]
+    fn detached_volume_is_not_closed_again() {
+        assert_eq!(
+            close_decision(VaultProbe::Detached),
+            CloseDecision::AlreadyDetached,
+            "отсоединённый том нечем закрывать: объекта loop-устройства не существует"
+        );
+    }
+
+    /// Отведённое время называется человеку словами, а не миллисекундами.
+    #[test]
+    fn timeout_is_named_in_seconds_only_when_seconds_make_sense() {
+        assert_eq!(timeout_text(Duration::from_secs(60)), "за 60 с");
+        assert_eq!(
+            timeout_text(Duration::from_millis(50)),
+            "за отведённое время"
+        );
+    }
+
     /// Фикстура с ОТКРЫТЫМ хранилищем: отдельная от `fixture`, чтобы не
     /// трогать записи, на которые опираются тесты 3b.
     fn fixture_open(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -648,7 +830,19 @@ mod tests {
     }
 
     fn harness_at(registry: std::path::PathBuf) -> Harness<'static, App> {
-        let mut harness = Harness::new_eframe(move |cc| App::new(cc, registry.clone(), None));
+        let home = registry
+            .parent()
+            .expect("у фикстуры есть каталог")
+            .to_path_buf();
+        let mut harness = Harness::new_eframe(move |cc| {
+            App::new(
+                cc,
+                registry.clone(),
+                home.clone(),
+                None,
+                Duration::from_secs(5),
+            )
+        });
         harness.state_mut().block_until_idle();
         harness.run();
         harness
