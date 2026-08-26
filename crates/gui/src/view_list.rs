@@ -81,9 +81,13 @@ pub fn show(ui: &mut egui::Ui, input: ListInput<'_>) -> Option<ListAction> {
         ui.separator();
     }
 
-    if ui.button("Создать хранилище").clicked() {
-        action = Some(ListAction::StartCreate);
-    }
+    // `!busy`, как у остальных действий списка: иначе клик во время операции
+    // увёл бы на экран создания и утопил её сообщение об отказе (инвариант 10).
+    ui.add_enabled_ui(!input.busy, |ui| {
+        if ui.button("Создать хранилище").clicked() {
+            action = Some(ListAction::StartCreate);
+        }
+    });
     ui.separator();
 
     if input.entries.is_empty() {

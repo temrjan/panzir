@@ -689,10 +689,11 @@ impl eframe::App for App {
             }
             Screen::Create => {
                 let busy = self.pending.is_some();
+                let message = self.message.as_deref();
                 let action = self
                     .create
                     .as_mut()
-                    .and_then(|draft| view_create::show(ui, draft, busy));
+                    .and_then(|draft| view_create::show(ui, draft, busy, message));
                 if let Some(action) = action {
                     self.handle_create(&ctx, action);
                 }
@@ -1361,6 +1362,47 @@ mod tests {
         assert!(
             harness.state().create.is_none(),
             "черновик создания пережил «Отмену» (секрет не затёрт)"
+        );
+    }
+
+    #[test]
+    fn create_screen_shows_a_kernel_message() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_create(&mut harness);
+        harness.state_mut().message = Some("служба дисков вернула ошибку".to_owned());
+        harness.run();
+        assert!(
+            harness
+                .query_by_label_contains("служба дисков вернула ошибку")
+                .is_some(),
+            "отказ ядра не виден на экране создания (инвариант 10)"
+        );
+    }
+
+    #[test]
+    fn list_create_button_is_disabled_while_an_operation_runs() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        assert!(
+            !harness
+                .get_by_label("Создать хранилище")
+                .accesskit_node()
+                .is_disabled(),
+            "до опыта кнопка уже неактивна — проверка ничего не докажет"
+        );
+        let ctx = harness.ctx.clone();
+        let never = harness
+            .state()
+            .spawn_waking(&ctx, std::future::pending::<OpOutcome>());
+        harness.state_mut().pending = Some(never);
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("Создать хранилище")
+                .accesskit_node()
+                .is_disabled(),
+            "«Создать хранилище» активна во время операции (гонка сообщения, инвариант 10)"
         );
     }
 

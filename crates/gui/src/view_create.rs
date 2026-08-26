@@ -56,17 +56,30 @@ pub fn parse_size(input: &str) -> Option<u64> {
     if mib < MIN_SIZE_MIB {
         return None;
     }
-    Some(mib * 1024 * 1024)
+    // checked_mul: петабайтный ввод не паникует (dev) и не заворачивается тихо
+    // (релиз) — `None` держит «Создать» неактивной тем же путём, что нижняя граница.
+    mib.checked_mul(1024 * 1024)
 }
 
 /// Рисует форму, возвращает намерение, если оно было.
 ///
 /// `busy` — идёт операция: «Создать» неактивна (второй операции быть не может),
 /// «Отмена» доступна всегда (она операции не запускает).
-pub fn show(ui: &mut egui::Ui, draft: &mut CreateDraft, busy: bool) -> Option<CreateAction> {
+pub fn show(
+    ui: &mut egui::Ui,
+    draft: &mut CreateDraft,
+    busy: bool,
+    message: Option<&str>,
+) -> Option<CreateAction> {
     let mut action = None;
 
     ui.heading("Новое хранилище");
+    // Отказ ядра обязан быть виден и на этом экране, а не только на списке
+    // (инвариант 10): без этого сообщение об ошибке предыдущей операции тонет
+    // при переходе на форму.
+    if let Some(text) = message {
+        ui.colored_label(ui.visuals().error_fg_color, text);
+    }
 
     let label_ok = Label::new(&draft.label).is_ok();
     let size_ok = parse_size(&draft.size).is_some();
@@ -142,5 +155,14 @@ mod tests {
         assert_eq!(parse_size("32"), Some(32 * 1024 * 1024));
         assert_eq!(parse_size("1024"), Some(1024 * 1024 * 1024)); // 1 ГиБ
         assert_eq!(parse_size(" 64 "), Some(64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_size_rejects_u64_overflow() {
+        // МиБ × 2^20 = байты. 2^44 МиБ × 2^20 = 2^64 — на единицу больше u64::MAX.
+        // Без checked_mul: dev-сборка паникует прямо в поле ввода, релиз — тихо
+        // заворачивается (петабайт → 32 МиБ), нарушая контракт «выше границы → None».
+        assert!(parse_size("17592186044415").is_some()); // 2^44 − 1 МиБ — ещё влезает
+        assert_eq!(parse_size("17592186044416"), None); // 2^44 МиБ — переполнение
     }
 }
