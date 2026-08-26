@@ -5,10 +5,12 @@
 //! Аллокация полная (fallocate), sparse запрещён.
 
 use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use secrecy::SecretString;
 
+use crate::mountpoint;
 use crate::udisks::{ObjPath, Udisks};
 use crate::vault::Label;
 use crate::{Error, Result};
@@ -223,5 +225,97 @@ pub async fn teardown_file_container(
             tracing::warn!("teardown: failed to remove {}: {e}", container.display());
             Err(Error::from(e))
         }
+    }
+}
+
+/// Создаёт родительскую папку контейнера (`~/.local/share/panzir/`) с правами
+/// 0700, если её ещё нет. Образец — `Registry::with_write_lock_at`
+/// (`registry.rs`): та же пара `create_dir_all` + `set_permissions`.
+async fn ensure_container_dir(container: &Path) -> Result<()> {
+    let parent = container
+        .parent()
+        .ok_or_else(|| Error::InvalidContainerPath(container.display().to_string()))?;
+    tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
+    tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(Error::Io)?;
+    Ok(())
+}
+
+/// Создаёт файл-хранилище целиком: папка 0700 → контейнер (ядро возвращает его
+/// открытым и смонтированным) → симлинк `~/panzir-<метка>`.
+///
+/// Симлинк ядро внутри `create_file_container` не делает (в отличие от
+/// открытия) — поэтому шаг здесь. При отказе на нём — откат
+/// ([`rollback_created_file_vault`]): иначе остался бы живой расшифрованный
+/// смонтированный том без записи в реестре, который приложение не может закрыть.
+/// Полный откат обязан жить в ядре: `ensure_loop_detached` — `pub(crate)`.
+///
+/// # Errors
+/// Любой шаг может упасть — см. [`Error`]; при отказе симлинка том уже откачен.
+pub async fn create_file_vault(
+    ud: &Udisks,
+    home: &Path,
+    label: &Label,
+    container: &Path,
+    size_bytes: u64,
+    passphrase: &SecretString,
+) -> Result<CreatedVault> {
+    ensure_container_dir(container).await?;
+    let created = create_file_container(ud, container, size_bytes, label, passphrase).await?;
+    if let Err(e) = mountpoint::create_symlink(home, label, &created.mount_point).await {
+        rollback_created_file_vault(ud, home, label, &created.loop_object, container).await;
+        return Err(e);
+    }
+    Ok(created)
+}
+
+/// Откат неудавшегося создания: снять симлинк, закрыть том, отвязать loop.
+/// Best-effort — вызывается уже на ошибке, поэтому шаги логируются, но не
+/// прерывают друг друга.
+///
+/// **Файл контейнера НЕ удаляет.** Удалять ли осиротевший файл (которого
+/// пользователь не видел зарегистрированным) — открытый вопрос Капитану,
+/// дефолт «оставить». При «удалять» здесь добавляется `remove_file(container)`
+/// ПОСЛЕ подтверждённой отвязки loop (как в [`teardown_file_container`]),
+/// поэтому `container` уже в сигнатуре.
+pub async fn rollback_created_file_vault(
+    ud: &Udisks,
+    home: &Path,
+    label: &Label,
+    loop_object: &ObjPath,
+    _container: &Path,
+) {
+    if let Err(e) = mountpoint::remove_symlink(home, label).await {
+        tracing::warn!("rollback_create: remove_symlink: {e}");
+    }
+    if let Err(e) = ud.close_encrypted(loop_object).await {
+        tracing::warn!("rollback_create: close_encrypted: {e}");
+    }
+    if let Err(e) = ud.ensure_loop_detached(loop_object).await {
+        tracing::warn!("rollback_create: ensure_loop_detached: {e}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Папка контейнера создаётся с правами 0700 (не дефолт 0755) — проверяемо
+    /// без udisks2, ради этого mkdir+chmod и живёт в ядре, а не в `crates/gui`.
+    #[tokio::test]
+    async fn ensure_container_dir_creates_parent_0700() {
+        let home = tempfile::tempdir().expect("временный каталог");
+        let container = home.path().join(".local/share/panzir/work.vault");
+        ensure_container_dir(&container)
+            .await
+            .expect("создать папку");
+        let mode = std::fs::metadata(container.parent().expect("родитель"))
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "папка контейнера не 0700");
     }
 }

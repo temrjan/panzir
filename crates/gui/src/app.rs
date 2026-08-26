@@ -6,7 +6,6 @@
 //! снимается неблокирующе.
 
 use std::future::Future;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -14,7 +13,6 @@ use eframe::egui;
 use panzir_core::create;
 use panzir_core::deps::{self, DepsReport};
 use panzir_core::lifecycle::{self, VaultProbe};
-use panzir_core::mountpoint;
 use panzir_core::registry::{Registry, VaultEntry};
 use panzir_core::udisks::{ObjPath, Udisks};
 use panzir_core::vault::{Label, VaultKind, VaultState, container_path};
@@ -242,7 +240,7 @@ pub fn kind_text(kind: &VaultKind) -> &'static str {
 /// живёт в `Option`, а `screen` говорит, показан ли он, — тогда «ушли с формы,
 /// а черновик завис» становится ловимым состоянием (условие устаревания для
 /// `forget_stale_passphrase`, как `expanded` для разблокировки).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Screen {
     /// Список хранилищ.
     List,
@@ -607,6 +605,18 @@ impl App {
                 Some("размер не подходит: целое число МиБ, не меньше минимума".to_owned());
             return;
         };
+        // 1-bis. Пре-чек занятой метки — срезает частый случай (метка уже у
+        // записи, в т.ч. флешки) ДО создания, без спиннера. НЕ единственная
+        // защита: настоящая — `Registry::add` под локом в `run_create`, с
+        // откатом тома при гонке.
+        if self
+            .entries
+            .iter()
+            .any(|e| e.label().as_str() == label.as_str())
+        {
+            self.message = Some(error_text(&Error::DuplicateLabel(label.to_string())));
+            return;
+        }
         // 2. Валидно — забираем секрет: буфер виджета пустеет (`mem::take`),
         // повтор затираем, `SecretString` строим из `&str` и исходник затираем
         // сами (перевод `String` вправе оставить незачищенную копию в куче).
@@ -773,39 +783,41 @@ async fn run_create(
         Ok(ud) => ud,
         Err(e) => return OpOutcome::Failed(error_text(&e)),
     };
-    // Папки `~/.local/share/panzir/` может ещё не быть — создаём её 0700 до
-    // контейнера (образец `Registry::with_write_lock_at`): иначе
-    // `create_file_container` упадёт уже на определении ФС родителя.
-    if let Some(parent) = container.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return OpOutcome::Failed(error_text(&Error::Io(e)));
-        }
-        if let Err(e) =
-            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await
-        {
-            return OpOutcome::Failed(error_text(&Error::Io(e)));
-        }
-    }
-    let created =
-        match create::create_file_container(&ud, container, size_bytes, label, passphrase).await {
-            Ok(created) => created,
-            Err(e) => return OpOutcome::Failed(error_text(&e)),
-        };
-    // Симлинк ядро при создании не делает (в отличие от открытия) — создаём здесь.
-    if let Err(e) = mountpoint::create_symlink(home, label, &created.mount_point).await {
-        return OpOutcome::Failed(error_text(&e));
-    }
-    let label = label.clone();
-    let container = container.to_path_buf();
-    let mount_point = created.mount_point;
-    write_then_read(path, move |r| {
-        r.add(VaultEntry::new(
-            label,
-            VaultKind::File(container),
-            VaultState::Open { mount_point },
-        ))
-    })
+    // Папка 0700 → контейнер → симлинк → откат-при-отказе — целиком в ядре:
+    // `ensure_loop_detached` — `pub(crate)`, из окна откат физически невыразим.
+    let created = match create::create_file_vault(
+        &ud, home, label, container, size_bytes, passphrase,
+    )
     .await
+    {
+        Ok(created) => created,
+        Err(e) => return OpOutcome::Failed(error_text(&e)),
+    };
+    // Запись в реестр под локом — НАСТОЯЩАЯ защита от гонки меток (пре-чек в
+    // `handle_create` лишь срезает частый случай без спиннера). На отказе —
+    // откат тома ядром, иначе остался бы живой том без записи.
+    let result = Registry::with_write_lock_at(path, {
+        let label = label.clone();
+        let container = container.to_path_buf();
+        let mount_point = created.mount_point.clone();
+        move |r| {
+            r.add(VaultEntry::new(
+                label,
+                VaultKind::File(container),
+                VaultState::Open { mount_point },
+            ))?;
+            Ok(r.entries().to_vec())
+        }
+    })
+    .await;
+    match result {
+        Ok(entries) => OpOutcome::Loaded(entries),
+        Err(e) => {
+            create::rollback_created_file_vault(&ud, home, label, &created.loop_object, container)
+                .await;
+            OpOutcome::Failed(error_text(&e))
+        }
+    }
 }
 
 /// Закрытие: проба → решение → действие → правда в реестре.
@@ -1403,6 +1415,82 @@ mod tests {
                 .accesskit_node()
                 .is_disabled(),
             "«Создать хранилище» активна во время операции (гонка сообщения, инвариант 10)"
+        );
+    }
+
+    #[test]
+    fn submitting_a_valid_form_dispatches_create_and_wipes_the_passphrase() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        // op_timeout = 0: задача создания оборвётся по таймауту на первом poll
+        // (`connect`), не тронув живой udisks2 — иначе тест реально создал бы том.
+        harness.state_mut().op_timeout = Duration::ZERO;
+        start_create(&mut harness);
+        {
+            let d = harness.state_mut().create.as_mut().expect("черновик");
+            d.label = "fresh".to_owned(); // свободна: в fixture только t-alpha/t-beta
+            d.size = "64".to_owned();
+            d.passphrase = "test-passphrase".to_owned();
+            d.confirm = "test-passphrase".to_owned();
+        }
+        let ctx = harness.ctx.clone();
+        harness
+            .state_mut()
+            .handle_create(&ctx, CreateAction::Submit);
+
+        assert!(
+            harness.state().pending.is_some(),
+            "Op::Create не отправлена"
+        );
+        assert_eq!(
+            harness.state().screen,
+            Screen::List,
+            "экран не вернулся на список после Submit"
+        );
+        assert!(
+            harness
+                .state()
+                .create
+                .as_ref()
+                .is_some_and(|d| d.passphrase.is_empty()),
+            "пароль остался в черновике после Submit (секрет не забран)"
+        );
+        // Оборвать фоновую задачу: op_timeout=0 её и так завершает, udisks2 не ждём.
+        if let Some(h) = harness.state_mut().pending.take() {
+            h.abort();
+        }
+    }
+
+    #[test]
+    fn submitting_a_taken_label_is_rejected_before_creating() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        harness.state_mut().block_until_idle(); // реестр загружен: t-alpha, t-beta
+        harness.run();
+        harness.state_mut().op_timeout = Duration::ZERO;
+        start_create(&mut harness);
+        {
+            let d = harness.state_mut().create.as_mut().expect("черновик");
+            d.label = "t-beta".to_owned(); // занята записью-флешкой — триггер БЛОКЕРа 1
+            d.size = "64".to_owned();
+            d.passphrase = "x".to_owned();
+            d.confirm = "x".to_owned();
+        }
+        let ctx = harness.ctx.clone();
+        harness
+            .state_mut()
+            .handle_create(&ctx, CreateAction::Submit);
+        assert!(
+            harness.state().pending.is_none(),
+            "создание запущено на занятой метке — пре-чек не сработал"
+        );
+        assert!(
+            harness
+                .state()
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("уже занято")),
+            "нет сообщения о занятой метке"
         );
     }
 
