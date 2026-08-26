@@ -45,6 +45,8 @@ pub enum ListAction {
         /// Набранное имя, ещё не проверенное ядром.
         new: String,
     },
+    /// Перейти на экран создания нового хранилища.
+    StartCreate,
 }
 
 /// Всё, что экрану нужно для отрисовки.
@@ -78,6 +80,11 @@ pub fn show(ui: &mut egui::Ui, input: ListInput<'_>) -> Option<ListAction> {
         ui.colored_label(ui.visuals().error_fg_color, text);
         ui.separator();
     }
+
+    if ui.button("Создать хранилище").clicked() {
+        action = Some(ListAction::StartCreate);
+    }
+    ui.separator();
 
     if input.entries.is_empty() {
         ui.label("Хранилищ пока нет");

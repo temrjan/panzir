@@ -6,21 +6,25 @@
 //! снимается неблокирующе.
 
 use std::future::Future;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use eframe::egui;
+use panzir_core::create;
 use panzir_core::deps::{self, DepsReport};
 use panzir_core::lifecycle::{self, VaultProbe};
+use panzir_core::mountpoint;
 use panzir_core::registry::{Registry, VaultEntry};
 use panzir_core::udisks::{ObjPath, Udisks};
-use panzir_core::vault::{Label, VaultKind, VaultState};
+use panzir_core::vault::{Label, VaultKind, VaultState, container_path};
 use panzir_core::{AuthRefusal, Error};
 use secrecy::SecretString;
 use secrecy::zeroize::Zeroize as _;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
+use crate::view_create::{self, CreateAction, CreateDraft};
 use crate::view_list::{self, ListAction, ListInput, RenameDraft, UnlockDraft};
 
 /// Сколько ждём завершения операции в тестах, прежде чем признать зависание.
@@ -80,6 +84,19 @@ enum Op {
         old: Label,
         /// Новая метка.
         new: Label,
+    },
+    /// Создать новое файловое хранилище: контейнер (создаётся открытым и
+    /// смонтированным ядром), симлинк, запись в реестр.
+    Create {
+        /// Метка нового хранилища.
+        label: Label,
+        /// Путь файла-контейнера — выбран приложением (`vault::container_path`).
+        container: PathBuf,
+        /// Размер контейнера в байтах.
+        size_bytes: u64,
+        /// Пароль. Дальше окна в открытом виде не живёт: `SecretString`
+        /// затирает себя при уничтожении.
+        passphrase: SecretString,
     },
 }
 
@@ -221,6 +238,18 @@ pub fn kind_text(kind: &VaultKind) -> &'static str {
     }
 }
 
+/// Какой экран показан. Отделён от черновика создания намеренно: черновик
+/// живёт в `Option`, а `screen` говорит, показан ли он, — тогда «ушли с формы,
+/// а черновик завис» становится ловимым состоянием (условие устаревания для
+/// `forget_stale_passphrase`, как `expanded` для разблокировки).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    /// Список хранилищ.
+    List,
+    /// Форма создания нового хранилища.
+    Create,
+}
+
 /// Состояние главного окна.
 pub struct App {
     rt: Runtime,
@@ -239,6 +268,11 @@ pub struct App {
     rename: Option<RenameDraft>,
     expanded: Option<Label>,
     unlock: Option<UnlockDraft>,
+    screen: Screen,
+    /// Черновик формы создания (секреты внутри). `Some` даже после ухода с
+    /// формы — затирается единым местом (`forget_stale_passphrase`), когда
+    /// `screen != Create`.
+    create: Option<CreateDraft>,
 }
 
 impl App {
@@ -282,6 +316,8 @@ impl App {
             rename: None,
             expanded: None,
             unlock: None,
+            screen: Screen::List,
+            create: None,
         };
         app.rebuild_env();
         app.spawn_op(&cc.egui_ctx, Op::Reload);
@@ -435,12 +471,22 @@ impl App {
     /// затирается. Без этого начатый и брошенный ввод просто выпадал бы из
     /// памяти нетронутым (находка ревью Гейта-2).
     fn forget_stale_passphrase(&mut self) {
+        // Разблокировка: черновик не соответствует раскрытой карточке.
         let matches_card = match (&self.unlock, &self.expanded) {
             (Some(draft), Some(label)) => draft.target.as_str() == label.as_str(),
             _ => false,
         };
         if !matches_card && let Some(mut draft) = self.unlock.take() {
             draft.text.zeroize();
+        }
+        // Создание: ушли с формы (`screen != Create`), а черновик завис —
+        // затираем оба поля пароля. Одно место на оба черновика, чтобы новую
+        // точку выхода не пришлось помнить (инвариант 5).
+        if self.screen != Screen::Create
+            && let Some(mut draft) = self.create.take()
+        {
+            draft.passphrase.zeroize();
+            draft.confirm.zeroize();
         }
     }
 
@@ -527,6 +573,65 @@ impl App {
                 }
                 Err(e) => self.message = Some(error_text(&e)),
             },
+            ListAction::StartCreate => {
+                self.screen = Screen::Create;
+                self.create = Some(CreateDraft::default());
+            }
+        }
+    }
+
+    /// Экран создания: Cancel уводит на список (черновик затрёт `forget`),
+    /// Submit валидирует, строит секрет и запускает `Op::Create`.
+    fn handle_create(&mut self, ctx: &egui::Context, action: CreateAction) {
+        let CreateAction::Submit = action else {
+            // Cancel: уходим на список; черновик (с секретом) затрёт
+            // `forget_stale_passphrase`, увидев `screen != Create`.
+            self.screen = Screen::List;
+            return;
+        };
+        // 1. Читаем и валидируем — секрет НЕ трогаем, пока не убедились.
+        let parsed = self
+            .create
+            .as_ref()
+            .map(|d| (Label::new(&d.label), view_create::parse_size(&d.size)));
+        let Some((label, size)) = parsed else { return };
+        let label = match label {
+            Ok(l) => l,
+            Err(e) => {
+                self.message = Some(error_text(&e));
+                return;
+            }
+        };
+        let Some(size_bytes) = size else {
+            self.message =
+                Some("размер не подходит: целое число МиБ, не меньше минимума".to_owned());
+            return;
+        };
+        // 2. Валидно — забираем секрет: буфер виджета пустеет (`mem::take`),
+        // повтор затираем, `SecretString` строим из `&str` и исходник затираем
+        // сами (перевод `String` вправе оставить незачищенную копию в куче).
+        let passphrase = {
+            let Some(draft) = self.create.as_mut() else {
+                return;
+            };
+            let mut typed = std::mem::take(&mut draft.passphrase);
+            draft.confirm.zeroize();
+            let secret = SecretString::from(typed.as_str());
+            typed.zeroize();
+            secret
+        };
+        // 3. Запускаем; черновик (уже без секрета) снимет `forget` при `screen = List`.
+        let container = container_path(&self.home, &label);
+        if self.spawn_op(
+            ctx,
+            Op::Create {
+                label,
+                container,
+                size_bytes,
+                passphrase,
+            },
+        ) {
+            self.screen = Screen::List;
         }
     }
 
@@ -563,21 +668,35 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.take_finished();
 
-        let action = view_list::show(
-            ui,
-            ListInput {
-                entries: &self.entries,
-                env: &self.env,
-                message: self.message.as_deref(),
-                busy: self.pending.is_some(),
-                rename: &mut self.rename,
-                expanded: &mut self.expanded,
-                unlock: &mut self.unlock,
-            },
-        );
-        if let Some(action) = action {
-            let ctx = ui.ctx().clone();
-            self.handle(&ctx, action);
+        let ctx = ui.ctx().clone();
+        match self.screen {
+            Screen::List => {
+                let action = view_list::show(
+                    ui,
+                    ListInput {
+                        entries: &self.entries,
+                        env: &self.env,
+                        message: self.message.as_deref(),
+                        busy: self.pending.is_some(),
+                        rename: &mut self.rename,
+                        expanded: &mut self.expanded,
+                        unlock: &mut self.unlock,
+                    },
+                );
+                if let Some(action) = action {
+                    self.handle(&ctx, action);
+                }
+            }
+            Screen::Create => {
+                let busy = self.pending.is_some();
+                let action = self
+                    .create
+                    .as_mut()
+                    .and_then(|draft| view_create::show(ui, draft, busy));
+                if let Some(action) = action {
+                    self.handle_create(&ctx, action);
+                }
+            }
         }
         self.forget_stale_passphrase();
 
@@ -599,6 +718,12 @@ async fn run_op(path: &std::path::Path, home: &std::path::Path, op: Op) -> OpOut
             container,
             passphrase,
         } => run_open(path, home, &label, &container, &passphrase).await,
+        Op::Create {
+            label,
+            container,
+            size_bytes,
+            passphrase,
+        } => run_create(path, home, &label, &container, size_bytes, &passphrase).await,
     }
 }
 
@@ -629,6 +754,57 @@ async fn run_open(
         }
         Err(e) => OpOutcome::Failed(error_text(&e)),
     }
+}
+
+/// Создание: папка → контейнер (ядро создаёт открытым) → симлинк → запись.
+///
+/// Одна задача, один секрет, одно пробуждение окна (инвариант 8). `home`
+/// приходит параметром (инвариант 9), env здесь не читается.
+async fn run_create(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    label: &Label,
+    container: &std::path::Path,
+    size_bytes: u64,
+    passphrase: &SecretString,
+) -> OpOutcome {
+    let ud = match Udisks::connect().await {
+        Ok(ud) => ud,
+        Err(e) => return OpOutcome::Failed(error_text(&e)),
+    };
+    // Папки `~/.local/share/panzir/` может ещё не быть — создаём её 0700 до
+    // контейнера (образец `Registry::with_write_lock_at`): иначе
+    // `create_file_container` упадёт уже на определении ФС родителя.
+    if let Some(parent) = container.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return OpOutcome::Failed(error_text(&Error::Io(e)));
+        }
+        if let Err(e) =
+            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await
+        {
+            return OpOutcome::Failed(error_text(&Error::Io(e)));
+        }
+    }
+    let created =
+        match create::create_file_container(&ud, container, size_bytes, label, passphrase).await {
+            Ok(created) => created,
+            Err(e) => return OpOutcome::Failed(error_text(&e)),
+        };
+    // Симлинк ядро при создании не делает (в отличие от открытия) — создаём здесь.
+    if let Err(e) = mountpoint::create_symlink(home, label, &created.mount_point).await {
+        return OpOutcome::Failed(error_text(&e));
+    }
+    let label = label.clone();
+    let container = container.to_path_buf();
+    let mount_point = created.mount_point;
+    write_then_read(path, move |r| {
+        r.add(VaultEntry::new(
+            label,
+            VaultKind::File(container),
+            VaultState::Open { mount_point },
+        ))
+    })
+    .await
 }
 
 /// Закрытие: проба → решение → действие → правда в реестре.
@@ -1054,6 +1230,137 @@ mod tests {
         assert!(
             harness.state().unlock.is_none(),
             "брошенный ввод пережил уход с карточки"
+        );
+    }
+
+    /// Открыть экран создания (кнопка на списке).
+    fn start_create(harness: &mut Harness<'static, App>) {
+        harness.get_by_label("Создать хранилище").click();
+        harness.run();
+    }
+
+    /// Заполнить черновик создания валидными значениями.
+    fn fill_valid_create(harness: &mut Harness<'static, App>) {
+        let d = harness
+            .state_mut()
+            .create
+            .as_mut()
+            .expect("черновик создания");
+        d.label = "work".to_owned();
+        d.size = "64".to_owned();
+        d.passphrase = "secret".to_owned();
+        d.confirm = "secret".to_owned();
+    }
+
+    #[test]
+    fn create_screen_shows_the_form() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_create(&mut harness);
+        for field in ["Метка:", "Размер, МиБ:", "Пароль:", "Повтор:"] {
+            assert!(
+                harness.query_by_label(field).is_some(),
+                "на форме создания нет поля {field}"
+            );
+        }
+        assert!(
+            harness.query_by_label("Создать").is_some(),
+            "нет кнопки «Создать»"
+        );
+        assert!(
+            harness.query_by_label("Отмена").is_some(),
+            "нет кнопки «Отмена»"
+        );
+    }
+
+    #[test]
+    fn mismatched_passwords_disable_create() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_create(&mut harness);
+        fill_valid_create(&mut harness);
+        harness
+            .state_mut()
+            .create
+            .as_mut()
+            .expect("черновик")
+            .confirm = "typo".to_owned();
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("Создать")
+                .accesskit_node()
+                .is_disabled(),
+            "«Создать» активна при несовпадающих паролях"
+        );
+        // Контроль: пароли совпали — кнопка активна.
+        harness
+            .state_mut()
+            .create
+            .as_mut()
+            .expect("черновик")
+            .confirm = "secret".to_owned();
+        harness.run();
+        assert!(
+            !harness
+                .get_by_label("Создать")
+                .accesskit_node()
+                .is_disabled(),
+            "«Создать» неактивна при совпадающих валидных полях"
+        );
+    }
+
+    #[test]
+    fn create_is_disabled_while_an_operation_runs() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_create(&mut harness);
+        fill_valid_create(&mut harness);
+        harness.run();
+        assert!(
+            !harness
+                .get_by_label("Создать")
+                .accesskit_node()
+                .is_disabled(),
+            "до опыта кнопка уже неактивна — проверка ничего не докажет"
+        );
+        // Занятость наводится незавершающейся задачей (как card_actions-тест).
+        let ctx = harness.ctx.clone();
+        let never = harness
+            .state()
+            .spawn_waking(&ctx, std::future::pending::<OpOutcome>());
+        harness.state_mut().pending = Some(never);
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("Создать")
+                .accesskit_node()
+                .is_disabled(),
+            "«Создать» осталась активной во время операции"
+        );
+    }
+
+    #[test]
+    fn cancelling_create_forgets_the_passphrase() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_create(&mut harness);
+        harness
+            .state_mut()
+            .create
+            .as_mut()
+            .expect("черновик")
+            .passphrase = "не-должно-остаться".to_owned();
+        harness.run();
+        assert!(
+            harness.state().create.is_some(),
+            "черновика нет до опыта — проверять нечего"
+        );
+        harness.get_by_label("Отмена").click();
+        harness.run();
+        assert!(
+            harness.state().create.is_none(),
+            "черновик создания пережил «Отмену» (секрет не затёрт)"
         );
     }
 
