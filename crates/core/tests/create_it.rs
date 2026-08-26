@@ -304,17 +304,31 @@ async fn rollback_of_a_created_vault_deletes_the_file_and_detaches_the_loop() {
     .await
     .expect("vault created");
 
-    assert!(
-        loop_attached_to(&container),
-        "loop не привязан до отката — проверять нечего"
-    );
-    assert!(container.exists(), "файла нет до отката — проверять нечего");
+    // Контроль канала — под `catch_unwind`: если он упадёт (том жив, файл на
+    // месте — предпосылки теста), откат ниже всё равно закроет том. RAII по
+    // образцу `with_container`: уборка выполняется ВСЕГДА, паникует тест или нет.
+    let control = std::panic::AssertUnwindSafe(async {
+        assert!(
+            loop_attached_to(&container),
+            "loop не привязан до отката — проверять нечего"
+        );
+        assert!(container.exists(), "файла нет до отката — проверять нечего");
+    })
+    .catch_unwind()
+    .await;
 
+    // Откат вызывается БЕЗУСЛОВНО: при пройденном контроле — как операция под
+    // тестом, при упавшем — как уборка живого тома (закрывает + удаляет файл).
     rollback_created_file_vault(&ud, home.path(), &label, &created.loop_object, &container).await;
 
-    assert!(
-        !loop_attached_to(&container),
-        "loop не отвязан откатом — остался живой том"
-    );
-    assert!(!container.exists(), "файл не удалён откатом");
+    match control {
+        Ok(()) => {
+            assert!(
+                !loop_attached_to(&container),
+                "loop не отвязан откатом — остался живой том"
+            );
+            assert!(!container.exists(), "файл не удалён откатом");
+        }
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
