@@ -6,6 +6,7 @@
 #![deny(missing_docs)]
 
 mod app;
+mod view_create;
 mod view_list;
 
 use std::process::ExitCode;

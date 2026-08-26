@@ -3,7 +3,7 @@
 //! Невалидных состояний не существует: переходы возможны только через
 //! методы [`Vault`], каждый проверяет исходное состояние.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -200,6 +200,20 @@ impl Vault {
     }
 }
 
+/// Путь нового файл-контейнера: `<home>/.local/share/panzir/<метка>.vault`.
+///
+/// Приложение выбирает путь само (спека среза 1) — пользователь вводит только
+/// метку. Чистая функция от `home` и метки; `home` приходит параметром
+/// (инвариант 9), env здесь НЕ читается — в отличие от [`Vault::symlink_path`],
+/// где обёртка над env нужна, потому что путь строится без готового `home`.
+/// Уровень упрощения тот же, что у [`crate::registry::Registry::default_path`]
+/// (`$HOME/...`, без разбора `$XDG_*`).
+#[must_use]
+pub fn container_path(home: &Path, label: &Label) -> PathBuf {
+    home.join(".local/share/panzir")
+        .join(format!("{}.vault", label.as_str()))
+}
+
 #[cfg(test)]
 // expect в тестах — осознанно (закон №3: unwrap/expect только в тестах и main).
 #[allow(clippy::expect_used)]
@@ -254,6 +268,15 @@ mod tests {
         assert!(Vault::symlink_path_in(Some("".into()), &label).is_err());
         let p = Vault::symlink_path_in(Some("/home/u".into()), &label).expect("ok");
         assert_eq!(p, PathBuf::from("/home/u/panzir-work"));
+    }
+
+    #[test]
+    fn container_path_is_under_xdg_data_home() {
+        let label = Label::new("work").expect("valid label");
+        assert_eq!(
+            container_path(Path::new("/home/u"), &label),
+            PathBuf::from("/home/u/.local/share/panzir/work.vault")
+        );
     }
 
     #[test]

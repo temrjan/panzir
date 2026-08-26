@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use futures_util::FutureExt;
-use panzir_core::create::{CreatedVault, create_file_container, teardown_file_container};
+use panzir_core::create::{
+    CreatedVault, create_file_container, create_file_vault, rollback_created_file_vault,
+    teardown_file_container,
+};
 use panzir_core::udisks::Udisks;
 use panzir_core::vault::Label;
 use secrecy::SecretString;
@@ -273,4 +276,59 @@ async fn cleanup(ud: &Udisks, created: &CreatedVault, container: &Path) {
     teardown_file_container(ud, &created.loop_object, container)
         .await
         .expect("cleanup must not leave a stale loop");
+}
+
+/// Откат неудавшегося создания отвязывает loop И удаляет файл (решение Капитана
+/// 26.08: провал атомарен, следа не оставляет). Продуктовый путь —
+/// `rollback_created_file_vault`, не тестовый `teardown_file_container`.
+///
+/// Контроль канала: до отката том жив (loop привязан, файл на месте) — иначе
+/// проверка «удалено/отвязано» была бы вакуумной.
+#[tokio::test]
+#[ignore = "requires live udisks2/polkit; run with --ignored"]
+async fn rollback_of_a_created_vault_deletes_the_file_and_detaches_the_loop() {
+    let _serial = UDISKS_LOCK.lock().await;
+    let ud = Udisks::connect().await.expect("udisks2 on the bus");
+    let home = tempfile::tempdir().expect("tempdir");
+    let container = home.path().join(".local/share/panzir/panzir-t20.vault");
+    let label = Label::new("panzir-t20").expect("label");
+
+    let created = create_file_vault(
+        &ud,
+        home.path(),
+        &label,
+        &container,
+        64 * 1024 * 1024,
+        &SecretString::from("test-passphrase-t20"),
+    )
+    .await
+    .expect("vault created");
+
+    // Контроль канала — под `catch_unwind`: если он упадёт (том жив, файл на
+    // месте — предпосылки теста), откат ниже всё равно закроет том. RAII по
+    // образцу `with_container`: уборка выполняется ВСЕГДА, паникует тест или нет.
+    let control = std::panic::AssertUnwindSafe(async {
+        assert!(
+            loop_attached_to(&container),
+            "loop не привязан до отката — проверять нечего"
+        );
+        assert!(container.exists(), "файла нет до отката — проверять нечего");
+    })
+    .catch_unwind()
+    .await;
+
+    // Откат вызывается БЕЗУСЛОВНО: при пройденном контроле — как операция под
+    // тестом, при упавшем — как уборка живого тома (закрывает + удаляет файл).
+    rollback_created_file_vault(&ud, home.path(), &label, &created.loop_object, &container).await;
+
+    match control {
+        Ok(()) => {
+            assert!(
+                !loop_attached_to(&container),
+                "loop не отвязан откатом — остался живой том"
+            );
+            assert!(!container.exists(), "файл не удалён откатом");
+        }
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
