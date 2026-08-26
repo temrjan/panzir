@@ -884,6 +884,32 @@ mod tests {
         );
     }
 
+    /// Круг H, находка Ревьюера: у классификатора есть третья ветка — ошибка,
+    /// которая **вообще не ответ метода**: сокет шины умер, адрес не разобран,
+    /// рукопожатие не состоялось. Здесь «служба не отвечает» — правда, и такой
+    /// случай обязан остаться [`Error::Udisks`]. Без этого теста регрессия в
+    /// `auth_refusal` вернёт ровно ту болезнь, которую лечит весь круг H:
+    /// обрыв шины назовётся отказом в правах, и сюит этого не заметит.
+    #[test]
+    fn a_broken_bus_is_not_mistaken_for_a_refusal() {
+        let bus_down = [
+            zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::other(
+                "system bus socket closed",
+            ))),
+            zbus::Error::Address("unix:path=/nonexistent".to_owned()),
+            zbus::Error::Handshake("EXTERNAL auth failed".to_owned()),
+        ];
+        for e in bus_down {
+            let shown = format!("{e:?}");
+            let err = Error::from(e);
+            assert!(
+                matches!(err, Error::Udisks(_)),
+                "обрыв шины выдан за отказ в правах ({shown}): человеку скажут «нельзя», \
+                 когда служба и правда не отвечает"
+            );
+        }
+    }
+
     #[test]
     fn clean_backing_file_strips_newline_and_deleted_suffix() {
         // Замер 24.08 (`od -c`): ядро пишет путь с завершающим \n. Без обрезки
