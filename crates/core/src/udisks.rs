@@ -16,7 +16,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use zbus::zvariant::{Fd, ObjectPath, OwnedObjectPath, Value};
 use zbus::{Connection, proxy};
 
-use crate::{Error, Result};
+use crate::{AuthRefusal, Error, Result};
 
 /// Словарь опций udisks2 (`a{sv}`).
 type Options<'a> = HashMap<&'a str, Value<'a>>;
@@ -38,6 +38,38 @@ fn no_interaction_options() -> Options<'static> {
 /// D-Bus ошибка-метод с заданным именем (таксономия udisks2 — только здесь).
 fn dbus_error_is(e: &zbus::Error, name: &str) -> bool {
     matches!(e, zbus::Error::MethodError(n, _, _) if n.as_str() == name)
+}
+
+/// Оттенок отказа polkit по имени D-Bus-ошибки; `None` — это не отказ в правах.
+/// Карта — из самого udisks (`udisksdaemonutil.c`): `dismissed → Dismissed`,
+/// `is_challenge → CanObtain`, иначе `NotAuthorized`. Описание ошибки не
+/// участвует: оно бывает пустым.
+fn auth_refusal(e: &zbus::Error) -> Option<AuthRefusal> {
+    let zbus::Error::MethodError(name, _, _) = e else {
+        return None;
+    };
+    match name.as_str() {
+        "org.freedesktop.UDisks2.Error.NotAuthorized" => Some(AuthRefusal::Denied),
+        "org.freedesktop.UDisks2.Error.NotAuthorizedCanObtain" => {
+            Some(AuthRefusal::NeedsConfirmation)
+        }
+        "org.freedesktop.UDisks2.Error.NotAuthorizedDismissed" => Some(AuthRefusal::Dismissed),
+        _ => None,
+    }
+}
+
+/// Единственная конверсия `zbus::Error` → [`Error`]: отказ polkit получает
+/// собственный вариант, всё остальное остаётся [`Error::Udisks`]. Ручная, а
+/// не `#[from]`, ровно затем, чтобы имена отказа жили здесь — рядом с
+/// остальной таксономией udisks2 — и покрывали каждый `?` на прокси-вызове
+/// разом, без обёртки на каждом.
+impl From<zbus::Error> for Error {
+    fn from(e: zbus::Error) -> Self {
+        match auth_refusal(&e) {
+            Some(reason) => Error::NotAuthorized { reason },
+            None => Error::Udisks(e),
+        }
+    }
 }
 
 /// «Том не смонтирован».
@@ -787,6 +819,95 @@ mod tests {
             desc.map(|s| s.to_owned()),
             msg,
         )
+    }
+
+    /// Круг H: udisks2 отвечает отказом polkit тремя именами. Ни одно из них —
+    /// не «шина умерла»: служба ответила безупречно, она сказала «нельзя».
+    /// Если такой отказ приезжает как общий `Error::Udisks`, окно скажет
+    /// человеку «служба дисков не отвечает» — и он пойдёт чинить не то.
+    #[test]
+    fn polkit_refusal_is_not_reported_as_a_generic_udisks_failure() {
+        for name in [
+            "org.freedesktop.UDisks2.Error.NotAuthorized",
+            "org.freedesktop.UDisks2.Error.NotAuthorizedCanObtain",
+            "org.freedesktop.UDisks2.Error.NotAuthorizedDismissed",
+        ] {
+            // Описание бывает и пустым: классификация идёт по имени, не по тексту.
+            for desc in [Some("Not authorized to perform operation"), None] {
+                let err = Error::from(dummy_udisks_error(name, desc));
+                assert!(
+                    !matches!(err, Error::Udisks(_)),
+                    "{name} (desc {desc:?}): отказ в правах приехал как общий сбой udisks2 — \
+                     окно скажет «не отвечает»"
+                );
+            }
+        }
+    }
+
+    /// Карта имя → оттенок, по исходнику udisks; и контроль, что новый отказ не
+    /// глотает соседей: `NotMounted` по-прежнему общий `Udisks`.
+    #[test]
+    fn polkit_refusal_maps_each_name_to_its_reason() {
+        let cases = [
+            (
+                "org.freedesktop.UDisks2.Error.NotAuthorized",
+                AuthRefusal::Denied,
+            ),
+            (
+                "org.freedesktop.UDisks2.Error.NotAuthorizedCanObtain",
+                AuthRefusal::NeedsConfirmation,
+            ),
+            (
+                "org.freedesktop.UDisks2.Error.NotAuthorizedDismissed",
+                AuthRefusal::Dismissed,
+            ),
+        ];
+        for (name, expected) in cases {
+            for desc in [Some("Not authorized to perform operation"), None] {
+                match Error::from(dummy_udisks_error(name, desc)) {
+                    Error::NotAuthorized { reason } => {
+                        assert_eq!(reason, expected, "{name} (desc {desc:?})");
+                    }
+                    other => {
+                        panic!("{name} (desc {desc:?}): ожидался NotAuthorized, пришло {other:?}")
+                    }
+                }
+            }
+        }
+        let not_mounted = Error::from(dummy_udisks_error(
+            "org.freedesktop.UDisks2.Error.NotMounted",
+            None,
+        ));
+        assert!(
+            matches!(not_mounted, Error::Udisks(_)),
+            "NotMounted — не отказ в правах, обязан остаться общим Udisks: {not_mounted:?}"
+        );
+    }
+
+    /// Круг H, находка Ревьюера: у классификатора есть третья ветка — ошибка,
+    /// которая **вообще не ответ метода**: сокет шины умер, адрес не разобран,
+    /// рукопожатие не состоялось. Здесь «служба не отвечает» — правда, и такой
+    /// случай обязан остаться [`Error::Udisks`]. Без этого теста регрессия в
+    /// `auth_refusal` вернёт ровно ту болезнь, которую лечит весь круг H:
+    /// обрыв шины назовётся отказом в правах, и сюит этого не заметит.
+    #[test]
+    fn a_broken_bus_is_not_mistaken_for_a_refusal() {
+        let bus_down = [
+            zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::other(
+                "system bus socket closed",
+            ))),
+            zbus::Error::Address("unix:path=/nonexistent".to_owned()),
+            zbus::Error::Handshake("EXTERNAL auth failed".to_owned()),
+        ];
+        for e in bus_down {
+            let shown = format!("{e:?}");
+            let err = Error::from(e);
+            assert!(
+                matches!(err, Error::Udisks(_)),
+                "обрыв шины выдан за отказ в правах ({shown}): человеку скажут «нельзя», \
+                 когда служба и правда не отвечает"
+            );
+        }
     }
 
     #[test]

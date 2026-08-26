@@ -18,7 +18,7 @@ pub mod registry;
 pub mod udisks;
 pub mod vault;
 
-pub use error::Error;
+pub use error::{AuthRefusal, Error};
 pub use vault::{Label, Vault, VaultKind, VaultState};
 
 /// Результат по умолчанию для всех операций core.
