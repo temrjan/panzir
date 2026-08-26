@@ -270,21 +270,20 @@ pub async fn create_file_vault(
     Ok(created)
 }
 
-/// Откат неудавшегося создания: снять симлинк, закрыть том, отвязать loop.
-/// Best-effort — вызывается уже на ошибке, поэтому шаги логируются, но не
-/// прерывают друг друга.
+/// Откат неудавшегося создания: снять симлинк, закрыть том, отвязать loop и
+/// **удалить файл контейнера** — но только после ПОДТВЕРЖДЁННОЙ отвязки loop
+/// (как [`teardown_file_container`]). Best-effort: вызывается уже на ошибке,
+/// шаги логируются, но не прерывают друг друга.
 ///
-/// **Файл контейнера НЕ удаляет.** Удалять ли осиротевший файл (которого
-/// пользователь не видел зарегистрированным) — открытый вопрос Капитану,
-/// дефолт «оставить». При «удалять» здесь добавляется `remove_file(container)`
-/// ПОСЛЕ подтверждённой отвязки loop (как в [`teardown_file_container`]),
-/// поэтому `container` уже в сигнатуре.
+/// Удаление файла — решение Капитана 26.08: провал создания атомарен и следа не
+/// оставляет. Это файл нашей же неудавшейся операции, не зарегистрированное
+/// хранилище — не предмет инварианта 1 (см. его уточнение в `CLAUDE.md`).
 pub async fn rollback_created_file_vault(
     ud: &Udisks,
     home: &Path,
     label: &Label,
     loop_object: &ObjPath,
-    _container: &Path,
+    container: &Path,
 ) {
     if let Err(e) = mountpoint::remove_symlink(home, label).await {
         tracing::warn!("rollback_create: remove_symlink: {e}");
@@ -292,8 +291,26 @@ pub async fn rollback_created_file_vault(
     if let Err(e) = ud.close_encrypted(loop_object).await {
         tracing::warn!("rollback_create: close_encrypted: {e}");
     }
-    if let Err(e) = ud.ensure_loop_detached(loop_object).await {
-        tracing::warn!("rollback_create: ensure_loop_detached: {e}");
+    // Файл удаляем ТОЛЬКО после ПОДТВЕРЖДЁННОЙ отвязки loop (как
+    // `teardown_file_container`): пока dm-crypt/loop живы, файл трогать нельзя.
+    // Решение Капитана 26.08 — провал создания атомарен, следа не оставляет
+    // (это файл нашей же неудавшейся операции, а не зарегистрированное
+    // хранилище — не предмет инварианта 1; оставленный файл к тому же блокировал
+    // бы повтор той же метки через `create_new`).
+    match ud.ensure_loop_detached(loop_object).await {
+        Ok(()) => {
+            if let Err(e) = tokio::fs::remove_file(container).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!("rollback_create: remove {}: {e}", container.display());
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "rollback_create: ensure_loop_detached: {e}; файл {} НЕ удаляю (loop ещё жив)",
+                container.display()
+            );
+        }
     }
 }
 
