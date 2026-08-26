@@ -10,12 +10,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use eframe::egui;
-use panzir_core::Error;
 use panzir_core::deps::{self, DepsReport};
 use panzir_core::lifecycle::{self, VaultProbe};
 use panzir_core::registry::{Registry, VaultEntry};
 use panzir_core::udisks::{ObjPath, Udisks};
 use panzir_core::vault::{Label, VaultKind, VaultState};
+use panzir_core::{AuthRefusal, Error};
 use secrecy::SecretString;
 use secrecy::zeroize::Zeroize as _;
 use tokio::runtime::Runtime;
@@ -157,12 +157,26 @@ pub fn error_text(err: &Error) -> String {
             )
         }
         Error::Registry(what) => {
-            format!("список хранилищ не прочитать: {what}")
+            format!("список хранилищ не удалось прочитать или сохранить: {what}")
         }
-        Error::Io(e) => format!("не удалось обратиться к диску: {e}"),
+        Error::Io(e) => format!("ошибка ввода-вывода: {e}"),
+        // Служба ответила ошибкой ИЛИ недоступна — вариант этого не различает,
+        // поэтому и текст не утверждает ни того, ни другого (круг H).
         Error::Udisks(e) => {
-            format!("служба дисков udisks2 не отвечает: {e}")
+            format!("служба дисков udisks2 вернула ошибку: {e}")
         }
+        // Отказ polkit — не сбой службы: она ответила «нельзя». Три оттенка —
+        // три текста; ни один не называет причину, которой имя не несёт.
+        Error::NotAuthorized { reason } => match reason {
+            AuthRefusal::Denied => {
+                "политика системы запрещает эту операцию вашей учётной записи — подтверждение прав здесь не поможет"
+                    .to_owned()
+            }
+            AuthRefusal::NeedsConfirmation => {
+                "операция требует подтверждения прав, а спросить его в этом вызове нельзя".to_owned()
+            }
+            AuthRefusal::Dismissed => "подтверждение прав отменено".to_owned(),
+        },
         Error::UnexpectedUdisksState(what) => {
             format!("служба дисков ответила неожиданно: {what}")
         }
@@ -797,6 +811,15 @@ mod tests {
             },
             Error::UnexpectedUdisksState("объект пропал".to_owned()),
             Error::Registry("битый toml".to_owned()),
+            Error::NotAuthorized {
+                reason: AuthRefusal::Denied,
+            },
+            Error::NotAuthorized {
+                reason: AuthRefusal::NeedsConfirmation,
+            },
+            Error::NotAuthorized {
+                reason: AuthRefusal::Dismissed,
+            },
             Error::NoHome,
             Error::AlreadyRunning,
             Error::VaultNotFound("t-alpha".to_owned()),
@@ -839,6 +862,57 @@ mod tests {
             "текст не объясняет причину: {text}"
         );
         assert_ne!(text, Error::AlreadyRunning.to_string());
+    }
+
+    /// Круг H: текст называет только то, что вариант ошибки действительно несёт.
+    /// `Io` рождается и в трубе к cryptsetup (`passphrase.rs`), не только «на
+    /// диске»; `Registry` — и при записи (`registry.rs`), не только при чтении.
+    #[test]
+    fn io_and_registry_texts_do_not_claim_a_cause_they_cannot_know() {
+        let io = error_text(&Error::Io(std::io::Error::other("проба")));
+        assert!(
+            !io.contains("диск"),
+            "Io рождается и в трубе к cryptsetup, «диск» — не причина: {io}"
+        );
+        let reg = error_text(&Error::Registry("проба".to_owned()));
+        assert!(
+            reg.contains("сохранить"),
+            "Registry рождается и при записи, «прочитать» — не вся правда: {reg}"
+        );
+    }
+
+    /// Круг H: отказ polkit — не сбой службы. Три оттенка — три разных текста;
+    /// ни один не говорит «не отвечает» и не называет агента: имя ошибки не
+    /// различает «агента нет» и «вызов сам запретил диалог».
+    #[test]
+    fn polkit_refusal_texts_name_only_what_the_variant_carries() {
+        let texts: Vec<String> = [
+            AuthRefusal::Denied,
+            AuthRefusal::NeedsConfirmation,
+            AuthRefusal::Dismissed,
+        ]
+        .into_iter()
+        .map(|reason| error_text(&Error::NotAuthorized { reason }))
+        .collect();
+        for text in &texts {
+            assert!(
+                !text.contains("не отвечает"),
+                "отказ в правах выдан за сбой службы: {text}"
+            );
+            assert!(
+                !text.contains("агент"),
+                "текст называет причину, которой имя ошибки не несёт: {text}"
+            );
+        }
+        assert_ne!(
+            texts[0], texts[1],
+            "«нельзя» и «нужно подтверждение» слились"
+        );
+        assert_ne!(
+            texts[1], texts[2],
+            "«нужно подтверждение» и «отменено» слились"
+        );
+        assert_ne!(texts[0], texts[2], "«нельзя» и «отменено» слились");
     }
 
     // ---------- Т-13а: окно поверх kittest ----------
