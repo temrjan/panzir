@@ -15,9 +15,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use secrecy::SecretString;
 
+use crate::registry::{Registry, VaultEntry};
 use crate::schedule::Scheduler;
 use crate::udisks::{ObjPath, Udisks};
 use crate::vault::Label;
+use crate::vault::{VaultKind, VaultState};
 use crate::{Error, Result};
 
 /// Хранилище открыто: объекты udisks2 и фактическая точка монтирования.
@@ -440,14 +442,226 @@ fn mount_has_noexec(mount_point: &Path) -> bool {
     })
 }
 
-/// Дедлайн `after` от текущего момента, в секундах Unix. Часы до эпохи —
-/// не наш случай; тогда дедлайн отсчитывается от нуля и заведомо просрочен,
-/// что для страховки при старте безопаснее, чем паника.
-fn deadline_after(after: Duration) -> u64 {
+/// Сколько раз и как часто автозакрытие пробует занятый том (спека С-8):
+/// `attempts` попыток через `interval`, затем часы заводятся на полный срок.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Пауза между попытками.
+    pub interval: Duration,
+    /// Сколько попыток подряд, прежде чем вернуться к полному сроку.
+    pub attempts: u8,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(60),
+            attempts: 3,
+        }
+    }
+}
+
+/// Чем кончилось закрытие по записи реестра.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// Том закрыт этим вызовом.
+    Closed,
+    /// Том уже был закрыт (штатной утилитой, прошлым срабатыванием);
+    /// запись приведена к правде, часы сняты.
+    AlreadyClosed,
+    /// Том занят: не ломаем (спека Т-3), часы заведены заново.
+    Deferred {
+        /// Номер попытки в текущей серии; `attempts` политики — серия
+        /// исчерпана, следующий срок полный.
+        attempt: u8,
+        /// Через сколько часы сработают снова.
+        retry_in: Duration,
+    },
+}
+
+/// Исход и снимок реестра, прочитанный **под тем же локом**, что и правка:
+/// вторым чтением он бы разъехался с записью другого процесса.
+#[derive(Debug, Clone)]
+pub struct CloseReport {
+    /// Что случилось с томом.
+    pub outcome: CloseOutcome,
+    /// Все записи после правки.
+    pub entries: Vec<VaultEntry>,
+}
+
+/// Закрыть хранилище по его записи: проба → решение → закрытие → правда в
+/// реестре. Единственный путь и для окна, и для закрывателя таймера — два
+/// куска, решающих один вопрос, не имеют права разойтись.
+///
+/// Занятый том (спека С-8) не ломается: попытка записывается в реестр, часы
+/// заводятся на `policy.interval`; после `policy.attempts` неудач — на полный
+/// срок записи, счётчик с нуля, момент первой неудачи остаётся.
+///
+/// # Errors
+/// - [`Error::VaultNotFound`] — записи нет;
+/// - [`Error::Registry`] — запись не о файле: часы заводятся только на файлы;
+/// - [`Error::VaultAlreadyAttached`] — контейнер держит другой пользователь;
+/// - ошибки udisks2/systemd — как есть; «занято» ошибкой не считается.
+pub async fn close_registered(
+    ud: &Udisks,
+    registry_path: &Path,
+    home: &Path,
+    scheduler: &impl Scheduler,
+    label: &Label,
+    policy: RetryPolicy,
+) -> Result<CloseReport> {
+    let registry = Registry::load_from(registry_path).await?;
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|e| e.label() == label)
+        .ok_or_else(|| Error::VaultNotFound(label.as_str().to_owned()))?;
+    let container = match entry.kind() {
+        VaultKind::File(path) => path.clone(),
+        VaultKind::Device { .. } => {
+            return Err(Error::Registry(format!(
+                "{label}: not a file vault — auto-close is armed for files only"
+            )));
+        }
+    };
+    let auto_close = entry.auto_close();
+    drop(registry);
+
+    match close_decision(probe_file_vault(ud, &container).await?) {
+        CloseDecision::Foreign(uid) => Err(Error::VaultAlreadyAttached {
+            path: container.display().to_string(),
+            uid,
+        }),
+        CloseDecision::AlreadyDetached => {
+            // Закрыли мимо нас — часы всё равно снимаем, запись приводим к правде.
+            scheduler.disarm(label).await?;
+            let entries = settle_closed(registry_path, label).await?;
+            Ok(CloseReport {
+                outcome: CloseOutcome::AlreadyClosed,
+                entries,
+            })
+        }
+        CloseDecision::Close(loop_object) => {
+            match close_file_vault(ud, &loop_object, label, home, false, scheduler).await {
+                Ok(()) => {
+                    let entries = settle_closed(registry_path, label).await?;
+                    Ok(CloseReport {
+                        outcome: CloseOutcome::Closed,
+                        entries,
+                    })
+                }
+                Err(e) if Udisks::is_retryable_unmount(&e) => {
+                    tracing::warn!("close_registered: {label} is busy, deferring: {e}");
+                    defer(registry_path, scheduler, label, auto_close, policy).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// Закрыть всё, у чего дедлайн уже прошёл (путь 3 спеки — страховка при
+/// старте окна: таймер не пережил сон машины, а окна в тот момент не было).
+///
+/// Каждая запись закрывается своим вызовом [`close_registered`]; отказ одной
+/// не мешает остальным — исходы возвращаются пометочно.
+///
+/// # Errors
+/// Только если реестр не читается; исходы по записям — внутри `Ok`.
+pub async fn close_expired(
+    ud: &Udisks,
+    registry_path: &Path,
+    home: &Path,
+    scheduler: &impl Scheduler,
+    now: u64,
+    policy: RetryPolicy,
+) -> Result<Vec<(Label, Result<CloseOutcome>)>> {
+    let registry = Registry::load_from(registry_path).await?;
+    let due: Vec<Label> = registry
+        .entries()
+        .iter()
+        .filter(|e| matches!(e.state(), VaultState::Open { until: Some(u), .. } if *u <= now))
+        .map(|e| e.label().clone())
+        .collect();
+    drop(registry);
+
+    let mut outcomes = Vec::with_capacity(due.len());
+    for label in due {
+        let outcome = close_registered(ud, registry_path, home, scheduler, &label, policy)
+            .await
+            .map(|report| report.outcome);
+        outcomes.push((label, outcome));
+    }
+    Ok(outcomes)
+}
+
+/// Запись → `Closed`, серия отложенных закрытий снята. Записи нет —
+/// не ошибка: том закрыт, править нечего.
+async fn settle_closed(registry_path: &Path, label: &Label) -> Result<Vec<VaultEntry>> {
+    let label = label.clone();
+    Registry::with_write_lock_at(registry_path, move |r| {
+        if let Some(entry) = r.entries_mut().iter_mut().find(|e| *e.label() == label) {
+            if entry.state() != &VaultState::Closed {
+                entry.set_state(VaultState::Closed)?;
+            }
+            entry.reset_close_deferral();
+        }
+        Ok(r.entries().to_vec())
+    })
+    .await
+}
+
+/// Том занят: попытка в реестр, часы заново (спека С-8). Реестр правится
+/// ДО завода часов — карточке есть что показать, даже если systemd откажет.
+async fn defer(
+    registry_path: &Path,
+    scheduler: &impl Scheduler,
+    label: &Label,
+    auto_close: Option<Duration>,
+    policy: RetryPolicy,
+) -> Result<CloseReport> {
+    let now = now_secs();
+    let (attempt, retry_in, entries) = Registry::with_write_lock_at(registry_path, {
+        let label = label.clone();
+        move |r| {
+            let entry = r
+                .entries_mut()
+                .iter_mut()
+                .find(|e| *e.label() == label)
+                .ok_or_else(|| Error::VaultNotFound(label.as_str().to_owned()))?;
+            entry.note_close_deferred(now);
+            let attempt = entry.close_attempts();
+            let retry_in = if attempt < policy.attempts {
+                policy.interval
+            } else {
+                entry.restart_close_attempts();
+                // «Не закрывать» с заведёнными часами не бывает; если реестр
+                // правили руками — ждём хотя бы интервал, а не вечность.
+                auto_close.unwrap_or(policy.interval)
+            };
+            entry.set_until(Some(now.saturating_add(retry_in.as_secs())))?;
+            Ok((attempt, retry_in, r.entries().to_vec()))
+        }
+    })
+    .await?;
+    scheduler.arm(label, retry_in).await?;
+    Ok(CloseReport {
+        outcome: CloseOutcome::Deferred { attempt, retry_in },
+        entries,
+    })
+}
+
+/// Текущий момент в секундах Unix; часы до эпохи — не наш случай, тогда ноль.
+fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-        .saturating_add(after.as_secs())
+}
+
+/// Дедлайн `after` от текущего момента, в секундах Unix (см. [`now_secs`]):
+/// заведомо просроченный дедлайн для страховки при старте безопаснее паники.
+fn deadline_after(after: Duration) -> u64 {
+    now_secs().saturating_add(after.as_secs())
 }
 
 /// Что делать с томом по результату пробы.
@@ -507,13 +721,18 @@ pub async fn close_file_vault(
     scheduler.disarm(label).await?;
     let close_result = ud.close_encrypted(loop_object).await;
 
-    let detach_result = if detach_loop {
-        ud.ensure_loop_detached(loop_object).await
-    } else {
-        // Чужой loop: не подталкиваем Delete, но убеждаемся, что autoclear
-        // сделал своё дело — иначе «закрыто» было бы утверждением без свидетеля.
-        Ok(())
-    };
+    if !detach_loop {
+        // Чужой loop не отвязываем — и второго свидетеля закрытия у нас нет.
+        // Единственный свидетель — исход `close_encrypted`: его отказ (занято,
+        // шина) нельзя подменять «закрыто» (инвариант 4). До 27.08 здесь
+        // стояло безусловное `Ok(())`, и занятый том уходил в реестр
+        // закрытым — поймано живым T-26.
+        close_result?;
+        crate::mountpoint::remove_symlink(home, label).await?;
+        return Ok(());
+    }
+
+    let detach_result = ud.ensure_loop_detached(loop_object).await;
 
     match (close_result, detach_result) {
         // Закрытие состоялось. Если `close_encrypted` при этом жаловался —

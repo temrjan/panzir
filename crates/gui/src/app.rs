@@ -312,7 +312,7 @@ impl App {
             registry_path,
             home,
             // Ждать бегущее закрытие в `disarm` — не дольше, чем операцию целиком.
-            scheduler: SystemdUser::new(closer, op_timeout),
+            scheduler: SystemdUser::new(vec![closer.into()], op_timeout),
             op_timeout,
             smoke_frames,
             frames_drawn: 0,

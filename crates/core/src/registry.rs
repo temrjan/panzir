@@ -65,10 +65,34 @@ impl VaultEntry {
         self.close_deferred_since.get_or_insert(now);
     }
 
-    /// Серия кончилась — закрылось или начали заново с полного срока.
+    /// Серия кончилась — закрылось: и счётчик, и момент первой неудачи снимаются.
     pub fn reset_close_deferral(&mut self) {
         self.close_attempts = 0;
         self.close_deferred_since = None;
+    }
+
+    /// Попытки исчерпаны, часы заведены на полный срок: счётчик с нуля, а
+    /// момент первой неудачи остаётся — карточке нужно «не закрывается с …».
+    pub fn restart_close_attempts(&mut self) {
+        self.close_attempts = 0;
+    }
+
+    /// Переставить дедлайн автозакрытия у открытого тома (перезавод часов).
+    ///
+    /// # Errors
+    /// [`Error::InvalidState`], если том не открыт: дедлайн есть только у
+    /// открытого.
+    pub fn set_until(&mut self, until: Option<u64>) -> Result<()> {
+        match &mut self.state {
+            VaultState::Open { until: slot, .. } => {
+                *slot = until;
+                Ok(())
+            }
+            other => Err(Error::InvalidState {
+                from: state_name(other),
+                to: "open (deadline change)",
+            }),
+        }
     }
 
     /// Та же запись с другим сроком автозакрытия.
@@ -697,6 +721,44 @@ mod tests {
         let mut a = a.clone();
         a.reset_close_deferral();
         assert_eq!((a.close_attempts(), a.close_deferred_since()), (0, None));
+    }
+
+    /// Дедлайн переставляется только у открытого тома (перезавод часов при
+    /// отложенном закрытии — С-8); закрытому дедлайн не положен.
+    #[test]
+    fn set_until_requires_open_state() {
+        let mut e = entry("x");
+        assert!(
+            e.set_until(Some(1)).is_err(),
+            "closed vault has no deadline"
+        );
+        e.set_state(VaultState::Open {
+            mount_point: PathBuf::from("/run/m"),
+            until: Some(1),
+        })
+        .expect("open");
+        e.set_until(Some(2)).expect("open vault: deadline moves");
+        assert_eq!(
+            e.state(),
+            &VaultState::Open {
+                mount_point: PathBuf::from("/run/m"),
+                until: Some(2),
+            }
+        );
+    }
+
+    /// Серия попыток начинается заново, а момент первой неудачи остаётся —
+    /// карточке нужно «не закрывается с …», а не «с последней минуты».
+    #[test]
+    fn restarting_attempts_keeps_first_failure_moment() {
+        let mut e = entry("x");
+        e.note_close_deferred(100);
+        e.note_close_deferred(160);
+        e.restart_close_attempts();
+        assert_eq!(
+            (e.close_attempts(), e.close_deferred_since()),
+            (0, Some(100))
+        );
     }
 
     #[tokio::test]

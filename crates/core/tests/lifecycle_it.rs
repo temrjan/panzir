@@ -745,7 +745,7 @@ async fn t24_open_arms_timer_and_close_disarms() {
         "positive control: no timer before the test opens the vault"
     );
 
-    let clock = SystemdUser::new(PathBuf::from("/bin/true"), Duration::from_secs(5));
+    let clock = SystemdUser::new(vec!["/bin/true".into()], Duration::from_secs(5));
     let opened = open_file_vault(
         &ud,
         &container,
@@ -779,5 +779,301 @@ async fn t24_open_arms_timer_and_close_disarms() {
     assert!(
         !timer_listed("panzir-close-t24"),
         "manual close must disarm the timer"
+    );
+}
+
+/// Собирает закрыватель-пример и возвращает его путь — как `t4_flock_stress`
+/// собирает своего воркера (`pr2_it.rs`): на чистом checkout бинаря ещё нет.
+async fn build_close_worker() -> PathBuf {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = workspace_root
+        .parent()
+        .and_then(Path::parent)
+        .expect("core is at crates/core inside workspace")
+        .to_path_buf();
+    let build = tokio::process::Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "panzir-core",
+            "--example",
+            "close_worker",
+            "--quiet",
+        ])
+        .current_dir(&workspace_root)
+        .status()
+        .await
+        .expect("build close_worker");
+    assert!(build.success(), "close_worker build failed");
+    workspace_root.join("target/debug/examples/close_worker")
+}
+
+/// Часы, чей закрыватель — воркер с явными реестром и домом: продуктовый
+/// `panzir --close` берёт их из системы, а тест не имеет права трогать
+/// настоящий `~/.config/panzir/vaults.toml`.
+fn worker_clock(
+    worker: &Path,
+    registry: &Path,
+    home: &Path,
+    retry_secs: u64,
+    attempts: u8,
+) -> SystemdUser {
+    SystemdUser::new(
+        vec![
+            worker.as_os_str().to_owned(),
+            registry.as_os_str().to_owned(),
+            home.as_os_str().to_owned(),
+            retry_secs.to_string().into(),
+            attempts.to_string().into(),
+        ],
+        Duration::from_secs(5),
+    )
+}
+
+/// Ждёт внешнего процесса (закрывателя, запущенного systemd), опрашивая
+/// условие. Это не маскировка флаки, а единственный способ наблюдать чужой
+/// процесс: у теста нет канала, по которому тот мог бы его разбудить.
+async fn wait_until(limit: Duration, mut pred: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        if pred() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    pred()
+}
+
+/// То же, что [`wait_until`], для условий, которым нужен `.await`
+/// (чтение реестра).
+async fn wait_until_async<F, Fut>(limit: Duration, mut pred: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        if pred().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    pred().await
+}
+
+/// Запись реестра по метке — свежим чтением файла, не кэшем теста.
+async fn registry_entry(path: &Path, label: &Label) -> panzir_core::registry::VaultEntry {
+    panzir_core::registry::Registry::load_from(path)
+        .await
+        .expect("registry readable")
+        .entries()
+        .iter()
+        .find(|e| e.label() == label)
+        .cloned()
+        .expect("entry present")
+}
+
+/// Всё, что тестам автозакрытия нужно знать о хранилище.
+struct AutoCloseFixture {
+    registry: PathBuf,
+    container: PathBuf,
+    label: Label,
+    pass: SecretString,
+    home: PathBuf,
+}
+
+/// Открытое хранилище, записанное в реестр так, как это делает окно.
+async fn open_and_record(
+    ud: &Udisks,
+    fx: &AutoCloseFixture,
+    clock: &SystemdUser,
+    auto_close: Duration,
+) -> panzir_core::lifecycle::OpenedVault {
+    use panzir_core::registry::{Registry, VaultEntry};
+    use panzir_core::vault::{VaultKind, VaultState};
+    let opened = open_file_vault(
+        ud,
+        &fx.container,
+        &fx.label,
+        &fx.pass,
+        &fx.home,
+        clock,
+        Some(auto_close),
+    )
+    .await
+    .expect("open with a clock");
+    assert!(
+        opened.until.is_some(),
+        "armed open must report its deadline"
+    );
+    Registry::with_write_lock_at(&fx.registry, {
+        let label = fx.label.clone();
+        let container = fx.container.clone();
+        let mount_point = opened.mount_point.clone();
+        let until = opened.until;
+        move |r| {
+            r.add(VaultEntry::new(
+                label,
+                VaultKind::File(container),
+                VaultState::Open { mount_point, until },
+            ))
+        }
+    })
+    .await
+    .expect("record open vault");
+    opened
+}
+
+/// T-25 (автозакрытие, критерий 2): таймер закрывает хранилище **без окна** —
+/// том заперт, loop отвязан, симлинк снят, реестр говорит «закрыто».
+#[tokio::test]
+#[ignore = "requires live udisks2/polkit and systemd --user; run with --ignored"]
+async fn t25_timer_closes_the_vault_without_the_window() {
+    require_it_flag();
+    let _serial = UDISKS_LOCK.lock().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = fake_home(dir.path());
+    let container = dir.path().join("panzir-t25.vault");
+    let registry = dir.path().join("vaults.toml");
+    let _cleanup = TestCleanup {
+        container: container.clone(),
+    };
+    let _timer_cleanup = TimerCleanup("panzir-close-t25".to_owned());
+    let label = Label::new("t25").expect("label");
+    let pass = SecretString::from("t25-passphrase");
+    let worker = build_close_worker().await;
+
+    let ud = Udisks::connect().await.expect("udisks2 on the bus");
+    let created = create_file_container(&ud, &container, 64 * 1024 * 1024, &label, &pass)
+        .await
+        .expect("container created");
+    close_file_vault(&ud, &created.loop_object, &label, &home, true, &NoScheduler)
+        .await
+        .expect("close after create");
+
+    let clock = worker_clock(&worker, &registry, &home, 60, 3);
+    let fx = AutoCloseFixture {
+        registry: registry.clone(),
+        container: container.clone(),
+        label: label.clone(),
+        pass: pass.clone(),
+        home: home.clone(),
+    };
+    let opened = open_and_record(&ud, &fx, &clock, Duration::from_secs(5)).await;
+    assert_counter_can_see(&container, 1);
+    let link = home.join("panzir-t25");
+    assert!(link.exists(), "symlink exists while open");
+
+    // Окна нет: никто, кроме таймера, закрыть не может.
+    let closed = wait_until(Duration::from_secs(25), || {
+        count_loops_by_sysfs(&container) == 0 && !link.exists()
+    })
+    .await;
+    assert!(
+        closed,
+        "timer must close the vault: loops={}, symlink={}",
+        count_loops_by_sysfs(&container),
+        link.exists()
+    );
+    assert!(
+        !opened.mount_point.join("lost+found").exists(),
+        "mount is gone"
+    );
+    let entry = registry_entry(&registry, &label).await;
+    assert_eq!(
+        entry.state(),
+        &panzir_core::vault::VaultState::Closed,
+        "registry must say closed"
+    );
+    assert_eq!(entry.close_attempts(), 0, "no deferral on a clean close");
+}
+
+/// T-26 (критерий 3, спека С-8): занятый том таймер **не ломает** — отступает,
+/// пишет попытку в реестр и заводит часы заново; освободили — закрывает.
+#[tokio::test]
+#[ignore = "requires live udisks2/polkit and systemd --user; run with --ignored"]
+async fn t26_busy_volume_is_deferred_then_closed() {
+    require_it_flag();
+    let _serial = UDISKS_LOCK.lock().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = fake_home(dir.path());
+    let container = dir.path().join("panzir-t26.vault");
+    let registry = dir.path().join("vaults.toml");
+    let _cleanup = TestCleanup {
+        container: container.clone(),
+    };
+    let _timer_cleanup = TimerCleanup("panzir-close-t26".to_owned());
+    let label = Label::new("t26").expect("label");
+    let pass = SecretString::from("t26-passphrase");
+    let worker = build_close_worker().await;
+
+    let ud = Udisks::connect().await.expect("udisks2 on the bus");
+    let created = create_file_container(&ud, &container, 64 * 1024 * 1024, &label, &pass)
+        .await
+        .expect("container created");
+    close_file_vault(&ud, &created.loop_object, &label, &home, true, &NoScheduler)
+        .await
+        .expect("close after create");
+
+    // Повтор через 2 с, не через минуту: тесту не ждать час.
+    let clock = worker_clock(&worker, &registry, &home, 2, 3);
+    let fx = AutoCloseFixture {
+        registry: registry.clone(),
+        container: container.clone(),
+        label: label.clone(),
+        pass: pass.clone(),
+        home: home.clone(),
+    };
+    let opened = open_and_record(&ud, &fx, &clock, Duration::from_secs(2)).await;
+
+    // Занимаем том: открытый дескриптор его корня держит монтирование —
+    // unmount ответит busy. Каталог, а не файл: корень свежего ext4 принадлежит
+    // root, писать в него пользователь не может (замечено 27.08, вне скоупа).
+    let hold = std::fs::File::open(&opened.mount_point).expect("hold the volume root");
+
+    let deferred = wait_until_async(Duration::from_secs(20), || async {
+        let entry = registry_entry(&registry, &label).await;
+        entry.close_attempts() >= 1 && entry.close_deferred_since().is_some()
+    })
+    .await;
+    assert!(
+        deferred,
+        "busy volume must be recorded as deferred, not forced"
+    );
+    assert_eq!(
+        count_loops_by_sysfs(&container),
+        1,
+        "busy volume must stay open — forcing it would lose data"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || timer_listed("panzir-close-t26")).await,
+        "deferral must re-arm the timer"
+    );
+    let entry = registry_entry(&registry, &label).await;
+    assert!(
+        matches!(
+            entry.state(),
+            panzir_core::vault::VaultState::Open { until: Some(_), .. }
+        ),
+        "registry must stay open with a fresh deadline"
+    );
+
+    drop(hold);
+    let closed = wait_until(Duration::from_secs(30), || {
+        count_loops_by_sysfs(&container) == 0
+    })
+    .await;
+    assert!(
+        closed,
+        "once released, the next attempt must close the vault"
+    );
+    let entry = registry_entry(&registry, &label).await;
+    assert_eq!(entry.state(), &panzir_core::vault::VaultState::Closed);
+    assert_eq!(
+        (entry.close_attempts(), entry.close_deferred_since()),
+        (0, None),
+        "a successful close ends the deferral series"
     );
 }
