@@ -27,6 +27,12 @@ pub struct VaultEntry {
     /// Срок автозакрытия; `None` — не закрывать (спека С-7: «никогда» —
     /// отдельное значение, не сентинел в числе).
     auto_close: Option<Duration>,
+    /// Сколько раз подряд автозакрытие отступило перед занятым томом
+    /// (спека С-8). Ноль — отложенного закрытия нет.
+    close_attempts: u8,
+    /// Момент первой неудачи текущей серии, секунды Unix — карточке есть что
+    /// показать («не закрывается с …»).
+    close_deferred_since: Option<u64>,
 }
 
 impl VaultEntry {
@@ -37,7 +43,32 @@ impl VaultEntry {
             kind,
             state,
             auto_close: Some(DEFAULT_AUTO_CLOSE),
+            close_attempts: 0,
+            close_deferred_since: None,
         }
+    }
+
+    /// Сколько раз подряд автозакрытие отступило перед занятым томом.
+    pub fn close_attempts(&self) -> u8 {
+        self.close_attempts
+    }
+
+    /// Момент первой неудачи текущей серии отложенных закрытий.
+    pub fn close_deferred_since(&self) -> Option<u64> {
+        self.close_deferred_since
+    }
+
+    /// Автозакрытие отступило ещё раз: счётчик растёт, момент первой неудачи
+    /// не сдвигается.
+    pub fn note_close_deferred(&mut self, now: u64) {
+        self.close_attempts = self.close_attempts.saturating_add(1);
+        self.close_deferred_since.get_or_insert(now);
+    }
+
+    /// Серия кончилась — закрылось или начали заново с полного срока.
+    pub fn reset_close_deferral(&mut self) {
+        self.close_attempts = 0;
+        self.close_deferred_since = None;
     }
 
     /// Та же запись с другим сроком автозакрытия.
@@ -129,6 +160,16 @@ struct StoredEntry {
     /// Отсутствует в файлах до автозакрытия → срок по умолчанию, миграции нет.
     #[serde(default)]
     auto_close_sec: StoredAutoClose,
+    /// Ключи отложенного закрытия пишутся только пока оно идёт: здоровый файл
+    /// их не видит, старый — читает без миграции.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    close_attempts: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    close_deferred_since: Option<u64>,
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -245,6 +286,8 @@ impl Registry {
                         StoredState::Disconnected => VaultState::Disconnected,
                     },
                     auto_close: v.auto_close_sec.into(),
+                    close_attempts: v.close_attempts,
+                    close_deferred_since: v.close_deferred_since,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -365,6 +408,8 @@ impl Registry {
                         VaultState::Disconnected => StoredState::Disconnected,
                     },
                     auto_close_sec: e.auto_close.into(),
+                    close_attempts: e.close_attempts,
+                    close_deferred_since: e.close_deferred_since,
                 })
                 .collect(),
         };
@@ -604,6 +649,54 @@ mod tests {
                 until: Some(1_700_000_000),
             }
         );
+    }
+
+    /// Отложенное закрытие (спека С-8): счётчик попыток и момент первой
+    /// неудачи хранятся плоскими скалярами и отсутствуют, пока не нужны, —
+    /// старые и «здоровые» файлы их не видят.
+    #[tokio::test]
+    async fn close_deferral_roundtrips_and_is_absent_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        Registry::with_write_lock_at(&path, |r| {
+            let mut a = entry("a");
+            a.note_close_deferred(1_700_000_000);
+            a.note_close_deferred(1_700_000_060);
+            r.add(a)?;
+            r.add(entry("b"))
+        })
+        .await
+        .expect("write");
+        let text = tokio::fs::read_to_string(&path).await.expect("read");
+        assert_eq!(
+            text.matches("close_attempts = 2").count(),
+            1,
+            "attempts must be a scalar and appear once, got:\n{text}"
+        );
+        assert_eq!(
+            text.matches("close_deferred_since = 1700000000").count(),
+            1,
+            "first failure moment must stick, got:\n{text}"
+        );
+        assert_eq!(
+            (
+                text.matches("close_attempts").count(),
+                text.matches("close_deferred_since").count()
+            ),
+            (1, 1),
+            "a healthy entry must not carry deferral keys, got:\n{text}"
+        );
+        let reg = Registry::load_from(&path).await.expect("reload");
+        let a = &reg.entries()[0];
+        assert_eq!(a.close_attempts(), 2);
+        assert_eq!(a.close_deferred_since(), Some(1_700_000_000));
+        let b = &reg.entries()[1];
+        assert_eq!(b.close_attempts(), 0);
+        assert_eq!(b.close_deferred_since(), None);
+
+        let mut a = a.clone();
+        a.reset_close_deferral();
+        assert_eq!((a.close_attempts(), a.close_deferred_since()), (0, None));
     }
 
     #[tokio::test]
