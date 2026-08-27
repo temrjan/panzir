@@ -4,10 +4,16 @@
 //! методы [`Vault`], каждый проверяет исходное состояние.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
+
+/// Срок автозакрытия по умолчанию — 15 минут (решение Капитана 27.08:
+/// между «одно действие подряд» у sudo/polkit и «заметная часть часа»
+/// у ssh-ключей gpg-agent).
+pub const DEFAULT_AUTO_CLOSE: Duration = Duration::from_secs(15 * 60);
 
 /// Метка хранилища: валидированная пользовательская строка.
 ///
@@ -80,6 +86,9 @@ pub enum VaultState {
     Open {
         /// Фактическая точка монтирования (из объекта udisks2, не угаданная).
         mount_point: PathBuf,
+        /// Дедлайн автозакрытия — секунды Unix (спека С-3: истина для таймера —
+        /// systemd, для карточки — это поле). `None` — таймер не заведён.
+        until: Option<u64>,
     },
     /// Носитель извлечён при живом приложении (спека п.11): симлинк снят,
     /// запись помечена. Переоткрытие — через обычный `open`.
@@ -155,7 +164,10 @@ impl Vault {
     pub fn mark_open(&mut self, mount_point: PathBuf) -> Result<()> {
         match self.state {
             VaultState::Closed | VaultState::Disconnected => {
-                self.state = VaultState::Open { mount_point };
+                self.state = VaultState::Open {
+                    mount_point,
+                    until: None,
+                };
                 Ok(())
             }
             VaultState::Open { .. } => Err(Error::InvalidState {

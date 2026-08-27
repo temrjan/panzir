@@ -233,7 +233,7 @@ fn show_card(
     // Точка монтирования — фактическая, из ответа udisks2, сохранённая в
     // записи. Путь симлинка сюда не подставляется: симлинк — наша выдумка,
     // а человеку нужно место, где лежат его файлы.
-    if let VaultState::Open { mount_point } = entry.state() {
+    if let VaultState::Open { mount_point, .. } = entry.state() {
         ui.label(format!("Смонтировано: {}", mount_point.display()));
     }
 

@@ -759,6 +759,7 @@ async fn run_open(
                 label,
                 VaultState::Open {
                     mount_point: opened.mount_point,
+                    until: None,
                 },
             )
             .await
@@ -804,7 +805,10 @@ async fn run_create(
             r.add(VaultEntry::new(
                 label,
                 VaultKind::File(container),
-                VaultState::Open { mount_point },
+                VaultState::Open {
+                    mount_point,
+                    until: None,
+                },
             ))?;
             Ok(r.entries().to_vec())
         }
@@ -1661,6 +1665,7 @@ mod tests {
                 VaultKind::File(container.clone()),
                 VaultState::Open {
                     mount_point: mount.clone(),
+                    until: None,
                 },
             ))?;
             Ok(())
