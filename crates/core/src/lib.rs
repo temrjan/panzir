@@ -10,6 +10,7 @@ pub mod create;
 pub mod deps;
 pub mod error;
 pub mod header;
+pub mod holders;
 pub mod keyslot;
 pub mod lifecycle;
 pub mod mountpoint;

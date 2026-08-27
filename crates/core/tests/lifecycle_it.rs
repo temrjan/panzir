@@ -811,20 +811,12 @@ async fn build_close_worker() -> PathBuf {
 /// Часы, чей закрыватель — воркер с явными реестром и домом: продуктовый
 /// `panzir --close` берёт их из системы, а тест не имеет права трогать
 /// настоящий `~/.config/panzir/vaults.toml`.
-fn worker_clock(
-    worker: &Path,
-    registry: &Path,
-    home: &Path,
-    retry_secs: u64,
-    attempts: u8,
-) -> SystemdUser {
+fn worker_clock(worker: &Path, registry: &Path, home: &Path) -> SystemdUser {
     SystemdUser::new(
         vec![
             worker.as_os_str().to_owned(),
             registry.as_os_str().to_owned(),
             home.as_os_str().to_owned(),
-            retry_secs.to_string().into(),
-            attempts.to_string().into(),
         ],
         Duration::from_secs(5),
     )
@@ -952,7 +944,7 @@ async fn t25_timer_closes_the_vault_without_the_window() {
         .await
         .expect("close after create");
 
-    let clock = worker_clock(&worker, &registry, &home, 60, 3);
+    let clock = worker_clock(&worker, &registry, &home);
     let fx = AutoCloseFixture {
         registry: registry.clone(),
         container: container.clone(),
@@ -989,11 +981,12 @@ async fn t25_timer_closes_the_vault_without_the_window() {
     assert_eq!(entry.close_attempts(), 0, "no deferral on a clean close");
 }
 
-/// T-26 (критерий 3, спека С-8): занятый том таймер **не ломает** — отступает,
-/// пишет попытку в реестр и заводит часы заново; освободили — закрывает.
+/// T-26 (критерий 3, спека С-8, E-minimal): занятый том таймер **не ломает**
+/// и **не перезапускает себя** — отступает, пишет попытку в реестр и ждёт
+/// человека; после освобождения сам не закрывается.
 #[tokio::test]
 #[ignore = "requires live udisks2/polkit and systemd --user; run with --ignored"]
-async fn t26_busy_volume_is_deferred_then_closed() {
+async fn t26_busy_volume_is_deferred_not_rearmed() {
     require_it_flag();
     let _serial = UDISKS_LOCK.lock().await;
 
@@ -1017,8 +1010,7 @@ async fn t26_busy_volume_is_deferred_then_closed() {
         .await
         .expect("close after create");
 
-    // Повтор через 2 с, не через минуту: тесту не ждать час.
-    let clock = worker_clock(&worker, &registry, &home, 2, 3);
+    let clock = worker_clock(&worker, &registry, &home);
     let fx = AutoCloseFixture {
         registry: registry.clone(),
         container: container.clone(),
@@ -1047,33 +1039,35 @@ async fn t26_busy_volume_is_deferred_then_closed() {
         1,
         "busy volume must stay open — forcing it would lose data"
     );
+
+    // E-minimal: таймер не перезаводится, дедлайн снят.
     assert!(
-        wait_until(Duration::from_secs(5), || timer_listed("panzir-close-t26")).await,
-        "deferral must re-arm the timer"
+        !timer_listed("panzir-close-t26"),
+        "deferral must NOT re-arm the timer"
     );
     let entry = registry_entry(&registry, &label).await;
     assert!(
         matches!(
             entry.state(),
-            panzir_core::vault::VaultState::Open { until: Some(_), .. }
+            panzir_core::vault::VaultState::Open { until: None, .. }
         ),
-        "registry must stay open with a fresh deadline"
+        "deadline must be cleared while deferred"
     );
 
     drop(hold);
-    let closed = wait_until(Duration::from_secs(30), || {
-        count_loops_by_sysfs(&container) == 0
-    })
-    .await;
-    assert!(
-        closed,
-        "once released, the next attempt must close the vault"
+    // Даём время на случайный повторный запуск — в E-minimal его не должно быть.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        count_loops_by_sysfs(&container),
+        1,
+        "vault must stay open after release — no auto-retry in E-minimal"
     );
     let entry = registry_entry(&registry, &label).await;
-    assert_eq!(entry.state(), &panzir_core::vault::VaultState::Closed);
-    assert_eq!(
-        (entry.close_attempts(), entry.close_deferred_since()),
-        (0, None),
-        "a successful close ends the deferral series"
+    assert!(
+        matches!(
+            entry.state(),
+            panzir_core::vault::VaultState::Open { until: None, .. }
+        ),
+        "registry must stay open with no deadline"
     );
 }

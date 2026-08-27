@@ -224,6 +224,29 @@ pub fn error_text(err: &Error) -> String {
     }
 }
 
+/// Сообщение об отложенном автозакрытии: кто держит сейф открытым.
+///
+/// E-minimal: при «занято» автозакрытие ждёт человека, поэтому окно
+/// показывает держателей и просит закрыть программу вручную.
+#[must_use]
+pub fn busy_message(holders: &[String]) -> String {
+    match holders.len() {
+        0 => "Сейф не закрыт: его файлы заняты другой программой. \
+             Завершите программы, в которых открыт сейф, и нажмите «Закрыть»."
+            .to_owned(),
+        1 => format!(
+            "Сейф не закрыт: его использует «{}». \
+             Завершите программу и нажмите «Закрыть».",
+            holders[0]
+        ),
+        _ => format!(
+            "Сейф не закрыт: его используют {}. \
+             Завершите их и нажмите «Закрыть».",
+            holders.join(", ")
+        ),
+    }
+}
+
 /// Короткое имя состояния записи для списка.
 #[must_use]
 pub fn state_text(state: &VaultState) -> &'static str {
@@ -1979,6 +2002,33 @@ mod tests {
                 .is_none(),
             "плашка тревожит на исправной машине"
         );
+    }
+
+    #[test]
+    fn busy_message_names_holders_or_falls_back_gracefully() {
+        let unknown: Vec<String> = vec![];
+        let text = busy_message(&unknown);
+        assert!(
+            text.contains("другой программой"),
+            "fallback must be general: {text}"
+        );
+        assert!(text.contains("«Закрыть»"));
+
+        let one = vec!["vim".to_owned()];
+        let text = busy_message(&one);
+        assert!(
+            text.contains("«vim»"),
+            "single holder must be quoted: {text}"
+        );
+        assert!(text.contains("Завершите программу"));
+
+        let many = vec!["vim".to_owned(), "bash".to_owned()];
+        let text = busy_message(&many);
+        assert!(
+            text.contains("vim, bash"),
+            "multiple holders must be listed: {text}"
+        );
+        assert!(text.contains("Завершите их"));
     }
 
     #[test]

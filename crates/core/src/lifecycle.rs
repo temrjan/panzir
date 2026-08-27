@@ -442,25 +442,6 @@ fn mount_has_noexec(mount_point: &Path) -> bool {
     })
 }
 
-/// Сколько раз и как часто автозакрытие пробует занятый том (спека С-8):
-/// `attempts` попыток через `interval`, затем часы заводятся на полный срок.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetryPolicy {
-    /// Пауза между попытками.
-    pub interval: Duration,
-    /// Сколько попыток подряд, прежде чем вернуться к полному сроку.
-    pub attempts: u8,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            interval: Duration::from_secs(60),
-            attempts: 3,
-        }
-    }
-}
-
 /// Чем кончилось закрытие по записи реестра.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseOutcome {
@@ -469,13 +450,10 @@ pub enum CloseOutcome {
     /// Том уже был закрыт (штатной утилитой, прошлым срабатыванием);
     /// запись приведена к правде, часы сняты.
     AlreadyClosed,
-    /// Том занят: не ломаем (спека Т-3), часы заведены заново.
+    /// Том занят: не ломаем (спека Т-3), откладываем до ручного закрытия.
     Deferred {
-        /// Номер попытки в текущей серии; `attempts` политики — серия
-        /// исчерпана, следующий срок полный.
+        /// Номер попытки в текущей серии.
         attempt: u8,
-        /// Через сколько часы сработают снова.
-        retry_in: Duration,
     },
 }
 
@@ -493,9 +471,8 @@ pub struct CloseReport {
 /// реестре. Единственный путь и для окна, и для закрывателя таймера — два
 /// куска, решающих один вопрос, не имеют права разойтись.
 ///
-/// Занятый том (спека С-8) не ломается: попытка записывается в реестр, часы
-/// заводятся на `policy.interval`; после `policy.attempts` неудач — на полный
-/// срок записи, счётчик с нуля, момент первой неудачи остаётся.
+/// Занятый том (спека С-8, E-minimal) не ломается: попытка записывается в
+/// реестр, дедлайн снимается, таймер не перезаводится — ждём человека.
 ///
 /// # Errors
 /// - [`Error::VaultNotFound`] — записи нет;
@@ -508,7 +485,6 @@ pub async fn close_registered(
     home: &Path,
     scheduler: &impl Scheduler,
     label: &Label,
-    policy: RetryPolicy,
 ) -> Result<CloseReport> {
     let registry = Registry::load_from(registry_path).await?;
     let entry = registry
@@ -524,7 +500,6 @@ pub async fn close_registered(
             )));
         }
     };
-    let auto_close = entry.auto_close();
     drop(registry);
 
     match close_decision(probe_file_vault(ud, &container).await?) {
@@ -552,7 +527,7 @@ pub async fn close_registered(
                 }
                 Err(e) if Udisks::is_retryable_unmount(&e) => {
                     tracing::warn!("close_registered: {label} is busy, deferring: {e}");
-                    defer(registry_path, scheduler, label, auto_close, policy).await
+                    defer(registry_path, label).await
                 }
                 Err(e) => Err(e),
             }
@@ -574,7 +549,6 @@ pub async fn close_expired(
     home: &Path,
     scheduler: &impl Scheduler,
     now: u64,
-    policy: RetryPolicy,
 ) -> Result<Vec<(Label, Result<CloseOutcome>)>> {
     let registry = Registry::load_from(registry_path).await?;
     let due: Vec<Label> = registry
@@ -587,7 +561,7 @@ pub async fn close_expired(
 
     let mut outcomes = Vec::with_capacity(due.len());
     for label in due {
-        let outcome = close_registered(ud, registry_path, home, scheduler, &label, policy)
+        let outcome = close_registered(ud, registry_path, home, scheduler, &label)
             .await
             .map(|report| report.outcome);
         outcomes.push((label, outcome));
@@ -611,17 +585,11 @@ async fn settle_closed(registry_path: &Path, label: &Label) -> Result<Vec<VaultE
     .await
 }
 
-/// Том занят: попытка в реестр, часы заново (спека С-8). Реестр правится
-/// ДО завода часов — карточке есть что показать, даже если systemd откажет.
-async fn defer(
-    registry_path: &Path,
-    scheduler: &impl Scheduler,
-    label: &Label,
-    auto_close: Option<Duration>,
-    policy: RetryPolicy,
-) -> Result<CloseReport> {
+/// Том занят: попытка в реестр, дедлайн снимаем, таймер не перезаводим
+/// (спека С-8, E-minimal: ждём человека).
+async fn defer(registry_path: &Path, label: &Label) -> Result<CloseReport> {
     let now = now_secs();
-    let (attempt, retry_in, entries) = Registry::with_write_lock_at(registry_path, {
+    let (attempt, entries) = Registry::with_write_lock_at(registry_path, {
         let label = label.clone();
         move |r| {
             let entry = r
@@ -631,22 +599,15 @@ async fn defer(
                 .ok_or_else(|| Error::VaultNotFound(label.as_str().to_owned()))?;
             entry.note_close_deferred(now);
             let attempt = entry.close_attempts();
-            let retry_in = if attempt < policy.attempts {
-                policy.interval
-            } else {
-                entry.restart_close_attempts();
-                // «Не закрывать» с заведёнными часами не бывает; если реестр
-                // правили руками — ждём хотя бы интервал, а не вечность.
-                auto_close.unwrap_or(policy.interval)
-            };
-            entry.set_until(Some(now.saturating_add(retry_in.as_secs())))?;
-            Ok((attempt, retry_in, r.entries().to_vec()))
+            // E-minimal: автоповтора нет — дедлайн убираем, чтобы страховка
+            // при старте окна не пыталась закрыть без человека.
+            entry.set_until(None)?;
+            Ok((attempt, r.entries().to_vec()))
         }
     })
     .await?;
-    scheduler.arm(label, retry_in).await?;
     Ok(CloseReport {
-        outcome: CloseOutcome::Deferred { attempt, retry_in },
+        outcome: CloseOutcome::Deferred { attempt },
         entries,
     })
 }

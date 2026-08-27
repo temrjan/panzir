@@ -8,7 +8,7 @@ use panzir_core::registry::VaultEntry;
 use panzir_core::vault::{Label, VaultKind, VaultState};
 use secrecy::zeroize::Zeroize as _;
 
-use crate::app::{EnvLine, kind_text, state_text};
+use crate::app::{EnvLine, busy_message, kind_text, state_text};
 
 /// Начатое переименование: какую запись меняем и что уже набрано.
 pub struct RenameDraft {
@@ -235,6 +235,12 @@ fn show_card(
     // а человеку нужно место, где лежат его файлы.
     if let VaultState::Open { mount_point, .. } = entry.state() {
         ui.label(format!("Смонтировано: {}", mount_point.display()));
+
+        // E-minimal: автозакрытие отложено из-за «занято» — показываем держателей.
+        if entry.close_attempts() > 0 {
+            let holders = panzir_core::holders::find_holders(mount_point);
+            ui.colored_label(ui.visuals().error_fg_color, busy_message(&holders));
+        }
     }
 
     let label = entry.label().clone();
