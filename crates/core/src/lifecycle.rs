@@ -11,9 +11,11 @@
 //! вызывающий.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use secrecy::SecretString;
 
+use crate::schedule::Scheduler;
 use crate::udisks::{ObjPath, Udisks};
 use crate::vault::Label;
 use crate::{Error, Result};
@@ -35,6 +37,9 @@ pub struct OpenedVault {
     /// пользователем (например, штатной утилитой дисков), отдаёт тот же uid.
     /// Здесь фиксируется именно происхождение — восстановить его позже нечем.
     pub loop_was_reused: bool,
+    /// Дедлайн автозакрытия (секунды Unix), если часы заведены; `None` —
+    /// срок «не закрывать». Записывается в реестр вызывающим.
+    pub until: Option<u64>,
 }
 
 /// Фактическое состояние контейнера — что о нём знает система прямо сейчас.
@@ -259,6 +264,8 @@ pub async fn open_file_vault(
     label: &Label,
     passphrase: &SecretString,
     home: &Path,
+    scheduler: &impl Scheduler,
+    auto_close: Option<Duration>,
 ) -> Result<OpenedVault> {
     // Стартовая точка: что система уже сделала — и что предстоит сделать нам.
     let (mut guard, cleartext, mount_point) = match probe_file_vault(ud, container).await? {
@@ -320,12 +327,33 @@ pub async fn open_file_vault(
     .await
     {
         Ok((cleartext_object, mount_point)) => {
+            // Часы — ПОСЛЕ успешного открытия (спека С-2): на том, которого нет,
+            // таймер бессмыслен. Отказ часов — отказ открытия: хранилище без
+            // часов молча нарушало бы обещание «само закроется», а закрыть
+            // только что открытое — честнее, чем оставить его так (инвариант 10).
+            let until = match auto_close {
+                Some(after) => match scheduler.arm(label, after).await {
+                    Ok(()) => Some(deadline_after(after)),
+                    Err(e) => {
+                        if let Err(link) = crate::mountpoint::remove_symlink(home, label).await {
+                            tracing::warn!(
+                                "open_file_vault: remove_symlink after arm failure: {link}"
+                            );
+                        }
+                        guard.cleanup().await;
+                        guard.disarm();
+                        return Err(e);
+                    }
+                },
+                None => None,
+            };
             guard.disarm();
             Ok(OpenedVault {
                 loop_object,
                 cleartext_object,
                 mount_point,
                 loop_was_reused,
+                until,
             })
         }
         Err(source) => {
@@ -412,6 +440,44 @@ fn mount_has_noexec(mount_point: &Path) -> bool {
     })
 }
 
+/// Дедлайн `after` от текущего момента, в секундах Unix. Часы до эпохи —
+/// не наш случай; тогда дедлайн отсчитывается от нуля и заведомо просрочен,
+/// что для страховки при старте безопаснее, чем паника.
+fn deadline_after(after: Duration) -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .saturating_add(after.as_secs())
+}
+
+/// Что делать с томом по результату пробы.
+///
+/// Чистая функция ядра, а не окна (долг A-11 закрыт вторым вызывающим —
+/// одноразовым закрывателем таймера): разбор пяти вариантов пробы обязан
+/// быть в одном месте, иначе окно и таймер разошлись бы в ответе на один
+/// и тот же вопрос.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CloseDecision {
+    /// Файл не подключён: закрывать нечего, привести запись к правде.
+    AlreadyDetached,
+    /// Есть объект loop-устройства — закрываем.
+    Close(ObjPath),
+    /// Подключён чужим uid: не трогаем (инвариант 3).
+    Foreign(u32),
+}
+
+/// `match` без ветки `_`: новый вариант пробы обязан сломать сборку здесь.
+#[must_use]
+pub fn close_decision(probe: VaultProbe) -> CloseDecision {
+    match probe {
+        VaultProbe::Detached => CloseDecision::AlreadyDetached,
+        VaultProbe::AttachedLocked { loop_object }
+        | VaultProbe::AttachedUnlocked { loop_object, .. }
+        | VaultProbe::AttachedOpen { loop_object, .. } => CloseDecision::Close(loop_object),
+        VaultProbe::Foreign { uid, .. } => CloseDecision::Foreign(uid),
+    }
+}
+
 /// Закрыть хранилище, ОСТАВИВ файл контейнера на месте.
 ///
 /// Отличие от [`crate::create::teardown_file_container`] ровно одно: та удаляет
@@ -433,7 +499,12 @@ pub async fn close_file_vault(
     label: &Label,
     home: &Path,
     detach_loop: bool,
+    scheduler: &impl Scheduler,
 ) -> Result<()> {
+    // Часы — ДО закрытия (спека С-2): снят только таймер, и если закрытие по
+    // нему уже бежит, `disarm` дожидается его. После этого запуск невозможен,
+    // и наше закрытие ни с кем не гонится.
+    scheduler.disarm(label).await?;
     let close_result = ud.close_encrypted(loop_object).await;
 
     let detach_result = if detach_loop {
@@ -467,5 +538,26 @@ pub async fn close_file_vault(
         }
         // Не закрылось и не отвязалось: исходная причина информативнее.
         (Err(source), Err(_)) => Err(source),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// # Почему проверен только один вариант из пяти
+    /// Остальные четыре несут `ObjPath`, а у него нет публичного
+    /// конструктора (`udisks.rs`: `from_owned` приватен, `block_device` —
+    /// `pub(crate)`). Что закрывает дыру вместо теста: `match` без ветки `_`
+    /// (новый вариант ломает сборку) и живые IT, где ветка `Foreign`
+    /// проверяется на настоящем томе (`t19`). Переехал из окна вместе с
+    /// функцией (долг A-11).
+    #[test]
+    fn detached_volume_is_not_closed_again() {
+        assert_eq!(
+            close_decision(VaultProbe::Detached),
+            CloseDecision::AlreadyDetached,
+            "отсоединённый том нечем закрывать: объекта loop-устройства не существует"
+        );
     }
 }

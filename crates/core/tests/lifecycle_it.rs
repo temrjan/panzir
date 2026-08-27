@@ -18,9 +18,11 @@ use std::process::Command;
 use panzir_core::Error;
 use panzir_core::create::{create_file_container, teardown_file_container};
 use panzir_core::lifecycle::{VaultProbe, close_file_vault, open_file_vault, probe_file_vault};
+use panzir_core::schedule::{NoScheduler, SystemdUser};
 use panzir_core::udisks::Udisks;
 use panzir_core::vault::Label;
 use secrecy::SecretString;
+use std::time::Duration;
 
 /// Живой udisks2 не обязан переживать два конкурентных вызова (22.08: два
 /// параллельных теста уронили демон в SEGV — см. `create_it.rs`). Тесты ходят
@@ -170,7 +172,7 @@ async fn t14_open_close_open_keeps_container_file() {
     assert_counter_can_see(&container, 1);
 
     // Закрываем продуктовым путём — файл обязан остаться.
-    close_file_vault(&ud, &created.loop_object, &label, &home, true)
+    close_file_vault(&ud, &created.loop_object, &label, &home, true, &NoScheduler)
         .await
         .expect("close must succeed");
     assert!(
@@ -187,7 +189,7 @@ async fn t14_open_close_open_keeps_container_file() {
     // ревью раунда 1). Настоящая проверка — после второго закрытия, ниже.
 
     // Открываем заново.
-    let opened = open_file_vault(&ud, &container, &label, &pass, &home)
+    let opened = open_file_vault(&ud, &container, &label, &pass, &home, &NoScheduler, None)
         .await
         .expect("reopen must succeed");
     assert!(
@@ -209,6 +211,7 @@ async fn t14_open_close_open_keeps_container_file() {
         &label,
         &home,
         !opened.loop_was_reused,
+        &NoScheduler,
     )
     .await
     .expect("second close");
@@ -249,7 +252,7 @@ async fn t15_second_open_does_not_raise_second_loop() {
         "exactly one loop so far"
     );
 
-    let opened = open_file_vault(&ud, &container, &label, &pass, &home)
+    let opened = open_file_vault(&ud, &container, &label, &pass, &home, &NoScheduler, None)
         .await
         .expect("open on an already-open vault must be idempotent");
     assert!(
@@ -272,6 +275,7 @@ async fn t15_second_open_does_not_raise_second_loop() {
         &label,
         &home,
         !opened.loop_was_reused,
+        &NoScheduler,
     )
     .await
     .expect("close");
@@ -308,7 +312,7 @@ async fn t16_probe_classifies_live_states() {
     }
 
     // 2. После закрытия → Detached.
-    close_file_vault(&ud, &created.loop_object, &label, &home, true)
+    close_file_vault(&ud, &created.loop_object, &label, &home, true, &NoScheduler)
         .await
         .expect("close");
     assert!(
@@ -375,13 +379,13 @@ async fn t17_wrong_passphrase_leaves_no_stale_loop() {
         .await
         .expect("container created");
     assert_counter_can_see(&container, 1); // положительный контроль (М-14)
-    close_file_vault(&ud, &created.loop_object, &label, &home, true)
+    close_file_vault(&ud, &created.loop_object, &label, &home, true, &NoScheduler)
         .await
         .expect("close before the wrong-passphrase attempt");
     assert_eq!(count_loops_by_sysfs(&container), 0, "clean start");
 
     let wrong = SecretString::from("t17-WRONG-passphrase");
-    let err = open_file_vault(&ud, &container, &label, &wrong, &home)
+    let err = open_file_vault(&ud, &container, &label, &wrong, &home, &NoScheduler, None)
         .await
         .expect_err("wrong passphrase must fail");
     eprintln!("T-17: open with wrong passphrase failed as expected: {err}");
@@ -421,7 +425,7 @@ async fn t19_two_loops_on_one_container_are_reported() {
     let created = create_file_container(&ud, &container, 64 * 1024 * 1024, &label, &pass)
         .await
         .expect("container created");
-    close_file_vault(&ud, &created.loop_object, &label, &home, true)
+    close_file_vault(&ud, &created.loop_object, &label, &home, true, &NoScheduler)
         .await
         .expect("close");
 
@@ -489,7 +493,7 @@ async fn t20_failure_after_unlock_leaves_nothing_behind() {
         .await
         .expect("container created");
     assert_counter_can_see(&container, 1);
-    close_file_vault(&ud, &created.loop_object, &label, &home, true)
+    close_file_vault(&ud, &created.loop_object, &label, &home, true, &NoScheduler)
         .await
         .expect("close before the test");
     assert_eq!(count_loops_by_sysfs(&container), 0, "clean start");
@@ -497,7 +501,7 @@ async fn t20_failure_after_unlock_leaves_nothing_behind() {
     // Препятствие: на месте будущего симлинка — обычный файл, не наш.
     std::fs::write(home.join("panzir-t20"), b"not a symlink").expect("obstacle");
 
-    let err = open_file_vault(&ud, &container, &label, &pass, &home)
+    let err = open_file_vault(&ud, &container, &label, &pass, &home, &NoScheduler, None)
         .await
         .expect_err("open must fail on an occupied symlink path");
     eprintln!("T-20: open failed as expected: {err}");
@@ -571,7 +575,7 @@ async fn t21_locked_volume_with_cleared_owner_is_still_ours() {
     }
 
     // И оно обязано открываться.
-    let opened = open_file_vault(&ud, &container, &label, &pass, &home)
+    let opened = open_file_vault(&ud, &container, &label, &pass, &home, &NoScheduler, None)
         .await
         .expect("a vault locked by another tool must still open");
     assert!(opened.loop_was_reused, "loop existed before us");
@@ -582,6 +586,7 @@ async fn t21_locked_volume_with_cleared_owner_is_still_ours() {
         &label,
         &home,
         !opened.loop_was_reused,
+        &NoScheduler,
     )
     .await
     .expect("close");
@@ -656,7 +661,7 @@ async fn t23_wrong_passphrase_rejected_on_already_unlocked_volume() {
 
     // Неверная фраза обязана быть отвергнута, хотя отпирать уже нечего.
     let wrong = SecretString::from("t23-WRONG-passphrase");
-    let err = open_file_vault(&ud, &container, &label, &wrong, &home)
+    let err = open_file_vault(&ud, &container, &label, &wrong, &home, &NoScheduler, None)
         .await
         .expect_err("wrong passphrase must be rejected even on an unlocked volume");
     eprintln!("T-23: rejected as expected: {err}");
@@ -666,7 +671,7 @@ async fn t23_wrong_passphrase_rejected_on_already_unlocked_volume() {
     );
 
     // А верная — открывает, и это та же ветка AttachedUnlocked.
-    let opened = open_file_vault(&ud, &container, &label, &pass, &home)
+    let opened = open_file_vault(&ud, &container, &label, &pass, &home, &NoScheduler, None)
         .await
         .expect("correct passphrase must open an already-unlocked volume");
     assert!(opened.loop_was_reused, "loop existed before this call");
@@ -679,4 +684,100 @@ async fn t23_wrong_passphrase_rejected_on_already_unlocked_volume() {
         .await
         .expect("teardown");
     std::fs::remove_file(home.join("panzir-t23")).ok();
+}
+
+/// Есть ли юнит среди таймеров пользователя — по `systemctl`, не по нашему
+/// же модулю: проверять `schedule` его собственным вызовом было бы тавтологией.
+fn timer_listed(unit: &str) -> bool {
+    let out = Command::new("systemctl")
+        .args(["--user", "list-timers", "--all", "--no-pager", "--plain"])
+        .output()
+        .expect("systemctl runs");
+    String::from_utf8_lossy(&out.stdout).contains(unit)
+}
+
+/// Уборка таймера, срабатывающая и при упавшем `assert`: иначе следующий
+/// прогон той же метки упрётся в «unit already loaded».
+struct TimerCleanup(String);
+
+impl Drop for TimerCleanup {
+    fn drop(&mut self) {
+        let timer = format!("{}.timer", self.0);
+        let service = format!("{}.service", self.0);
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &timer, &service])
+            .output();
+        let _ = Command::new("systemctl")
+            .args(["--user", "reset-failed", &service])
+            .output();
+    }
+}
+
+/// T-24 (автозакрытие, критерий 1): открытие заводит часы в `systemd --user`,
+/// ручное закрытие их снимает. Закрыватель здесь — `/bin/true`: тест про
+/// завод и снятие, не про срабатывание (оно — T-25).
+#[tokio::test]
+#[ignore = "requires live udisks2/polkit and systemd --user; run with --ignored"]
+async fn t24_open_arms_timer_and_close_disarms() {
+    require_it_flag();
+    let _serial = UDISKS_LOCK.lock().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = fake_home(dir.path());
+    let container = dir.path().join("panzir-t24.vault");
+    let _cleanup = TestCleanup {
+        container: container.clone(),
+    };
+    let _timer_cleanup = TimerCleanup("panzir-close-t24".to_owned());
+    let label = Label::new("t24").expect("label");
+    let pass = SecretString::from("t24-passphrase");
+
+    let ud = Udisks::connect().await.expect("udisks2 on the bus");
+    let created = create_file_container(&ud, &container, 64 * 1024 * 1024, &label, &pass)
+        .await
+        .expect("container created");
+    // Свежесозданный том закрываем без часов: их ещё никто не заводил.
+    close_file_vault(&ud, &created.loop_object, &label, &home, true, &NoScheduler)
+        .await
+        .expect("close after create");
+    assert!(
+        !timer_listed("panzir-close-t24"),
+        "positive control: no timer before the test opens the vault"
+    );
+
+    let clock = SystemdUser::new(PathBuf::from("/bin/true"), Duration::from_secs(5));
+    let opened = open_file_vault(
+        &ud,
+        &container,
+        &label,
+        &pass,
+        &home,
+        &clock,
+        Some(Duration::from_secs(600)),
+    )
+    .await
+    .expect("open with a clock");
+    assert!(
+        timer_listed("panzir-close-t24"),
+        "open must arm the timer in systemd --user"
+    );
+    assert!(
+        opened.until.is_some(),
+        "an armed open must report its deadline for the registry"
+    );
+
+    close_file_vault(
+        &ud,
+        &opened.loop_object,
+        &label,
+        &home,
+        !opened.loop_was_reused,
+        &clock,
+    )
+    .await
+    .expect("manual close");
+    assert!(
+        !timer_listed("panzir-close-t24"),
+        "manual close must disarm the timer"
+    );
 }
