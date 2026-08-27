@@ -46,6 +46,15 @@ fn main() -> ExitCode {
     // Единственное чтение окружения в приложении: разбор — в чистой функции,
     // иначе его нечем проверить (подменить переменную в тесте не даёт
     // `unsafe_code = "forbid"`).
+    // Бинарь, который таймер автозакрытия запустит в режиме `--close`:
+    // единственное место, где окно спрашивает систему, как его зовут.
+    let closer = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("не удалось определить путь к panzir: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let raw_frames = std::env::var("PANZIR_SMOKE_FRAMES").ok();
     let smoke_frames = app::smoke_frames_from(raw_frames.as_deref());
 
@@ -64,6 +73,7 @@ fn main() -> ExitCode {
                 cc,
                 registry_path,
                 home,
+                closer,
                 smoke_frames,
                 OP_TIMEOUT,
             )))

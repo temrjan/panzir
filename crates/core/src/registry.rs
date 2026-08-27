@@ -7,6 +7,7 @@
 
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rustix::fs::{FlockOperation, flock};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt as _;
 use tokio::task;
 
-use crate::vault::{Label, VaultKind, VaultState};
+use crate::vault::{DEFAULT_AUTO_CLOSE, Label, VaultKind, VaultState};
 use crate::{Error, Result};
 
 /// Запись в реестре. Поля приватные — состояние меняется только методами.
@@ -23,12 +24,92 @@ pub struct VaultEntry {
     label: Label,
     kind: VaultKind,
     state: VaultState,
+    /// Срок автозакрытия; `None` — не закрывать (спека С-7: «никогда» —
+    /// отдельное значение, не сентинел в числе).
+    auto_close: Option<Duration>,
+    /// Сколько раз подряд автозакрытие отступило перед занятым томом
+    /// (спека С-8). Ноль — отложенного закрытия нет.
+    close_attempts: u8,
+    /// Момент первой неудачи текущей серии, секунды Unix — карточке есть что
+    /// показать («не закрывается с …»).
+    close_deferred_since: Option<u64>,
 }
 
 impl VaultEntry {
-    /// Создать новую запись.
+    /// Создать новую запись со сроком автозакрытия по умолчанию.
     pub fn new(label: Label, kind: VaultKind, state: VaultState) -> Self {
-        Self { label, kind, state }
+        Self {
+            label,
+            kind,
+            state,
+            auto_close: Some(DEFAULT_AUTO_CLOSE),
+            close_attempts: 0,
+            close_deferred_since: None,
+        }
+    }
+
+    /// Сколько раз подряд автозакрытие отступило перед занятым томом.
+    pub fn close_attempts(&self) -> u8 {
+        self.close_attempts
+    }
+
+    /// Момент первой неудачи текущей серии отложенных закрытий.
+    pub fn close_deferred_since(&self) -> Option<u64> {
+        self.close_deferred_since
+    }
+
+    /// Автозакрытие отступило ещё раз: счётчик растёт, момент первой неудачи
+    /// не сдвигается.
+    pub fn note_close_deferred(&mut self, now: u64) {
+        self.close_attempts = self.close_attempts.saturating_add(1);
+        self.close_deferred_since.get_or_insert(now);
+    }
+
+    /// Серия кончилась — закрылось: и счётчик, и момент первой неудачи снимаются.
+    pub fn reset_close_deferral(&mut self) {
+        self.close_attempts = 0;
+        self.close_deferred_since = None;
+    }
+
+    /// Попытки исчерпаны, часы заведены на полный срок: счётчик с нуля, а
+    /// момент первой неудачи остаётся — карточке нужно «не закрывается с …».
+    pub fn restart_close_attempts(&mut self) {
+        self.close_attempts = 0;
+    }
+
+    /// Переставить дедлайн автозакрытия у открытого тома (перезавод часов).
+    ///
+    /// # Errors
+    /// [`Error::InvalidState`], если том не открыт: дедлайн есть только у
+    /// открытого.
+    pub fn set_until(&mut self, until: Option<u64>) -> Result<()> {
+        match &mut self.state {
+            VaultState::Open { until: slot, .. } => {
+                *slot = until;
+                Ok(())
+            }
+            other => Err(Error::InvalidState {
+                from: state_name(other),
+                to: "open (deadline change)",
+            }),
+        }
+    }
+
+    /// Та же запись с другим сроком автозакрытия.
+    #[must_use]
+    pub fn with_auto_close(mut self, auto_close: Option<Duration>) -> Self {
+        self.auto_close = auto_close;
+        self
+    }
+
+    /// Срок автозакрытия; `None` — не закрывать.
+    pub fn auto_close(&self) -> Option<Duration> {
+        self.auto_close
+    }
+
+    /// Сменить срок автозакрытия (внутри [`Registry::with_write_lock`]).
+    pub fn set_auto_close(&mut self, auto_close: Option<Duration>) {
+        self.auto_close = auto_close;
     }
 
     /// Метка хранилища.
@@ -100,6 +181,19 @@ struct StoredEntry {
     #[serde(flatten)]
     kind: StoredKind,
     state: StoredState,
+    /// Отсутствует в файлах до автозакрытия → срок по умолчанию, миграции нет.
+    #[serde(default)]
+    auto_close_sec: StoredAutoClose,
+    /// Ключи отложенного закрытия пишутся только пока оно идёт: здоровый файл
+    /// их не видит, старый — читает без миграции.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    close_attempts: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    close_deferred_since: Option<u64>,
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,8 +207,53 @@ enum StoredKind {
 #[serde(rename_all = "snake_case")]
 enum StoredState {
     Closed,
-    Open { mount_point: PathBuf },
+    Open {
+        mount_point: PathBuf,
+        /// `None` в TOML не выразим — поле просто отсутствует.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<u64>,
+    },
     Disconnected,
+}
+
+/// Срок на диске: число секунд или слово `"never"`. Секунды, а не минуты —
+/// живой IT заводит таймер на единицы секунд. Слово вместо нуля — чтобы
+/// «не закрывать» читалось глазами и не путалось с опечаткой.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredAutoClose {
+    Seconds(u64),
+    Never(NeverWord),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum NeverWord {
+    Never,
+}
+
+impl Default for StoredAutoClose {
+    fn default() -> Self {
+        Self::Seconds(DEFAULT_AUTO_CLOSE.as_secs())
+    }
+}
+
+impl From<Option<Duration>> for StoredAutoClose {
+    fn from(auto_close: Option<Duration>) -> Self {
+        match auto_close {
+            Some(d) => Self::Seconds(d.as_secs()),
+            None => Self::Never(NeverWord::Never),
+        }
+    }
+}
+
+impl From<StoredAutoClose> for Option<Duration> {
+    fn from(stored: StoredAutoClose) -> Self {
+        match stored {
+            StoredAutoClose::Seconds(s) => Some(Duration::from_secs(s)),
+            StoredAutoClose::Never(NeverWord::Never) => None,
+        }
+    }
 }
 
 impl Registry {
@@ -165,9 +304,14 @@ impl Registry {
                     },
                     state: match v.state {
                         StoredState::Closed => VaultState::Closed,
-                        StoredState::Open { mount_point } => VaultState::Open { mount_point },
+                        StoredState::Open { mount_point, until } => {
+                            VaultState::Open { mount_point, until }
+                        }
                         StoredState::Disconnected => VaultState::Disconnected,
                     },
+                    auto_close: v.auto_close_sec.into(),
+                    close_attempts: v.close_attempts,
+                    close_deferred_since: v.close_deferred_since,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -281,11 +425,15 @@ impl Registry {
                     },
                     state: match &e.state {
                         VaultState::Closed => StoredState::Closed,
-                        VaultState::Open { mount_point } => StoredState::Open {
+                        VaultState::Open { mount_point, until } => StoredState::Open {
                             mount_point: mount_point.clone(),
+                            until: *until,
                         },
                         VaultState::Disconnected => StoredState::Disconnected,
                     },
+                    auto_close_sec: e.auto_close.into(),
+                    close_attempts: e.close_attempts,
+                    close_deferred_since: e.close_deferred_since,
                 })
                 .collect(),
         };
@@ -415,6 +563,7 @@ mod tests {
         let mut e = entry("x");
         e.set_state(VaultState::Open {
             mount_point: PathBuf::from("/run/m"),
+            until: None,
         })
         .expect("closed -> open");
         e.set_state(VaultState::Closed).expect("open -> closed");
@@ -423,6 +572,7 @@ mod tests {
         // Переоткрытие после извлечения — штатный путь (спека п.11).
         e.set_state(VaultState::Open {
             mount_point: PathBuf::from("/run/m"),
+            until: None,
         })
         .expect("disconnected -> open");
         e.set_state(VaultState::Closed)
@@ -435,6 +585,180 @@ mod tests {
         assert!(e.set_state(VaultState::Disconnected).is_ok());
         // Disconnected -> Disconnected запрещён.
         assert!(e.set_state(VaultState::Disconnected).is_err());
+    }
+
+    /// Старый `vaults.toml` (до автозакрытия) читается без миграции: срок —
+    /// 15 минут по умолчанию, дедлайна у открытого тома нет.
+    #[tokio::test]
+    async fn load_registry_without_auto_close_fields_uses_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        tokio::fs::write(
+            &path,
+            "[[vaults]]\nlabel = \"work\"\nkind = \"file\"\npath = \"/tmp/work.vault\"\n\
+             [vaults.state]\nopen = { mount_point = \"/run/m\" }\n",
+        )
+        .await
+        .expect("write old-format registry");
+        let reg = Registry::load_from(&path)
+            .await
+            .expect("old file must parse");
+        let e = &reg.entries()[0];
+        assert_eq!(e.auto_close(), Some(DEFAULT_AUTO_CLOSE));
+        assert_eq!(
+            e.state(),
+            &VaultState::Open {
+                mount_point: PathBuf::from("/run/m"),
+                until: None,
+            }
+        );
+    }
+
+    /// Срок хранится в секундах (живой IT открывает том на 5 с — минуты
+    /// его не выразят); «не закрывать» — явное слово, а не сентинел
+    /// (находка 3 ревью спеки): `None` в модели ↔ `"never"` в файле.
+    #[tokio::test]
+    async fn auto_close_roundtrips_seconds_and_never() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        Registry::with_write_lock_at(&path, |r| {
+            r.add(entry("a").with_auto_close(Some(Duration::from_secs(30 * 60))))?;
+            r.add(entry("b").with_auto_close(None))
+        })
+        .await
+        .expect("write");
+        let text = tokio::fs::read_to_string(&path).await.expect("read");
+        assert!(
+            text.contains("auto_close_sec = 1800"),
+            "seconds must be a plain scalar, got:\n{text}"
+        );
+        assert!(
+            text.contains("auto_close_sec = \"never\""),
+            "never must be spelled out, got:\n{text}"
+        );
+        let reg = Registry::load_from(&path).await.expect("reload");
+        assert_eq!(
+            reg.entries()[0].auto_close(),
+            Some(Duration::from_secs(30 * 60))
+        );
+        assert_eq!(reg.entries()[1].auto_close(), None);
+    }
+
+    /// Дедлайн — секунды Unix, плоский скаляр, не вложенная таблица
+    /// (находка 5 ревью спеки: `SystemTime` под derive даёт таблицу).
+    #[tokio::test]
+    async fn until_roundtrips_as_unix_seconds_scalar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        Registry::with_write_lock_at(&path, |r| {
+            let mut e = entry("x");
+            e.set_state(VaultState::Open {
+                mount_point: PathBuf::from("/run/m"),
+                until: Some(1_700_000_000),
+            })?;
+            r.add(e)
+        })
+        .await
+        .expect("write");
+        let text = tokio::fs::read_to_string(&path).await.expect("read");
+        assert!(
+            text.contains("until = 1700000000"),
+            "until must be a scalar, got:\n{text}"
+        );
+        let reg = Registry::load_from(&path).await.expect("reload");
+        assert_eq!(
+            reg.entries()[0].state(),
+            &VaultState::Open {
+                mount_point: PathBuf::from("/run/m"),
+                until: Some(1_700_000_000),
+            }
+        );
+    }
+
+    /// Отложенное закрытие (спека С-8): счётчик попыток и момент первой
+    /// неудачи хранятся плоскими скалярами и отсутствуют, пока не нужны, —
+    /// старые и «здоровые» файлы их не видят.
+    #[tokio::test]
+    async fn close_deferral_roundtrips_and_is_absent_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        Registry::with_write_lock_at(&path, |r| {
+            let mut a = entry("a");
+            a.note_close_deferred(1_700_000_000);
+            a.note_close_deferred(1_700_000_060);
+            r.add(a)?;
+            r.add(entry("b"))
+        })
+        .await
+        .expect("write");
+        let text = tokio::fs::read_to_string(&path).await.expect("read");
+        assert_eq!(
+            text.matches("close_attempts = 2").count(),
+            1,
+            "attempts must be a scalar and appear once, got:\n{text}"
+        );
+        assert_eq!(
+            text.matches("close_deferred_since = 1700000000").count(),
+            1,
+            "first failure moment must stick, got:\n{text}"
+        );
+        assert_eq!(
+            (
+                text.matches("close_attempts").count(),
+                text.matches("close_deferred_since").count()
+            ),
+            (1, 1),
+            "a healthy entry must not carry deferral keys, got:\n{text}"
+        );
+        let reg = Registry::load_from(&path).await.expect("reload");
+        let a = &reg.entries()[0];
+        assert_eq!(a.close_attempts(), 2);
+        assert_eq!(a.close_deferred_since(), Some(1_700_000_000));
+        let b = &reg.entries()[1];
+        assert_eq!(b.close_attempts(), 0);
+        assert_eq!(b.close_deferred_since(), None);
+
+        let mut a = a.clone();
+        a.reset_close_deferral();
+        assert_eq!((a.close_attempts(), a.close_deferred_since()), (0, None));
+    }
+
+    /// Дедлайн переставляется только у открытого тома (перезавод часов при
+    /// отложенном закрытии — С-8); закрытому дедлайн не положен.
+    #[test]
+    fn set_until_requires_open_state() {
+        let mut e = entry("x");
+        assert!(
+            e.set_until(Some(1)).is_err(),
+            "closed vault has no deadline"
+        );
+        e.set_state(VaultState::Open {
+            mount_point: PathBuf::from("/run/m"),
+            until: Some(1),
+        })
+        .expect("open");
+        e.set_until(Some(2)).expect("open vault: deadline moves");
+        assert_eq!(
+            e.state(),
+            &VaultState::Open {
+                mount_point: PathBuf::from("/run/m"),
+                until: Some(2),
+            }
+        );
+    }
+
+    /// Серия попыток начинается заново, а момент первой неудачи остаётся —
+    /// карточке нужно «не закрывается с …», а не «с последней минуты».
+    #[test]
+    fn restarting_attempts_keeps_first_failure_moment() {
+        let mut e = entry("x");
+        e.note_close_deferred(100);
+        e.note_close_deferred(160);
+        e.restart_close_attempts();
+        assert_eq!(
+            (e.close_attempts(), e.close_deferred_since()),
+            (0, Some(100))
+        );
     }
 
     #[tokio::test]

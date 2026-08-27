@@ -12,10 +12,11 @@ use std::time::Duration;
 use eframe::egui;
 use panzir_core::create;
 use panzir_core::deps::{self, DepsReport};
-use panzir_core::lifecycle::{self, VaultProbe};
+use panzir_core::lifecycle::{self, CloseDecision, close_decision};
 use panzir_core::registry::{Registry, VaultEntry};
-use panzir_core::udisks::{ObjPath, Udisks};
-use panzir_core::vault::{Label, VaultKind, VaultState, container_path};
+use panzir_core::schedule::SystemdUser;
+use panzir_core::udisks::Udisks;
+use panzir_core::vault::{DEFAULT_AUTO_CLOSE, Label, VaultKind, VaultState, container_path};
 use panzir_core::{AuthRefusal, Error};
 use secrecy::SecretString;
 use secrecy::zeroize::Zeroize as _;
@@ -67,6 +68,9 @@ enum Op {
         /// Секрет. Дальше окна в открытом виде не живёт: `SecretString`
         /// затирает себя при уничтожении.
         passphrase: SecretString,
+        /// Срок автозакрытия из записи; `None` — не закрывать. Читается при
+        /// клике, чтобы фоновая задача не открывала реестр второй раз.
+        auto_close: Option<Duration>,
     },
     /// Закрыть хранилище: отпереть нельзя без пароля, а запереть — можно.
     Close {
@@ -150,6 +154,9 @@ pub fn smoke_frames_from(raw: Option<&str>) -> Option<u32> {
 pub fn error_text(err: &Error) -> String {
     match err {
         Error::AlreadyRunning => "panzir уже запущен — закройте второе окно и повторите".to_owned(),
+        Error::Schedule { cmd, status } => format!(
+            "часы автозакрытия не завелись — само хранилище не закроется: «{cmd}» ({status})"
+        ),
         Error::MissingDependency { name, hint } => {
             format!("не хватает «{name}»: {hint}")
         }
@@ -217,6 +224,29 @@ pub fn error_text(err: &Error) -> String {
     }
 }
 
+/// Сообщение об отложенном автозакрытии: кто держит сейф открытым.
+///
+/// E-minimal: при «занято» автозакрытие ждёт человека, поэтому окно
+/// показывает держателей и просит закрыть программу вручную.
+#[must_use]
+pub fn busy_message(holders: &[String]) -> String {
+    match holders.len() {
+        0 => "Сейф не закрыт: его файлы заняты другой программой. \
+             Завершите программы, в которых открыт сейф, и нажмите «Закрыть»."
+            .to_owned(),
+        1 => format!(
+            "Сейф не закрыт: его использует «{}». \
+             Завершите программу и нажмите «Закрыть».",
+            holders[0]
+        ),
+        _ => format!(
+            "Сейф не закрыт: его используют {}. \
+             Завершите их и нажмите «Закрыть».",
+            holders.join(", ")
+        ),
+    }
+}
+
 /// Короткое имя состояния записи для списка.
 #[must_use]
 pub fn state_text(state: &VaultState) -> &'static str {
@@ -253,6 +283,8 @@ pub struct App {
     rt: Runtime,
     registry_path: PathBuf,
     home: PathBuf,
+    /// Часы автозакрытия: окно только передаёт их в ядро.
+    scheduler: SystemdUser,
     op_timeout: Duration,
     smoke_frames: Option<u32>,
     frames_drawn: u32,
@@ -261,6 +293,9 @@ pub struct App {
     udisks: Option<UdisksStatus>,
     local_deps: DepsReport,
     pending: Option<JoinHandle<OpOutcome>>,
+    /// Периодическая перечитка реестра, пока есть открытые тома (E-minimal).
+    /// Не блокирует кнопки: `pending` остаётся свободен для операций человека.
+    reload_tick: Option<JoinHandle<OpOutcome>>,
     bus_probe: Option<JoinHandle<UdisksStatus>>,
     message: Option<String>,
     rename: Option<RenameDraft>,
@@ -292,6 +327,7 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         registry_path: PathBuf,
         home: PathBuf,
+        closer: PathBuf,
         smoke_frames: Option<u32>,
         op_timeout: Duration,
     ) -> Self {
@@ -301,6 +337,8 @@ impl App {
             rt,
             registry_path,
             home,
+            // Ждать бегущее закрытие в `disarm` — не дольше, чем операцию целиком.
+            scheduler: SystemdUser::new(vec![closer.into()], op_timeout),
             op_timeout,
             smoke_frames,
             frames_drawn: 0,
@@ -309,6 +347,7 @@ impl App {
             udisks: None,
             local_deps,
             pending: None,
+            reload_tick: None,
             bus_probe: None,
             message: None,
             rename: None,
@@ -355,11 +394,12 @@ impl App {
         }
         let path = self.registry_path.clone();
         let home = self.home.clone();
+        let scheduler = self.scheduler.clone();
         let limit = self.op_timeout;
         self.pending = Some(self.spawn_waking(ctx, async move {
             // Таймаут накрывает операцию ЦЕЛИКОМ, включая пробу: человеку не
             // важно, на каком шаге застряло, ему важно, что окно не висит.
-            match tokio::time::timeout(limit, run_op(&path, &home, op)).await {
+            match tokio::time::timeout(limit, run_op(&path, &home, &scheduler, op)).await {
                 Ok(outcome) => outcome,
                 Err(_) => OpOutcome::Failed(format!(
                     "хранилище не откликнулось {}. Возможно, том занят другой программой. \
@@ -369,6 +409,25 @@ impl App {
             }
         }));
         true
+    }
+
+    /// Периодическая перечитка реестра, пока есть открытые тома.
+    ///
+    /// E-minimal: закрыватель пишет отложенное закрытие в реестр, а окно
+    /// должно показать это без перезапуска. Период в 5 с — баланс между
+    /// свежестью картинки и нагрузкой на диск/шину.
+    fn spawn_reload_tick(&mut self, ctx: &egui::Context) {
+        if self.reload_tick.is_some() {
+            return;
+        }
+        let path = self.registry_path.clone();
+        self.reload_tick = Some(self.spawn_waking(ctx, async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            match Registry::load_from(&path).await {
+                Ok(reg) => OpOutcome::Loaded(reg.entries().to_vec()),
+                Err(e) => OpOutcome::Failed(error_text(&e)),
+            }
+        }));
     }
 
     /// Проба шины — отдельная задача, а не часть загрузки списка: зависший
@@ -389,6 +448,15 @@ impl App {
     fn take_finished(&mut self) {
         if self.pending.as_ref().is_some_and(JoinHandle::is_finished)
             && let Some(handle) = self.pending.take()
+        {
+            let outcome = self.rt.block_on(handle);
+            self.apply(outcome);
+        }
+        if self
+            .reload_tick
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            && let Some(handle) = self.reload_tick.take()
         {
             let outcome = self.rt.block_on(handle);
             self.apply(outcome);
@@ -499,6 +567,15 @@ impl App {
             })
     }
 
+    /// Срок автозакрытия записи. Записи нет — срок по умолчанию: до открытия
+    /// дело всё равно не дойдёт (`container_of` откажет раньше).
+    fn auto_close_of(&self, label: &Label) -> Option<Duration> {
+        self.entries
+            .iter()
+            .find(|e| e.label().as_str() == label.as_str())
+            .map_or(Some(DEFAULT_AUTO_CLOSE), VaultEntry::auto_close)
+    }
+
     /// Отказ по носителю произносится словами: молчание здесь — тот же дефект,
     /// что и ложное сообщение (инвариант 10).
     fn refuse_device(&mut self) {
@@ -534,6 +611,7 @@ impl App {
                 let passphrase = SecretString::from(typed.as_str());
                 typed.zeroize();
 
+                let auto_close = self.auto_close_of(&label);
                 match self.container_of(&label) {
                     Some(container) => {
                         self.spawn_op(
@@ -542,6 +620,7 @@ impl App {
                                 label,
                                 container,
                                 passphrase,
+                                auto_close,
                             },
                         );
                     }
@@ -663,6 +742,10 @@ impl App {
                 self.udisks = Some(status);
             }
         }
+        // Периодическая перечитка в тестах не нужна и ждала бы 5 с.
+        if let Some(handle) = self.reload_tick.take() {
+            handle.abort();
+        }
         if let Some(handle) = self.pending.take() {
             let outcome = self
                 .rt
@@ -677,6 +760,16 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.take_finished();
+
+        // E-minimal: если есть открытые тома, перечитываем реестр в фоне,
+        // чтобы показать отложенное автозакрытие, записанное закрывателем.
+        if self
+            .entries
+            .iter()
+            .any(|e| matches!(e.state(), VaultState::Open { .. }))
+        {
+            self.spawn_reload_tick(ui.ctx());
+        }
 
         let ctx = ui.ctx().clone();
         match self.screen {
@@ -715,7 +808,12 @@ impl eframe::App for App {
     }
 }
 
-async fn run_op(path: &std::path::Path, home: &std::path::Path, op: Op) -> OpOutcome {
+async fn run_op(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    scheduler: &SystemdUser,
+    op: Op,
+) -> OpOutcome {
     match op {
         Op::Reload => match Registry::load_from(path).await {
             Ok(reg) => OpOutcome::Loaded(reg.entries().to_vec()),
@@ -723,12 +821,26 @@ async fn run_op(path: &std::path::Path, home: &std::path::Path, op: Op) -> OpOut
         },
         Op::Remove(label) => write_then_read(path, move |r| r.remove(&label)).await,
         Op::Rename { old, new } => write_then_read(path, move |r| r.rename(&old, new)).await,
-        Op::Close { label, container } => run_close(path, home, &label, &container).await,
+        Op::Close { label, container } => {
+            run_close(path, home, scheduler, &label, &container).await
+        }
         Op::Open {
             label,
             container,
             passphrase,
-        } => run_open(path, home, &label, &container, &passphrase).await,
+            auto_close,
+        } => {
+            run_open(
+                path,
+                home,
+                scheduler,
+                &label,
+                &container,
+                &passphrase,
+                auto_close,
+            )
+            .await
+        }
         Op::Create {
             label,
             container,
@@ -742,15 +854,21 @@ async fn run_op(path: &std::path::Path, home: &std::path::Path, op: Op) -> OpOut
 async fn run_open(
     path: &std::path::Path,
     home: &std::path::Path,
+    scheduler: &SystemdUser,
     label: &Label,
     container: &std::path::Path,
     passphrase: &SecretString,
+    auto_close: Option<Duration>,
 ) -> OpOutcome {
     let ud = match Udisks::connect().await {
         Ok(ud) => ud,
         Err(e) => return OpOutcome::Failed(error_text(&e)),
     };
-    match lifecycle::open_file_vault(&ud, container, label, passphrase, home).await {
+    match lifecycle::open_file_vault(
+        &ud, container, label, passphrase, home, scheduler, auto_close,
+    )
+    .await
+    {
         // Точка монтирования — из ответа udisks2, не угаданная: путь симлинка
         // сюда не подставляется (спека п.2 скоупа).
         Ok(opened) => {
@@ -759,6 +877,7 @@ async fn run_open(
                 label,
                 VaultState::Open {
                     mount_point: opened.mount_point,
+                    until: opened.until,
                 },
             )
             .await
@@ -804,7 +923,10 @@ async fn run_create(
             r.add(VaultEntry::new(
                 label,
                 VaultKind::File(container),
-                VaultState::Open { mount_point },
+                VaultState::Open {
+                    mount_point,
+                    until: None,
+                },
             ))?;
             Ok(r.entries().to_vec())
         }
@@ -827,6 +949,7 @@ async fn run_create(
 async fn run_close(
     path: &std::path::Path,
     home: &std::path::Path,
+    scheduler: &SystemdUser,
     label: &Label,
     container: &std::path::Path,
 ) -> OpOutcome {
@@ -850,36 +973,13 @@ async fn run_close(
              второе подключение испортило бы данные"
         )),
         CloseDecision::Close(loop_object) => {
-            match lifecycle::close_file_vault(&ud, &loop_object, label, home, false).await {
+            match lifecycle::close_file_vault(&ud, &loop_object, label, home, false, scheduler)
+                .await
+            {
                 Ok(()) => set_state_then_read(path, label, VaultState::Closed).await,
                 Err(e) => OpOutcome::Failed(error_text(&e)),
             }
         }
-    }
-}
-
-/// Что делать с томом по результату пробы.
-///
-/// Вынесено в чистую функцию намеренно: тест окна не может позвать живой
-/// udisks2, а разбор пяти вариантов — именно то, что обязано быть проверено.
-#[derive(Debug, PartialEq, Eq)]
-enum CloseDecision {
-    /// Файл не подключён: закрывать нечего, привести запись к правде.
-    AlreadyDetached,
-    /// Есть объект loop-устройства — закрываем.
-    Close(ObjPath),
-    /// Подключён чужим uid: не трогаем (инвариант 3).
-    Foreign(u32),
-}
-
-/// `match` без ветки `_`: новый вариант пробы обязан сломать сборку здесь.
-fn close_decision(probe: VaultProbe) -> CloseDecision {
-    match probe {
-        VaultProbe::Detached => CloseDecision::AlreadyDetached,
-        VaultProbe::AttachedLocked { loop_object }
-        | VaultProbe::AttachedUnlocked { loop_object, .. }
-        | VaultProbe::AttachedOpen { loop_object, .. } => CloseDecision::Close(loop_object),
-        VaultProbe::Foreign { uid, .. } => CloseDecision::Foreign(uid),
     }
 }
 
@@ -1618,23 +1718,6 @@ mod tests {
     /// штатной утилитой дисков или приложение падало. Закрывать нечего, и
     /// звать `close_file_vault` было бы обращением к объекту, которого уже нет.
     ///
-    /// # Почему проверен только один вариант из пяти
-    /// Остальные четыре несут `ObjPath`, а у него **нет публичного
-    /// конструктора** (`udisks.rs:76-89`: `from_owned` приватен,
-    /// `block_device` — `pub(crate)`). Собрать их вне `panzir-core`
-    /// невозможно. Что закрывает дыру вместо теста: `match` без ветки `_`
-    /// (новый вариант ломает сборку) и живые IT ядра, где ветка `Foreign`
-    /// проверяется на настоящем томе (`t19`). Записано в отчёт Гейта-2 как
-    /// ограничение, а не как достаточное покрытие.
-    #[test]
-    fn detached_volume_is_not_closed_again() {
-        assert_eq!(
-            close_decision(VaultProbe::Detached),
-            CloseDecision::AlreadyDetached,
-            "отсоединённый том нечем закрывать: объекта loop-устройства не существует"
-        );
-    }
-
     /// Отведённое время называется человеку словами, а не миллисекундами.
     #[test]
     fn timeout_is_named_in_seconds_only_when_seconds_make_sense() {
@@ -1661,6 +1744,7 @@ mod tests {
                 VaultKind::File(container.clone()),
                 VaultState::Open {
                     mount_point: mount.clone(),
+                    until: None,
                 },
             ))?;
             Ok(())
@@ -1693,6 +1777,7 @@ mod tests {
                 cc,
                 registry.clone(),
                 home.clone(),
+                PathBuf::from("/bin/true"),
                 None,
                 Duration::from_secs(5),
             )
@@ -1963,6 +2048,33 @@ mod tests {
                 .is_none(),
             "плашка тревожит на исправной машине"
         );
+    }
+
+    #[test]
+    fn busy_message_names_holders_or_falls_back_gracefully() {
+        let unknown: Vec<String> = vec![];
+        let text = busy_message(&unknown);
+        assert!(
+            text.contains("другой программой"),
+            "fallback must be general: {text}"
+        );
+        assert!(text.contains("«Закрыть»"));
+
+        let one = vec!["vim".to_owned()];
+        let text = busy_message(&one);
+        assert!(
+            text.contains("«vim»"),
+            "single holder must be quoted: {text}"
+        );
+        assert!(text.contains("Завершите программу"));
+
+        let many = vec!["vim".to_owned(), "bash".to_owned()];
+        let text = busy_message(&many);
+        assert!(
+            text.contains("vim, bash"),
+            "multiple holders must be listed: {text}"
+        );
+        assert!(text.contains("Завершите их"));
     }
 
     #[test]

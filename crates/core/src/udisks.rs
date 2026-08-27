@@ -458,7 +458,9 @@ impl Udisks {
         }))
     }
 
-    fn is_retryable_unmount(e: &Error) -> bool {
+    /// «Занято» в любом из двух представлений (см. `is_device_busy`):
+    /// `lifecycle` по нему решает, отступить ли автозакрытию (спека С-8).
+    pub(crate) fn is_retryable_unmount(e: &Error) -> bool {
         match e {
             Error::Udisks(z) => is_device_busy(z),
             Error::UnexpectedUdisksState(msg) => msg.contains("still mounted after unmount"),
