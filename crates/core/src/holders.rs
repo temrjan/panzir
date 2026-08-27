@@ -43,6 +43,15 @@ fn is_under_mount_point(path: &Path, mount_point: &Path) -> bool {
     path == mount_point || path.starts_with(mount_point)
 }
 
+/// Убирает управляющие символы из имени процесса: `/proc/<pid>/comm` —
+/// ядерная строка, но выводить её в GUI можно только после фильтра.
+fn sanitize_comm(raw: &str) -> String {
+    raw.trim_end()
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// Сканировать `/proc` и вернуть имена процессов, держащих `mount_point`.
 ///
 /// Процессы, недоступные текущему пользователю (чужой uid, root и т.п.),
@@ -69,7 +78,7 @@ fn scan_proc() -> Vec<ProcEntry> {
         let Ok(comm) = std::fs::read_to_string(pid_dir.join("comm")) else {
             continue;
         };
-        let comm = comm.trim_end().to_owned();
+        let comm = sanitize_comm(&comm);
         if comm.is_empty() {
             continue;
         }
@@ -128,6 +137,13 @@ mod tests {
         }];
         let holders = holders_from_entries(&mount, entries.into_iter());
         assert_eq!(holders, vec!["vim".to_owned()]);
+    }
+
+    #[test]
+    fn comm_sanitizes_control_characters() {
+        assert_eq!(sanitize_comm("vim\n"), "vim");
+        assert_eq!(sanitize_comm("we\x07rd"), "we?rd");
+        assert!(sanitize_comm("\n\t").is_empty());
     }
 
     #[test]

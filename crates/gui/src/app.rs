@@ -293,6 +293,9 @@ pub struct App {
     udisks: Option<UdisksStatus>,
     local_deps: DepsReport,
     pending: Option<JoinHandle<OpOutcome>>,
+    /// Периодическая перечитка реестра, пока есть открытые тома (E-minimal).
+    /// Не блокирует кнопки: `pending` остаётся свободен для операций человека.
+    reload_tick: Option<JoinHandle<OpOutcome>>,
     bus_probe: Option<JoinHandle<UdisksStatus>>,
     message: Option<String>,
     rename: Option<RenameDraft>,
@@ -344,6 +347,7 @@ impl App {
             udisks: None,
             local_deps,
             pending: None,
+            reload_tick: None,
             bus_probe: None,
             message: None,
             rename: None,
@@ -407,6 +411,25 @@ impl App {
         true
     }
 
+    /// Периодическая перечитка реестра, пока есть открытые тома.
+    ///
+    /// E-minimal: закрыватель пишет отложенное закрытие в реестр, а окно
+    /// должно показать это без перезапуска. Период в 5 с — баланс между
+    /// свежестью картинки и нагрузкой на диск/шину.
+    fn spawn_reload_tick(&mut self, ctx: &egui::Context) {
+        if self.reload_tick.is_some() {
+            return;
+        }
+        let path = self.registry_path.clone();
+        self.reload_tick = Some(self.spawn_waking(ctx, async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            match Registry::load_from(&path).await {
+                Ok(reg) => OpOutcome::Loaded(reg.entries().to_vec()),
+                Err(e) => OpOutcome::Failed(error_text(&e)),
+            }
+        }));
+    }
+
     /// Проба шины — отдельная задача, а не часть загрузки списка: зависший
     /// D-Bus не имеет права задерживать показ уже прочитанных записей.
     fn spawn_bus_probe(&mut self, ctx: &egui::Context) {
@@ -425,6 +448,15 @@ impl App {
     fn take_finished(&mut self) {
         if self.pending.as_ref().is_some_and(JoinHandle::is_finished)
             && let Some(handle) = self.pending.take()
+        {
+            let outcome = self.rt.block_on(handle);
+            self.apply(outcome);
+        }
+        if self
+            .reload_tick
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            && let Some(handle) = self.reload_tick.take()
         {
             let outcome = self.rt.block_on(handle);
             self.apply(outcome);
@@ -710,6 +742,10 @@ impl App {
                 self.udisks = Some(status);
             }
         }
+        // Периодическая перечитка в тестах не нужна и ждала бы 5 с.
+        if let Some(handle) = self.reload_tick.take() {
+            handle.abort();
+        }
         if let Some(handle) = self.pending.take() {
             let outcome = self
                 .rt
@@ -724,6 +760,16 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.take_finished();
+
+        // E-minimal: если есть открытые тома, перечитываем реестр в фоне,
+        // чтобы показать отложенное автозакрытие, записанное закрывателем.
+        if self
+            .entries
+            .iter()
+            .any(|e| matches!(e.state(), VaultState::Open { .. }))
+        {
+            self.spawn_reload_tick(ui.ctx());
+        }
 
         let ctx = ui.ctx().clone();
         match self.screen {
