@@ -150,6 +150,9 @@ pub fn smoke_frames_from(raw: Option<&str>) -> Option<u32> {
 pub fn error_text(err: &Error) -> String {
     match err {
         Error::AlreadyRunning => "panzir уже запущен — закройте второе окно и повторите".to_owned(),
+        Error::Schedule { cmd, status } => format!(
+            "часы автозакрытия не завелись — само хранилище не закроется: «{cmd}» ({status})"
+        ),
         Error::MissingDependency { name, hint } => {
             format!("не хватает «{name}»: {hint}")
         }

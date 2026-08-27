@@ -74,6 +74,7 @@ pub fn check_local_deps() -> DepsReport {
         ("fallocate", "util-linux"),
         ("cryptsetup", "cryptsetup"),
         ("pkexec", "polkit"),
+        ("systemd-run", "systemd"),
     ] {
         statuses.push(DepStatus {
             name,
@@ -101,7 +102,14 @@ mod tests {
         let names: Vec<&str> = check_local_deps().statuses.iter().map(|s| s.name).collect();
         assert_eq!(
             names,
-            ["stat", "chattr", "fallocate", "cryptsetup", "pkexec"],
+            [
+                "stat",
+                "chattr",
+                "fallocate",
+                "cryptsetup",
+                "pkexec",
+                "systemd-run",
+            ],
             "плашка обязана называть только то, что проверено измерением: \
              запись, чьё значение получено догадкой, — ложная тревога при каждом запуске"
         );
