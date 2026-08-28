@@ -65,7 +65,26 @@ impl TempKeyfile {
 }
 
 impl Drop for TempKeyfile {
+    /// Затирает содержимое нулями перед `unlink`: после голого `remove_file`
+    /// байты секрета остались бы в свободных блоках ФС (аудит 2026-08-28 §5).
+    ///
+    /// Чего это НЕ обещает: на целевой Fedora `$TMPDIR` — tmpfs (замер
+    /// 2026-08-28: `stat -f -c %T /tmp` → `tmpfs`), файл до диска не доходит;
+    /// при переопределённом `TMPDIR` на CoW- или журналируемой ФС перезапись
+    /// не гарантирует, что старые блоки недостижимы.
     fn drop(&mut self) {
+        // Затираем тот же inode — переоткрытием пути: путь жив до unlink, имя
+        // уникально. Длина — metadata().len() с нулевого офсета, иначе нули
+        // дописались бы в конец, а секрет остался. Всё best-effort: Drop не
+        // возвращает ошибок, поэтому каждый шаг под `let _`.
+        if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&self.path)
+            && let Ok(len) = file.metadata().map(|m| m.len())
+            && let Ok(len) = usize::try_from(len)
+        {
+            use std::io::Write as _;
+            let _ = file.write_all(&vec![0_u8; len]);
+            let _ = file.sync_data();
+        }
         // Синхронное удаление вне async-контекста — допустимо для файла.
         let _ = std::fs::remove_file(&self.path);
     }
