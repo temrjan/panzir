@@ -1071,3 +1071,160 @@ async fn t26_busy_volume_is_deferred_not_rearmed() {
         "registry must stay open with no deadline"
     );
 }
+
+/// Собирает продуктовый бинарь окна и возвращает его путь — приёмом
+/// `build_close_worker`: на чистом checkout бинаря ещё нет. Цена названа в
+/// спеке (Р-3): сьют ядра собирает артефакт соседнего крейта.
+async fn build_product_binary() -> PathBuf {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = workspace_root
+        .parent()
+        .and_then(Path::parent)
+        .expect("core is at crates/core inside workspace")
+        .to_path_buf();
+    let build = tokio::process::Command::new("cargo")
+        .args(["build", "-p", "panzir-gui", "--quiet"])
+        .current_dir(&workspace_root)
+        .status()
+        .await
+        .expect("build panzir-gui");
+    assert!(build.success(), "panzir-gui build failed");
+    workspace_root.join("target/debug/panzir-gui")
+}
+
+/// T-27 (спека 2026-08-28 §4.3): продуктовый бинарь в режиме `--close`
+/// закрывает хранилище — сквозная цепочка таймер → `panzir-gui --close` →
+/// `close_registered` на настоящем изделии. Корень CRITICAL аудита §6: звенья
+/// проверялись с подставными соседями, и разрыв оказался на стыке.
+///
+/// Швы, названные вслух:
+/// 1. Что `arm()` порождает именно argv `[бинарь, --close, метка]`, здесь не
+///    проверяется — это покрыто юнитом
+///    `systemd_run_args_carry_label_and_closer_only` (schedule.rs) и T-24.
+/// 2. Ветка «занято» (`Deferred`) на продуктовом бинаре живьём не покрывается:
+///    она целиком внутри общего `close_registered` и закрыта T-26 на воркере.
+#[tokio::test]
+#[ignore = "requires live udisks2/polkit and systemd --user; run with --ignored"]
+async fn t27_product_binary_in_close_mode_closes_the_vault() {
+    use panzir_core::registry::{Registry, VaultEntry};
+    use panzir_core::vault::{VaultKind, VaultState};
+
+    require_it_flag();
+    let _serial = UDISKS_LOCK.lock().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = fake_home(dir.path());
+    let container = dir.path().join("panzir-t27.vault");
+    // Реестр — ровно там, где его найдёт закрыватель под `-E HOME=<home>`
+    // (Registry::default_path читает только HOME, registry.rs:261-269).
+    let registry = home.join(".config").join("panzir").join("vaults.toml");
+    let _cleanup = TestCleanup {
+        container: container.clone(),
+    };
+    let _timer_cleanup = TimerCleanup("panzir-close-t27".to_owned());
+    let label = Label::new("t27").expect("label");
+    let pass = SecretString::from("t27-passphrase");
+    let binary = build_product_binary().await;
+
+    let ud = Udisks::connect().await.expect("udisks2 on the bus");
+    let created = create_file_container(&ud, &container, 64 * 1024 * 1024, &label, &pass)
+        .await
+        .expect("container created");
+    close_file_vault(&ud, &created.loop_object, &label, &home, true, &NoScheduler)
+        .await
+        .expect("close after create");
+
+    // Открываем без часов и записываем продуктовой формой записи (спека Ч-5):
+    // таймер заводит не arm(), а сам тест. `until: None` — валидное
+    // продуктовое состояние «таймер не заведён» (vault.rs:86-90).
+    let opened = open_file_vault(&ud, &container, &label, &pass, &home, &NoScheduler, None)
+        .await
+        .expect("open without a clock");
+    Registry::with_write_lock_at(&registry, {
+        let label = label.clone();
+        let container = container.clone();
+        let mount_point = opened.mount_point.clone();
+        move |r| {
+            r.add(VaultEntry::new(
+                label,
+                VaultKind::File(container),
+                VaultState::Open {
+                    mount_point,
+                    until: None,
+                },
+            ))
+        }
+    })
+    .await
+    .expect("record open vault");
+    assert_counter_can_see(&container, 1);
+    let link = home.join("panzir-t27");
+    assert!(link.exists(), "symlink exists while open");
+    // Предусловие (не положительный контроль): до завода таймера его нет.
+    // Проверять ПОСЛЕ завода было бы флаки — `--on-active=5s` может уже
+    // сработать; факт принятия таймера доказывает `spawned.success()` ниже.
+    assert!(
+        !timer_listed("panzir-close-t27"),
+        "precondition: no timer before the test arms one"
+    );
+
+    // Пролог, как у arm() (спека С-4, замер 27.08: повторный завод под тем же
+    // именем отказывает). «Юнит не загружен» — штатный исход, коды не смотрим.
+    // TimerCleanup закрывает штатный путь и панику, но не Ctrl-C, а свип
+    // run-it-tests.sh таймеры не чистит вовсе.
+    let _ = Command::new("systemctl")
+        .args([
+            "--user",
+            "stop",
+            "panzir-close-t27.timer",
+            "panzir-close-t27.service",
+        ])
+        .output();
+    let _ = Command::new("systemctl")
+        .args([
+            "--user",
+            "reset-failed",
+            "panzir-close-t27.timer",
+            "panzir-close-t27.service",
+        ])
+        .output();
+
+    // Тест сам зовёт systemd-run — как T-25 сам зовёт cargo build (Д-3 спеки).
+    let home_arg = format!("HOME={}", home.display());
+    let spawned = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--quiet",
+            "--unit=panzir-close-t27",
+            "--on-active=5s",
+            "--timer-property=AccuracySec=1s",
+            "-E",
+            &home_arg,
+        ])
+        .arg(&binary)
+        .args(["--close", "t27"])
+        .status()
+        .expect("systemd-run");
+    assert!(spawned.success(), "systemd-run must accept the timer");
+
+    // Окна нет: никто, кроме таймера, закрыть не может.
+    let closed = wait_until(Duration::from_secs(25), || {
+        count_loops_by_sysfs(&container) == 0 && !link.exists()
+    })
+    .await;
+    assert!(
+        closed,
+        "product binary must close the vault on --close: loops={}, symlink={}",
+        count_loops_by_sysfs(&container),
+        link.exists()
+    );
+    let entry = registry_entry(&registry, &label).await;
+    assert_eq!(
+        entry.state(),
+        &panzir_core::vault::VaultState::Closed,
+        "registry must say closed"
+    );
+    assert_eq!(entry.close_attempts(), 0, "no deferral on a clean close");
+    // Инвариант 1: закрытие не удаляет контейнер — и на новом маршруте тоже.
+    assert!(container.exists(), "container file must survive the close");
+}

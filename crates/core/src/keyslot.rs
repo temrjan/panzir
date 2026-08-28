@@ -201,3 +201,46 @@ async fn luks_add_key(
         })
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use secrecy::SecretString;
+
+    /// Witness-тест (спека 2026-08-28 §4.2): вторая жёсткая ссылка на тот же
+    /// inode видит, что содержимое затёрто до unlink. Носитель регрессии
+    /// дефекта: сегодня `Drop` — только `remove_file`.
+    #[tokio::test]
+    async fn temp_keyfile_wipes_content_before_unlink() {
+        let secret = b"witness-secret-phrase";
+        let pass = Passphrase::new(SecretString::from(
+            std::str::from_utf8(secret).expect("ascii secret"),
+        ));
+        let keyfile = TempKeyfile::from_passphrase(&pass)
+            .await
+            .expect("keyfile created");
+        let keyfile_path = keyfile.path().to_owned();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let witness = dir.path().join("witness");
+        std::fs::hard_link(&keyfile_path, &witness).expect("hard link");
+
+        // Положительный контроль (приём assert_counter_can_see): witness
+        // видит секрет ДО затирания — иначе зелёный был бы совместим с
+        // «ссылка легла не на тот inode».
+        assert_eq!(
+            std::fs::read(&witness).expect("read witness before drop"),
+            secret,
+            "witness must see the secret before wipe"
+        );
+
+        drop(keyfile);
+        let left = std::fs::read(&witness).expect("read witness after drop");
+        assert_eq!(
+            left,
+            vec![0u8; secret.len()],
+            "содержимое обязано быть затёрто до unlink"
+        );
+        assert!(!keyfile_path.exists(), "unlink сохранён");
+    }
+}
