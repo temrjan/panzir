@@ -146,6 +146,100 @@ pub fn smoke_frames_from(raw: Option<&str>) -> Option<u32> {
     }
 }
 
+/// Что попросил вызывающий через командную строку.
+///
+/// Это внутренний контракт «таймер ↔ бинарь», а не пользовательский CLI:
+/// таймер автозакрытия запускает этот же бинарь с `--close <метка>`
+/// (`SystemdUser`, schedule.rs). Пользовательских флагов нет и не должно
+/// появиться без отдельного решения — поэтому никакого парсера аргументов:
+/// две формы вызова, три исхода.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CloseRequest {
+    /// Аргументов нет — обычное окно.
+    Window,
+    /// Ровно `--close <валидная метка>` — headless-закрытие хранилища.
+    Close(Label),
+    /// Всё остальное — ошибка вызова; причина различима в stderr.
+    Usage(UsageReason),
+}
+
+/// Почему вызов не разобран. Тексты различаются при одном exit-коде 2:
+/// ночной отказ разбирают по journalctl, гадание там недопустимо.
+/// Match'и на нём — без ветки `_`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UsageReason {
+    /// Аргумент не из контракта (опечатка, `--version`, лишний аргумент).
+    UnknownArgument(std::ffi::OsString),
+    /// `--close` без метки.
+    MissingLabel,
+    /// Метка не прошла `Label::new`.
+    InvalidLabel(String),
+}
+
+/// Разбирает argv — полный, включая `argv[0]` с именем бинаря: его ставит ОС,
+/// и образец подсчёта в проекте (`close_worker.rs`) считает с ним.
+/// `skip(1)`, а не срез `args[1..]`: не паникует даже на теоретически пустом
+/// argv. Отделён от чтения argv в `main` по той же причине, что
+/// [`smoke_frames_from`]: подменить argv тесту нечем.
+#[must_use]
+pub fn close_label_from(args: &[std::ffi::OsString]) -> CloseRequest {
+    let mut rest = args.iter().skip(1);
+    let Some(first) = rest.next() else {
+        return CloseRequest::Window;
+    };
+    if first != "--close" {
+        return CloseRequest::Usage(UsageReason::UnknownArgument(first.clone()));
+    }
+    let Some(label) = rest.next() else {
+        return CloseRequest::Usage(UsageReason::MissingLabel);
+    };
+    if let Some(extra) = rest.next() {
+        return CloseRequest::Usage(UsageReason::UnknownArgument(extra.clone()));
+    }
+    match label.to_str().and_then(|text| Label::new(text).ok()) {
+        Some(label) => CloseRequest::Close(label),
+        None => CloseRequest::Usage(UsageReason::InvalidLabel(
+            label.to_string_lossy().into_owned(),
+        )),
+    }
+}
+
+/// Строка usage — одна на все отказы разбора argv.
+#[must_use]
+pub fn usage_line() -> &'static str {
+    "usage: panzir-gui [--close <label>]"
+}
+
+/// Причина отказа разбора — человеку в stderr и journal. Без ветки `_`:
+/// новый вариант обязан сломать сборку здесь.
+#[must_use]
+pub fn usage_reason_text(reason: &UsageReason) -> String {
+    match reason {
+        UsageReason::UnknownArgument(arg) => {
+            format!("unknown argument: {}", arg.to_string_lossy())
+        }
+        UsageReason::MissingLabel => "--close requires a label".to_owned(),
+        UsageReason::InvalidLabel(text) => {
+            format!("invalid label: {text} — labels are [a-z0-9-], up to 16 bytes")
+        }
+    }
+}
+
+/// Строка исхода закрытия для stdout/journal. Три исхода обязаны читаться
+/// по-разному: «не закрыл» не должен выглядеть как «закрыл» рядом с успешным
+/// юнитом. Без ветки `_`: новый вариант `CloseOutcome` обязан сломать сборку
+/// здесь (образец — `close_decision` в ядре).
+#[must_use]
+pub fn outcome_line(label: &Label, outcome: &lifecycle::CloseOutcome) -> String {
+    match outcome {
+        lifecycle::CloseOutcome::Closed => format!("{label}: closed"),
+        lifecycle::CloseOutcome::AlreadyClosed => format!("{label}: already closed"),
+        lifecycle::CloseOutcome::Deferred { attempt } => {
+            format!("{label}: busy — close deferred (attempt {attempt}), waiting for manual close")
+        }
+    }
+}
+
 /// Переводит отказ ядра на человеческий язык.
 ///
 /// Match намеренно без ветки `_`: новый вариант в ядре обязан сломать сборку
@@ -1048,6 +1142,117 @@ mod tests {
     use panzir_core::vault::VaultState;
 
     use super::*;
+
+    // ---------- Разбор argv и строка исхода (круг починки 2026-08-28) ----------
+
+    fn os(text: &str) -> std::ffi::OsString {
+        std::ffi::OsString::from(text)
+    }
+
+    #[test]
+    fn argv_without_arguments_is_window() {
+        assert_eq!(close_label_from(&[os("panzir-gui")]), CloseRequest::Window);
+    }
+
+    #[test]
+    fn close_with_valid_label_is_close() {
+        assert_eq!(
+            close_label_from(&[os("panzir-gui"), os("--close"), os("t27")]),
+            CloseRequest::Close(Label::new("t27").expect("label"))
+        );
+    }
+
+    #[test]
+    fn close_without_label_is_usage_missing_label() {
+        assert_eq!(
+            close_label_from(&[os("panzir-gui"), os("--close")]),
+            CloseRequest::Usage(UsageReason::MissingLabel)
+        );
+    }
+
+    #[test]
+    fn unknown_flag_is_usage_unknown_argument() {
+        assert_eq!(
+            close_label_from(&[os("panzir-gui"), os("--version")]),
+            CloseRequest::Usage(UsageReason::UnknownArgument(os("--version")))
+        );
+        // Опечатка в имени режима — тот же класс: упасть громко, а не молча
+        // открыть окно (ровно чинимый дефект).
+        assert_eq!(
+            close_label_from(&[os("panzir-gui"), os("--clse"), os("t27")]),
+            CloseRequest::Usage(UsageReason::UnknownArgument(os("--clse")))
+        );
+    }
+
+    #[test]
+    fn invalid_label_is_usage_invalid_label() {
+        assert_eq!(
+            close_label_from(&[os("panzir-gui"), os("--close"), os("Bad_Label!!")]),
+            CloseRequest::Usage(UsageReason::InvalidLabel("Bad_Label!!".to_owned()))
+        );
+    }
+
+    #[test]
+    fn extra_argument_after_label_is_usage() {
+        assert_eq!(
+            close_label_from(&[os("panzir-gui"), os("--close"), os("t27"), os("extra")]),
+            CloseRequest::Usage(UsageReason::UnknownArgument(os("extra")))
+        );
+    }
+
+    #[test]
+    fn non_utf8_argument_is_usage() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let bad = std::ffi::OsStr::from_bytes(&[0x2d, 0x80]); // "-" + broken byte
+        assert!(matches!(
+            close_label_from(&[os("panzir-gui"), bad.to_os_string()]),
+            CloseRequest::Usage(UsageReason::UnknownArgument(_))
+        ));
+        assert!(matches!(
+            close_label_from(&[os("panzir-gui"), os("--close"), bad.to_os_string()]),
+            CloseRequest::Usage(UsageReason::InvalidLabel(_))
+        ));
+    }
+
+    #[test]
+    fn usage_reasons_read_differently() {
+        let texts = [
+            usage_reason_text(&UsageReason::UnknownArgument(os("--version"))),
+            usage_reason_text(&UsageReason::MissingLabel),
+            usage_reason_text(&UsageReason::InvalidLabel("x!!".to_owned())),
+        ];
+        for (i, a) in texts.iter().enumerate() {
+            for (j, b) in texts.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "причины {i} и {j} обязаны различаться");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn close_outcomes_read_differently() {
+        let label = Label::new("t27").expect("label");
+        let lines = [
+            outcome_line(&label, &lifecycle::CloseOutcome::Closed),
+            outcome_line(&label, &lifecycle::CloseOutcome::AlreadyClosed),
+            outcome_line(&label, &lifecycle::CloseOutcome::Deferred { attempt: 1 }),
+        ];
+        for (i, a) in lines.iter().enumerate() {
+            for (j, b) in lines.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "исходы {i} и {j} обязаны читаться по-разному");
+                }
+            }
+        }
+        // «Не закрыл» не должен выглядеть как «закрыл» рядом с успешным юнитом.
+        assert!(
+            lines[2].contains("deferred"),
+            "deferred says so: {}",
+            lines[2]
+        );
+        assert!(!lines[2].contains(": closed"), "не «closed»: {}", lines[2]);
+    }
 
     // ---------- Ю-2: разбор PANZIR_SMOKE_FRAMES ----------
 
