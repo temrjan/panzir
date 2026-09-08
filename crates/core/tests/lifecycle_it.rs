@@ -102,9 +102,18 @@ impl Drop for TestCleanup {
             let dev = format!("/dev/{name}");
             // Порядок обязателен: снять loop из-под живой dm-crypt нельзя —
             // Delete ответит Ok, а устройства останутся (Б-1 раунда 1).
-            let _ = Command::new("udisksctl")
-                .args(["unmount", "-b", &dev, "--no-user-interaction"])
-                .output();
+            // Unmount идёт по ДЕТЯМ loop-устройства, а не по самому loop: ФС
+            // живёт на dm-ребёнке (/dev/dm-*), unmount по loop отвечает
+            // «not mounted», затем lock busy и delete врёт Ok (Б-3, 28.08).
+            // Приём — как в свипе run-it-tests.sh: lsblk -nro PATH, первая
+            // строка (сам loop) отбрасывается.
+            if let Ok(out) = Command::new("lsblk").args(["-nro", "PATH", &dev]).output() {
+                for child in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
+                    let _ = Command::new("udisksctl")
+                        .args(["unmount", "-b", child, "--no-user-interaction"])
+                        .output();
+                }
+            }
             let _ = Command::new("udisksctl")
                 .args(["lock", "-b", &dev, "--no-user-interaction"])
                 .output();
