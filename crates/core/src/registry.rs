@@ -15,6 +15,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt as _;
 use tokio::task;
 
+use crate::ssh::SshError;
 use crate::vault::{DEFAULT_AUTO_CLOSE, Label, VaultKind, VaultState};
 use crate::{Error, Result};
 
@@ -167,6 +168,87 @@ fn state_name(state: &VaultState) -> &'static str {
 pub struct Registry {
     path: PathBuf,
     entries: Vec<VaultEntry>,
+}
+
+/// SSH-хост хранилища (спека Ш-7): одна Host-запись генерируемого сниппета.
+/// Хранится в реестре (Р-2) — реестр единственная правда; сниппет
+/// `~/.config/panzir/ssh-<метка>.conf` — перезаписываемая производная.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHost {
+    /// Алиас из строки `Host` — то, что пользователь набирает: `ssh devbox`.
+    pub host: String,
+    /// Адрес (`HostName`).
+    pub hostname: String,
+    /// Логин (`User`).
+    pub user: String,
+    /// Порт (`Port`); `None` — строка не пишется, действует дефолт ssh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Имя файла ключа внутри хранилища (basename); полный путь строится
+    /// через симлинк `~/panzir-<метка>` при рендере сниппета.
+    pub key_file: String,
+}
+
+impl SshHost {
+    /// Проверить поля и собрать запись.
+    ///
+    /// `host` и `key_file` — белый список `[a-z0-9._-]` (образец [`Label`]):
+    /// оба попадают в генерируемый конфиг, `key_file` ещё и в путь.
+    /// `hostname` и `user` — непустые строки без пробельных символов и `#`
+    /// (иначе — инъекция лишней строки в генерируемый конфиг).
+    ///
+    /// # Errors
+    /// [`SshError::InvalidField`] с именем отвергнутого поля.
+    pub fn new(
+        host: &str,
+        hostname: &str,
+        user: &str,
+        port: Option<u16>,
+        key_file: &str,
+    ) -> std::result::Result<Self, SshError> {
+        // Белый список [a-z0-9._-]; «.»/«..» отвергаются — это выход за
+        // пределы каталога хранилища при join в путь ключа.
+        fn strict(field: &'static str, value: &str) -> std::result::Result<(), SshError> {
+            let ok = !value.is_empty()
+                && value != "."
+                && value != ".."
+                && value.chars().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+                });
+            if ok {
+                Ok(())
+            } else {
+                Err(SshError::InvalidField {
+                    field,
+                    value: value.to_owned(),
+                })
+            }
+        }
+        // Непустая строка без пробельных символов и '#': иначе значение
+        // ломает строку генерируемого конфига или начинает комментарий.
+        fn loose(field: &'static str, value: &str) -> std::result::Result<(), SshError> {
+            let ok = !value.is_empty() && value.chars().all(|c| !c.is_whitespace() && c != '#');
+            if ok {
+                Ok(())
+            } else {
+                Err(SshError::InvalidField {
+                    field,
+                    value: value.to_owned(),
+                })
+            }
+        }
+        strict("host", host)?;
+        loose("hostname", hostname)?;
+        loose("user", user)?;
+        strict("key_file", key_file)?;
+        Ok(Self {
+            host: host.to_owned(),
+            hostname: hostname.to_owned(),
+            user: user.to_owned(),
+            port,
+            key_file: key_file.to_owned(),
+        })
+    }
 }
 
 /// Представление реестра на диске.
@@ -532,6 +614,40 @@ mod tests {
             VaultKind::File(PathBuf::from(format!("/tmp/{label}.vault"))),
             VaultState::Closed,
         )
+    }
+
+    #[test]
+    fn ssh_host_accepts_valid_fields() {
+        let h = SshHost::new("devbox", "192.0.2.10", "devbox", Some(9281), "id_ed25519")
+            .expect("valid host");
+        assert_eq!(h.port, Some(9281));
+        let h = SshHost::new("my_host.1", "nas.lan", "root", None, "id_nas").expect("valid");
+        assert_eq!(h.port, None);
+    }
+
+    #[test]
+    fn ssh_host_rejects_dangerous_input() {
+        // Белый список [a-z0-9._-] для host/key_file; «.»/«..» — выход из каталога.
+        for (host, key_file) in [
+            ("", "id"),
+            ("Dev Box", "id"),
+            ("dev/box", "id"),
+            ("devbox", ".."),
+            ("devbox", "."),
+            ("devbox", "../escape"),
+            ("devbox", ""),
+        ] {
+            assert!(
+                SshHost::new(host, "192.0.2.10", "u", None, key_file).is_err(),
+                "host={host:?} key_file={key_file:?} must be rejected"
+            );
+        }
+        // Инъекция строки конфига в hostname/user: пробелы, '#', перевод строки.
+        assert!(SshHost::new("d", "bad host.lan", "u", None, "id").is_err());
+        assert!(SshHost::new("d", "host#x", "u", None, "id").is_err());
+        assert!(SshHost::new("d", "192.0.2.10", "root toor", None, "id").is_err());
+        assert!(SshHost::new("d", "192.0.2.10\nHost evil", "u", None, "id").is_err());
+        assert!(SshHost::new("d", "", "u", None, "id").is_err());
     }
 
     #[test]

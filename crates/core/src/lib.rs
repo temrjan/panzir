@@ -17,6 +17,7 @@ pub mod mountpoint;
 pub mod passphrase;
 pub mod registry;
 pub mod schedule;
+pub mod ssh;
 pub mod udisks;
 pub mod vault;
 
