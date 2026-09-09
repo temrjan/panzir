@@ -5,10 +5,11 @@
 
 use eframe::egui;
 use panzir_core::registry::VaultEntry;
+use panzir_core::ssh::IncludeStatus;
 use panzir_core::vault::{Label, VaultKind, VaultState};
 use secrecy::zeroize::Zeroize as _;
 
-use crate::app::{EnvLine, busy_message, kind_text, state_text};
+use crate::app::{EnvLine, SshCardStatus, SshConfirm, busy_message, kind_text, state_text};
 
 /// Начатое переименование: какую запись меняем и что уже набрано.
 pub struct RenameDraft {
@@ -30,6 +31,34 @@ pub struct UnlockDraft {
     pub text: String,
 }
 
+/// Начатое добавление SSH-хоста: для какой записи и что набрано.
+/// Поля — сырые строки; проверяет ядро (`SshHost::new`) при отправке.
+pub struct SshHostDraft {
+    /// Метка записи, к которой добавляют хоста.
+    pub target: Label,
+    /// Алиас (`Host`), как его наберут в командной строке.
+    pub host: String,
+    /// Адрес (`HostName`).
+    pub hostname: String,
+    /// Логин (`User`).
+    pub user: String,
+    /// Порт — пусто или число (`Port` пишется только при числе).
+    pub port: String,
+    /// Имя файла ключа внутри хранилища.
+    pub key_file: String,
+}
+
+/// Всё, что карточке нужно для секции SSH-связки (спека Ш-7).
+/// Собрано в одну структуру, чтобы сигнатуры рендера не расползались.
+pub struct SshCard<'a> {
+    /// Черновик добавления хоста.
+    pub draft: &'a mut Option<SshHostDraft>,
+    /// Статус связки — результат фоновой пробы.
+    pub status: &'a Option<SshCardStatus>,
+    /// Ожидающее подтверждение вставление/починка строки `Include`.
+    pub confirm: &'a mut Option<SshConfirm>,
+}
+
 /// Что человек попросил сделать.
 pub enum ListAction {
     /// Открыть хранилище набранной фразой.
@@ -47,6 +76,30 @@ pub enum ListAction {
     },
     /// Перейти на экран создания нового хранилища.
     StartCreate,
+    /// Добавить SSH-хоста к записи. Поля — сырые строки из черновика.
+    AddSshHost {
+        /// Метка записи.
+        target: Label,
+        /// Набранный алиас.
+        host: String,
+        /// Набранный адрес.
+        hostname: String,
+        /// Набранный логин.
+        user: String,
+        /// Набранный порт (пусто — без порта).
+        port: String,
+        /// Набранное имя файла ключа.
+        key_file: String,
+    },
+    /// Показать точную строку `Include` и спросить подтверждение.
+    AskSshInclude {
+        /// Метка записи.
+        target: Label,
+        /// `true` — починка `Shadowed` (поднять строку первой).
+        repair: bool,
+    },
+    /// Человек подтвердил вставку/починку строки `Include`.
+    ConfirmSshInclude,
 }
 
 /// Всё, что экрану нужно для отрисовки.
@@ -63,6 +116,12 @@ pub struct ListInput<'a> {
     pub rename: &'a mut Option<RenameDraft>,
     /// Начатый ввод парольной фразы.
     pub unlock: &'a mut Option<UnlockDraft>,
+    /// Начатое добавление SSH-хоста.
+    pub ssh_draft: &'a mut Option<SshHostDraft>,
+    /// Статус SSH-связки раскрытой карточки (результат пробы).
+    pub ssh_status: &'a Option<SshCardStatus>,
+    /// Ожидающее подтверждение вставление/починка строки `Include`.
+    pub ssh_confirm: &'a mut Option<SshConfirm>,
     /// Метка записи, чья карточка раскрыта. Раскрыта не более одной: операция
     /// всё равно идёт одна за раз, а два раскрытых поля пароля означали бы два
     /// секрета в памяти вместо одного.
@@ -94,6 +153,11 @@ pub fn show(ui: &mut egui::Ui, input: ListInput<'_>) -> Option<ListAction> {
         ui.label("Хранилищ пока нет");
     } else {
         for entry in input.entries {
+            let mut ssh = SshCard {
+                draft: &mut *input.ssh_draft,
+                status: input.ssh_status,
+                confirm: &mut *input.ssh_confirm,
+            };
             if let Some(a) = show_entry(
                 ui,
                 entry,
@@ -101,6 +165,7 @@ pub fn show(ui: &mut egui::Ui, input: ListInput<'_>) -> Option<ListAction> {
                 input.rename,
                 input.expanded,
                 input.unlock,
+                &mut ssh,
             ) {
                 action = Some(a);
             }
@@ -128,6 +193,7 @@ fn show_entry(
     rename: &mut Option<RenameDraft>,
     expanded: &mut Option<Label>,
     unlock: &mut Option<UnlockDraft>,
+    ssh: &mut SshCard,
 ) -> Option<ListAction> {
     let mut action = None;
     let label = entry.label().clone();
@@ -204,7 +270,7 @@ fn show_entry(
 
     if is_expanded
         && let Some(a) = ui
-            .indent(label.as_str(), |ui| show_card(ui, entry, busy, unlock))
+            .indent(label.as_str(), |ui| show_card(ui, entry, busy, unlock, ssh))
             .inner
     {
         action = Some(a);
@@ -219,6 +285,7 @@ fn show_card(
     entry: &VaultEntry,
     busy: bool,
     unlock: &mut Option<UnlockDraft>,
+    ssh: &mut SshCard,
 ) -> Option<ListAction> {
     match entry.kind() {
         VaultKind::File(path) => ui.label(format!("Файл: {}", path.display())),
@@ -244,7 +311,7 @@ fn show_card(
     }
 
     let label = entry.label().clone();
-    let mut action = None;
+    let mut action = show_ssh_section(ui, entry, busy, ssh);
 
     ui.add_enabled_ui(!busy, |ui| {
         if matches!(entry.state(), VaultState::Open { .. }) {
@@ -285,6 +352,188 @@ fn show_card(
             *unlock = Some(UnlockDraft {
                 target: label.clone(),
                 text: String::new(),
+            });
+        }
+    });
+    action
+}
+
+/// Секция SSH-связки на карточке (спека Ш-7): список хостов из реестра,
+/// статус строки `Include` из пробы, подтверждение вставки/починки и
+/// черновик добавления хоста.
+fn show_ssh_section(
+    ui: &mut egui::Ui,
+    entry: &VaultEntry,
+    busy: bool,
+    ssh: &mut SshCard,
+) -> Option<ListAction> {
+    let mut action = None;
+    let label = entry.label().clone();
+
+    ui.separator();
+    ui.label("SSH-связка:");
+    if entry.ssh_hosts().is_empty() {
+        ui.label("хостов нет");
+    } else {
+        for h in entry.ssh_hosts() {
+            let port = h.port.map_or(String::new(), |p| format!(":{p}"));
+            ui.label(format!(
+                "{} → {}@{}{} · ключ {}",
+                h.host, h.user, h.hostname, port, h.key_file
+            ));
+        }
+        // Контракт, видимый пользователю: закрытое хранилище — ключи
+        // недоступны (IdentityFile указывает в мёртвый симлинк).
+        if !matches!(entry.state(), VaultState::Open { .. }) {
+            ui.label("хранилище закрыто — ключи недоступны");
+        }
+
+        // Статус связки — результат пробы; `None` — проба ещё не вернулась,
+        // и кадр ничего не утверждает, вместо того чтобы соврать на кадр.
+        if let Some(status) = ssh
+            .status
+            .as_ref()
+            .filter(|s| s.label.as_str() == label.as_str())
+        {
+            if let Some(err) = &status.error {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("ваш ~/.ssh/config не прочитался: {err}"),
+                );
+            }
+            ui.add_enabled_ui(!busy, |ui| match status.include {
+                IncludeStatus::Ok => {
+                    ui.label("связка включена: строка Include — первая в ~/.ssh/config");
+                }
+                IncludeStatus::Missing => {
+                    if ui.button("Включить SSH-связку").clicked() {
+                        action = Some(ListAction::AskSshInclude {
+                            target: label.clone(),
+                            repair: false,
+                        });
+                    }
+                }
+                IncludeStatus::Shadowed => {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        "строка Include съехала ниже чужого блока Host/Match — \
+                         наши имена будут перехвачены",
+                    );
+                    if ui.button("Поднять строку первой").clicked() {
+                        action = Some(ListAction::AskSshInclude {
+                            target: label.clone(),
+                            repair: true,
+                        });
+                    }
+                }
+            });
+            if let Some(name) = &status.collision {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!(
+                        "имя «{name}» уже занято в вашем ~/.ssh/config — \
+                         переименуйте хоста, иначе сработает чужая запись"
+                    ),
+                );
+            }
+            // Резолюция по `ssh -G` — проверка по результату (К-7), только у
+            // открытого хранилища.
+            for r in &status.resolutions {
+                if r.ok {
+                    ui.label(format!("{}: ssh -G подтверждает связку", r.host));
+                } else if let Some(detail) = &r.detail {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("{}: {detail}", r.host));
+                } else {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!(
+                            "{}: ssh -G не подтверждает связку — нет нашего identityfile \
+                             или identitiesonly yes",
+                            r.host
+                        ),
+                    );
+                }
+            }
+        }
+
+        // Подтверждение: человек видит точную строку до записи в его config.
+        let confirming = ssh
+            .confirm
+            .as_ref()
+            .is_some_and(|c| c.target.as_str() == label.as_str());
+        if confirming {
+            if let Some(c) = ssh.confirm.as_ref() {
+                ui.label(if c.repair {
+                    "Строка будет поднята первой:"
+                } else {
+                    "В ваш ~/.ssh/config будет вставлена строка:"
+                });
+                ui.monospace(&c.line);
+            }
+            ui.add_enabled_ui(!busy, |ui| {
+                if ui.button("Подтвердить").clicked() {
+                    action = Some(ListAction::ConfirmSshInclude);
+                }
+                if ui.button("Отмена").clicked() {
+                    *ssh.confirm = None;
+                }
+            });
+        }
+    }
+
+    ui.add_enabled_ui(!busy, |ui| {
+        let drafting = ssh
+            .draft
+            .as_ref()
+            .is_some_and(|d| d.target.as_str() == label.as_str());
+        if drafting {
+            if let Some(d) = ssh.draft.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.label("Имя хоста:");
+                    ui.text_edit_singleline(&mut d.host);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Адрес:");
+                    ui.text_edit_singleline(&mut d.hostname);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Логин:");
+                    ui.text_edit_singleline(&mut d.user);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Порт (необязательно):");
+                    ui.text_edit_singleline(&mut d.port);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Файл ключа:");
+                    ui.text_edit_singleline(&mut d.key_file);
+                });
+            }
+            // Черновик здесь НЕ забираем: его снимает `app.rs`, и только если
+            // операция ушла в работу — как у переименования.
+            if ui.button("Сохранить хост").clicked()
+                && let Some(d) = ssh.draft.as_ref()
+            {
+                action = Some(ListAction::AddSshHost {
+                    target: d.target.clone(),
+                    host: d.host.clone(),
+                    hostname: d.hostname.clone(),
+                    user: d.user.clone(),
+                    port: d.port.clone(),
+                    key_file: d.key_file.clone(),
+                });
+            }
+            if ui.button("Отмена").clicked() {
+                *ssh.draft = None;
+            }
+        } else if ui.button("Добавить хост").clicked() {
+            *ssh.draft = Some(SshHostDraft {
+                target: label.clone(),
+                host: String::new(),
+                hostname: String::new(),
+                user: String::new(),
+                port: String::new(),
+                key_file: String::new(),
             });
         }
     });

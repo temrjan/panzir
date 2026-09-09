@@ -85,6 +85,12 @@ pub enum Error {
     #[error("HOME is unset or empty")]
     NoHome,
 
+    /// Ошибка SSH-связки (валидация полей хоста, запись сниппета, правка
+    /// `~/.ssh/config`). Разбор отказов ssh — внутри `ssh.rs`, сюда приходит
+    /// уже наш тип (карточка К-3).
+    #[error("ssh: {0}")]
+    Ssh(#[from] crate::ssh::SshError),
+
     /// Другой процесс panzir уже запущен (advisory flock не получен).
     #[error("panzir is already running")]
     AlreadyRunning,

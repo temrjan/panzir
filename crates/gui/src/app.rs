@@ -13,8 +13,9 @@ use eframe::egui;
 use panzir_core::create;
 use panzir_core::deps::{self, DepsReport};
 use panzir_core::lifecycle::{self, CloseDecision, close_decision};
-use panzir_core::registry::{Registry, VaultEntry};
+use panzir_core::registry::{Registry, SshHost, VaultEntry};
 use panzir_core::schedule::SystemdUser;
+use panzir_core::ssh::{self, IncludeStatus, SshError};
 use panzir_core::udisks::Udisks;
 use panzir_core::vault::{DEFAULT_AUTO_CLOSE, Label, VaultKind, VaultState, container_path};
 use panzir_core::{AuthRefusal, Error};
@@ -24,7 +25,7 @@ use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
 use crate::view_create::{self, CreateAction, CreateDraft};
-use crate::view_list::{self, ListAction, ListInput, RenameDraft, UnlockDraft};
+use crate::view_list::{self, ListAction, ListInput, RenameDraft, SshHostDraft, UnlockDraft};
 
 /// Сколько ждём завершения операции в тестах, прежде чем признать зависание.
 /// Не «пауза для стабилизации»: ожидание идёт по настоящему сигналу завершения
@@ -50,6 +51,47 @@ pub struct EnvLine {
     pub ok: bool,
     /// Что сделать, если не работает.
     pub hint: String,
+}
+
+/// Итог резолюции одного хоста через `ssh -G` (проверка по результату, К-7).
+/// Считается только для открытого хранилища.
+#[derive(Clone, Debug)]
+pub struct SshResolution {
+    /// Алиас хоста.
+    pub host: String,
+    /// `identitiesonly yes` и наш `identityfile` подтверждены резолюцией.
+    pub ok: bool,
+    /// Текст отказа `ssh -G` (не запустился/ошибка/таймаут), если был.
+    pub detail: Option<String>,
+}
+
+/// Статус SSH-связки раскрытой карточки — результат фоновой пробы: чтение
+/// `~/.ssh/config` плюс, для открытого хранилища, резолюция `ssh -G`.
+#[derive(Clone, Debug)]
+pub struct SshCardStatus {
+    /// Метка записи, к которой относится статус.
+    pub label: Label,
+    /// Где строка `Include` в config.
+    pub include: IncludeStatus,
+    /// Имя нашего хоста, уже занятое в чужом config (ворнинг по чтению).
+    pub collision: Option<String>,
+    /// Config существует, но не прочитался — отказ показывается, а не
+    /// проглатывается как «строки нет» (инвариант 10).
+    pub error: Option<String>,
+    /// Резолюция по хостам; пусто для закрытого хранилища.
+    pub resolutions: Vec<SshResolution>,
+}
+
+/// Подтверждение вставки/починки строки `Include`: человек видит точную
+/// строку до того, как мы пишем в его config (М-1).
+#[derive(Clone, Debug)]
+pub struct SshConfirm {
+    /// Метка записи.
+    pub target: Label,
+    /// `true` — починка `Shadowed` (поднять строку первой), `false` — вставка.
+    pub repair: bool,
+    /// Точная строка `Include` — показывается перед записью.
+    pub line: String,
 }
 
 /// Что окно просит у ядра. Все операции идут через одну дверь — [`App::spawn_op`].
@@ -100,6 +142,21 @@ enum Op {
         /// затирает себя при уничтожении.
         passphrase: SecretString,
     },
+    /// Добавить SSH-хоста к записи и перезаписать сниппет (спека Ш-7).
+    AddSshHost {
+        /// Метка записи.
+        label: Label,
+        /// Проверенный конструктором хост.
+        host: SshHost,
+    },
+    /// Вставить строку `Include` первой или поднять её (починка `Shadowed`).
+    /// Только по подтверждению: человек видел точную строку.
+    SshInclude {
+        /// Метка записи.
+        label: Label,
+        /// `true` — починка (М-1), `false` — вставка.
+        repair: bool,
+    },
 }
 
 /// Чем кончилась операция. Список приходит вместе с исходом: правка реестра и
@@ -108,6 +165,10 @@ enum Op {
 enum OpOutcome {
     /// Свежий список записей.
     Loaded(Vec<VaultEntry>),
+    /// Свежий список плюс ворнинг человеку: операция состоялась, но её
+    /// производная часть отказала (например, сниппет при открытии) —
+    /// молчать нельзя (инвариант 10), а отказом это не является.
+    LoadedWith(Vec<VaultEntry>, String),
     /// Операция отказала; строка уже переведена на человеческий язык.
     Failed(String),
 }
@@ -315,6 +376,22 @@ pub fn error_text(err: &Error) -> String {
                 "на файле {path} найдено {count} подключений вместо одного — это уже повреждение, закройте хранилище сторонними средствами"
             )
         }
+        Error::Ssh(SshError::InvalidField { field, value }) => {
+            let rule = match *field {
+                "host" | "key_file" => {
+                    "разрешены строчные буквы, цифры, точка, дефис и подчёркивание"
+                }
+                _ => "без пробелов и символа «#»",
+            };
+            format!("SSH-хост: поле «{field}» не подходит: «{value}» — {rule}")
+        }
+        Error::Ssh(SshError::Io(e)) => format!("SSH-связка: ошибка ввода-вывода: {e}"),
+        Error::Ssh(SshError::Query { host, status }) => {
+            format!("ssh -G {host} завершился с ошибкой ({status}) — связку показать не удалось")
+        }
+        Error::Ssh(SshError::QueryTimeout { host }) => {
+            format!("ssh -G {host} не ответил за отведённое время — связку показать не удалось")
+        }
     }
 }
 
@@ -377,6 +454,9 @@ pub struct App {
     rt: Runtime,
     registry_path: PathBuf,
     home: PathBuf,
+    /// Путь `~/.ssh/config` — параметром (инвариант 9), читает/пишет только
+    /// по запросу человека (вставка `Include` — по подтверждению).
+    ssh_config: PathBuf,
     /// Часы автозакрытия: окно только передаёт их в ядро.
     scheduler: SystemdUser,
     op_timeout: Duration,
@@ -391,10 +471,18 @@ pub struct App {
     /// Не блокирует кнопки: `pending` остаётся свободен для операций человека.
     reload_tick: Option<JoinHandle<OpOutcome>>,
     bus_probe: Option<JoinHandle<UdisksStatus>>,
+    /// Проба SSH-связки раскрытой карточки (чтение config).
+    ssh_probe: Option<JoinHandle<SshCardStatus>>,
+    /// Последний известный статус связки; инвалидируется при смене списка.
+    ssh_status: Option<SshCardStatus>,
     message: Option<String>,
     rename: Option<RenameDraft>,
     expanded: Option<Label>,
     unlock: Option<UnlockDraft>,
+    /// Черновик добавления SSH-хоста (не секрет — затирать не нужно).
+    ssh_draft: Option<SshHostDraft>,
+    /// Ожидающее подтверждение вставление/починка строки `Include`.
+    ssh_confirm: Option<SshConfirm>,
     screen: Screen,
     /// Черновик формы создания (секреты внутри). `Some` даже после ухода с
     /// формы — затирается единым местом (`forget_stale_passphrase`), когда
@@ -421,6 +509,7 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         registry_path: PathBuf,
         home: PathBuf,
+        ssh_config: PathBuf,
         closer: PathBuf,
         smoke_frames: Option<u32>,
         op_timeout: Duration,
@@ -431,6 +520,7 @@ impl App {
             rt,
             registry_path,
             home,
+            ssh_config,
             // Ждать бегущее закрытие в `disarm` — не дольше, чем операцию целиком.
             scheduler: SystemdUser::new(vec![closer.into()], op_timeout),
             op_timeout,
@@ -443,10 +533,14 @@ impl App {
             pending: None,
             reload_tick: None,
             bus_probe: None,
+            ssh_probe: None,
+            ssh_status: None,
             message: None,
             rename: None,
             expanded: None,
             unlock: None,
+            ssh_draft: None,
+            ssh_confirm: None,
             screen: Screen::List,
             create: None,
         };
@@ -488,12 +582,15 @@ impl App {
         }
         let path = self.registry_path.clone();
         let home = self.home.clone();
+        let ssh_config = self.ssh_config.clone();
         let scheduler = self.scheduler.clone();
         let limit = self.op_timeout;
         self.pending = Some(self.spawn_waking(ctx, async move {
             // Таймаут накрывает операцию ЦЕЛИКОМ, включая пробу: человеку не
             // важно, на каком шаге застряло, ему важно, что окно не висит.
-            match tokio::time::timeout(limit, run_op(&path, &home, &scheduler, op)).await {
+            match tokio::time::timeout(limit, run_op(&path, &home, &ssh_config, &scheduler, op))
+                .await
+            {
                 Ok(outcome) => outcome,
                 Err(_) => OpOutcome::Failed(format!(
                     "хранилище не откликнулось {}. Возможно, том занят другой программой. \
@@ -538,6 +635,69 @@ impl App {
         }));
     }
 
+    /// Проба SSH-связки раскрытой карточки: читает config и считает статус
+    /// строки `Include` и коллизию имён; для открытого хранилища — ещё и
+    /// резолюцию `ssh -G` по каждому хосту (К-7). Пробуждение окна — через
+    /// [`App::spawn_waking`], как у любой фоновой задачи (инвариант 8).
+    /// Резолюция зовётся с `config = None`: она обязана читать настоящий
+    /// config пользователя — в этом смысл сверки.
+    fn spawn_ssh_probe(
+        &mut self,
+        ctx: &egui::Context,
+        label: Label,
+        hosts: Vec<SshHost>,
+        resolve: bool,
+    ) {
+        if self.ssh_probe.is_some() {
+            return;
+        }
+        let config = self.ssh_config.clone();
+        let home = self.home.clone();
+        let timeout = self.op_timeout;
+        let config_dir = self
+            .registry_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        self.ssh_probe = Some(self.spawn_waking(ctx, async move {
+            let snippet = ssh::snippet_path(&config_dir, &label);
+            let line = ssh::include_line(&snippet);
+            let (text, error) = match tokio::fs::read_to_string(&config).await {
+                Ok(text) => (Some(text), None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+            let mut resolutions = Vec::new();
+            if resolve {
+                let symlink = panzir_core::mountpoint::symlink_path(&home, &label);
+                for h in &hosts {
+                    let expected = symlink.join(&h.key_file);
+                    resolutions.push(match ssh::ssh_g(&h.host, None, timeout).await {
+                        Ok(r) => SshResolution {
+                            ok: ssh::resolution_confirms(&r, &expected),
+                            host: h.host.clone(),
+                            detail: None,
+                        },
+                        Err(e) => SshResolution {
+                            ok: false,
+                            host: h.host.clone(),
+                            detail: Some(e.to_string()),
+                        },
+                    });
+                }
+            }
+            SshCardStatus {
+                include: ssh::include_status(text.as_deref(), &line),
+                collision: text
+                    .as_deref()
+                    .and_then(|t| ssh::detect_collision(t, &hosts)),
+                error,
+                resolutions,
+                label,
+            }
+        }));
+    }
+
     /// Снимает результаты завершившихся задач. Не блокирует.
     fn take_finished(&mut self) {
         if self.pending.as_ref().is_some_and(JoinHandle::is_finished)
@@ -562,6 +722,12 @@ impl App {
             self.udisks = Some(status);
             self.rebuild_env();
         }
+        if self.ssh_probe.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(handle) = self.ssh_probe.take()
+            && let Ok(status) = self.rt.block_on(handle)
+        {
+            self.ssh_status = Some(status);
+        }
     }
 
     fn apply(&mut self, outcome: Result<OpOutcome, tokio::task::JoinError>) {
@@ -569,6 +735,14 @@ impl App {
             Ok(OpOutcome::Loaded(entries)) => {
                 self.entries = entries;
                 self.message = None;
+                // Список сменился — статус связки устарел, карточка
+                // переспросит его следующим кадром.
+                self.ssh_status = None;
+            }
+            Ok(OpOutcome::LoadedWith(entries, note)) => {
+                self.entries = entries;
+                self.message = Some(note);
+                self.ssh_status = None;
             }
             Ok(OpOutcome::Failed(text)) => self.message = Some(text),
             Err(e) => {
@@ -748,6 +922,76 @@ impl App {
                 self.screen = Screen::Create;
                 self.create = Some(CreateDraft::default());
             }
+            ListAction::AddSshHost {
+                target,
+                host,
+                hostname,
+                user,
+                port,
+                key_file,
+            } => {
+                // Порт — опциональное поле: пусто → None, иначе число.
+                let port = match port.trim() {
+                    "" => None,
+                    raw => match raw.parse::<u16>() {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            self.message = Some(
+                                "порт не подходит: целое число от 1 до 65535, либо пусто"
+                                    .to_owned(),
+                            );
+                            return;
+                        }
+                    },
+                };
+                match SshHost::new(&host, &hostname, &user, port, &key_file) {
+                    Ok(host) => {
+                        // Черновик снимается только если операция началась —
+                        // как у переименования: набранное не пропадает молча.
+                        if self.spawn_op(
+                            ctx,
+                            Op::AddSshHost {
+                                label: target,
+                                host,
+                            },
+                        ) {
+                            self.ssh_draft = None;
+                        }
+                    }
+                    Err(e) => self.message = Some(error_text(&Error::from(e))),
+                }
+            }
+            ListAction::AskSshInclude { target, repair } => {
+                // Точная строка считается здесь, а не в виджете: человеку
+                // показывается ровно то, что уйдёт в его config.
+                let config_dir = self
+                    .registry_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf();
+                let line = ssh::include_line(&ssh::snippet_path(&config_dir, &target));
+                self.ssh_confirm = Some(SshConfirm {
+                    target,
+                    repair,
+                    line,
+                });
+            }
+            ListAction::ConfirmSshInclude => {
+                let Some(confirm) = self.ssh_confirm.clone() else {
+                    return;
+                };
+                // Черновик снимается, только если операция ушла в работу —
+                // как у переименования и добавления хоста.
+                if self.spawn_op(
+                    ctx,
+                    Op::SshInclude {
+                        label: confirm.target,
+                        repair: confirm.repair,
+                    },
+                ) {
+                    self.ssh_confirm = None;
+                }
+            }
         }
     }
 
@@ -840,6 +1084,14 @@ impl App {
         if let Some(handle) = self.reload_tick.take() {
             handle.abort();
         }
+        if let Some(handle) = self.ssh_probe.take()
+            && let Ok(status) = self
+                .rt
+                .block_on(async move { tokio::time::timeout(TEST_DEADLINE, handle).await })
+                .expect("проба SSH-связки не завершилась за отведённое время")
+        {
+            self.ssh_status = Some(status);
+        }
         if let Some(handle) = self.pending.take() {
             let outcome = self
                 .rt
@@ -878,6 +1130,9 @@ impl eframe::App for App {
                         rename: &mut self.rename,
                         expanded: &mut self.expanded,
                         unlock: &mut self.unlock,
+                        ssh_draft: &mut self.ssh_draft,
+                        ssh_status: &self.ssh_status,
+                        ssh_confirm: &mut self.ssh_confirm,
                     },
                 );
                 if let Some(action) = action {
@@ -898,6 +1153,22 @@ impl eframe::App for App {
         }
         self.forget_stale_passphrase();
 
+        // Проба связки — для раскрытой карточки с хостами, когда статус
+        // устарел (список сменился) или ещё не запрошен.
+        if self.screen == Screen::List
+            && self.ssh_probe.is_none()
+            && let Some(label) = self.expanded.clone()
+            && self.ssh_status.as_ref().is_none_or(|s| s.label != label)
+            && let Some(entry) = self.entries.iter().find(|e| e.label() == &label)
+            && !entry.ssh_hosts().is_empty()
+        {
+            let hosts = entry.ssh_hosts().to_vec();
+            // Резолюция `ssh -G` — только по открытому хранилищу: у закрытого
+            // она ничего не добавляет к «ключи недоступны».
+            let resolve = matches!(entry.state(), VaultState::Open { .. });
+            self.spawn_ssh_probe(ui.ctx(), label, hosts, resolve);
+        }
+
         self.tick_smoke(ui.ctx());
     }
 }
@@ -905,6 +1176,7 @@ impl eframe::App for App {
 async fn run_op(
     path: &std::path::Path,
     home: &std::path::Path,
+    ssh_config: &std::path::Path,
     scheduler: &SystemdUser,
     op: Op,
 ) -> OpOutcome {
@@ -941,6 +1213,84 @@ async fn run_op(
             size_bytes,
             passphrase,
         } => run_create(path, home, &label, &container, size_bytes, &passphrase).await,
+        Op::AddSshHost { label, host } => run_add_ssh_host(path, home, &label, host).await,
+        Op::SshInclude { label, repair } => run_ssh_include(path, ssh_config, &label, repair).await,
+    }
+}
+
+/// Вставка/починка строки `Include` — по подтверждению (М-1): чужой config
+/// правится только здесь, содержимое и права сохраняет ядро (М-2, М-3).
+/// Реестр не меняется; перечитываем его, чтобы инвалидировать статус связки.
+async fn run_ssh_include(
+    path: &std::path::Path,
+    ssh_config: &std::path::Path,
+    label: &Label,
+    repair: bool,
+) -> OpOutcome {
+    let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let snippet = ssh::snippet_path(config_dir, label);
+    let result = if repair {
+        ssh::repair_include(ssh_config, &snippet).await
+    } else {
+        ssh::apply_include(ssh_config, &snippet).await
+    };
+    match result {
+        Ok(_) => match Registry::load_from(path).await {
+            Ok(reg) => OpOutcome::Loaded(reg.entries().to_vec()),
+            Err(e) => OpOutcome::Failed(error_text(&e)),
+        },
+        Err(e) => OpOutcome::Failed(error_text(&Error::from(e))),
+    }
+}
+
+/// Добавление SSH-хоста: правда — в реестр под локом, затем сниппет
+/// перезаписывается как производная (спека Ш-7). Отказ записи сниппета не
+/// откатывает реестр: при открытии сниппет пересоздаётся из реестра.
+async fn run_add_ssh_host(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    label: &Label,
+    host: SshHost,
+) -> OpOutcome {
+    let written = Registry::with_write_lock_at(path, {
+        let label = label.clone();
+        move |r| {
+            let entry = r
+                .entries_mut()
+                .iter_mut()
+                .find(|e| e.label().as_str() == label.as_str())
+                .ok_or_else(|| Error::VaultNotFound(label.as_str().to_owned()))?;
+            entry.add_ssh_host(host);
+            Ok(r.entries().to_vec())
+        }
+    })
+    .await;
+    let entries = match written {
+        Ok(entries) => entries,
+        Err(e) => return OpOutcome::Failed(error_text(&e)),
+    };
+
+    let Some(entry) = entries
+        .iter()
+        .find(|e| e.label().as_str() == label.as_str())
+    else {
+        return OpOutcome::Loaded(entries);
+    };
+    let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let snippet = panzir_core::ssh::snippet_path(config_dir, label);
+    let symlink = panzir_core::mountpoint::symlink_path(home, label);
+    let text = panzir_core::ssh::render_snippet(entry.ssh_hosts(), &symlink);
+    match panzir_core::ssh::write_snippet_atomic(&snippet, &text).await {
+        Ok(()) => OpOutcome::Loaded(entries),
+        // Хост уже записан в реестр — это успех с отказавшей производной,
+        // а не отказ операции: список обновляем, ворнинг говорим (инв. 10).
+        Err(e) => OpOutcome::LoadedWith(
+            entries,
+            format!(
+                "хост записан в список, но сниппет не обновился: {}",
+                error_text(&Error::from(e))
+            ),
+        ),
     }
 }
 
@@ -966,7 +1316,7 @@ async fn run_open(
         // Точка монтирования — из ответа udisks2, не угаданная: путь симлинка
         // сюда не подставляется (спека п.2 скоупа).
         Ok(opened) => {
-            set_state_then_read(
+            let outcome = set_state_then_read(
                 path,
                 label,
                 VaultState::Open {
@@ -974,7 +1324,35 @@ async fn run_open(
                     until: opened.until,
                 },
             )
-            .await
+            .await;
+            // Ш-7: сниппет пересоздаётся из реестра при каждом открытии —
+            // он производная, а не правда. Сверка связки и `ssh -G` по
+            // хостам показываются пробой карточки (список сменился → статус
+            // инвалидирован → переспрос).
+            let OpOutcome::Loaded(entries) = &outcome else {
+                return outcome;
+            };
+            let Some(entry) = entries
+                .iter()
+                .find(|e| e.label().as_str() == label.as_str())
+                .filter(|e| !e.ssh_hosts().is_empty())
+            else {
+                return outcome;
+            };
+            let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let snippet = ssh::snippet_path(config_dir, label);
+            let symlink = panzir_core::mountpoint::symlink_path(home, label);
+            let text = ssh::render_snippet(entry.ssh_hosts(), &symlink);
+            match ssh::write_snippet_atomic(&snippet, &text).await {
+                Ok(()) => outcome,
+                Err(e) => OpOutcome::LoadedWith(
+                    entries.clone(),
+                    format!(
+                        "хранилище открыто, но SSH-сниппет не обновился: {}",
+                        error_text(&Error::from(e))
+                    ),
+                ),
+            }
         }
         Err(e) => OpOutcome::Failed(error_text(&e)),
     }
@@ -1332,6 +1710,18 @@ mod tests {
                 path: "/tmp/x.vault".to_owned(),
                 count: 2,
             },
+            Error::Ssh(SshError::InvalidField {
+                field: "host",
+                value: "Bad Host".to_owned(),
+            }),
+            Error::Ssh(SshError::Io(std::io::Error::other("проба"))),
+            Error::Ssh(SshError::Query {
+                host: "devbox".to_owned(),
+                status: "exit status: 255".to_owned(),
+            }),
+            Error::Ssh(SshError::QueryTimeout {
+                host: "devbox".to_owned(),
+            }),
         ]
     }
 
@@ -1977,19 +2367,382 @@ mod tests {
             .parent()
             .expect("у фикстуры есть каталог")
             .to_path_buf();
-        let mut harness = Harness::new_eframe(move |cc| {
-            App::new(
-                cc,
-                registry.clone(),
-                home.clone(),
-                PathBuf::from("/bin/true"),
-                None,
-                Duration::from_secs(5),
-            )
-        });
+        let ssh_config = home.join(".ssh").join("config");
+        let mut harness = egui_kittest::HarnessBuilder::default()
+            // Реактивное окно: завершение каждой фоновой задачи — отдельный
+            // немедленный repaint (инвариант 8). Кадр после подтверждения
+            // связки видит пачку: конец операции + конец переспроса статуса;
+            // четырёх шагов по умолчанию на это не хватает. Это конечные
+            // всплески, не вечный repaint: run() всё равно останавливается,
+            // когда задачи кончились.
+            .with_max_steps(64)
+            .build_eframe(move |cc| {
+                App::new(
+                    cc,
+                    registry.clone(),
+                    home.clone(),
+                    ssh_config.clone(),
+                    PathBuf::from("/bin/true"),
+                    None,
+                    Duration::from_secs(5),
+                )
+            });
         harness.state_mut().block_until_idle();
         harness.run();
         harness
+    }
+
+    // ---------- Ш-7: добавление SSH-хоста с карточки ----------
+
+    /// Раскрыть карточку первой записи и начать черновик добавления хоста.
+    fn start_ssh_draft(harness: &mut Harness<'static, App>) {
+        harness
+            .get_all_by_label("Подробнее")
+            .next()
+            .expect("кнопка раскрытия первой записи")
+            .click();
+        harness.run();
+        harness.get_by_label("Добавить хост").click();
+        harness.run();
+    }
+
+    fn fill_ssh_draft(harness: &mut Harness<'static, App>, host: &str, port: &str) {
+        let mut draft = harness
+            .state_mut()
+            .ssh_draft
+            .take()
+            .expect("черновик хоста");
+        draft.host = host.to_owned();
+        draft.hostname = "192.0.2.10".to_owned();
+        draft.user = "devbox".to_owned();
+        draft.port = port.to_owned();
+        draft.key_file = "id_ed25519".to_owned();
+        harness.state_mut().ssh_draft = Some(draft);
+    }
+
+    #[test]
+    fn adding_ssh_host_writes_registry_and_snippet() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_ssh_draft(&mut harness);
+        fill_ssh_draft(&mut harness, "devbox", "9281");
+
+        harness.get_by_label("Сохранить хост").click();
+        harness.run();
+        harness.state_mut().block_until_idle();
+        harness.run();
+
+        // Правда — в реестре.
+        let text = std::fs::read_to_string(dir.path().join("vaults.toml")).expect("registry");
+        assert!(
+            text.contains("[[vaults.ssh_hosts]]"),
+            "host must be stored:\n{text}"
+        );
+        assert!(text.contains("port = 9281"), "port must be stored:\n{text}");
+        // Сниппет — производная, записана рядом с реестром, 0600.
+        let snippet = dir.path().join("ssh-t-alpha.conf");
+        let content = std::fs::read_to_string(&snippet).expect("snippet written");
+        assert!(content.contains("Host devbox\n"), "snippet:\n{content}");
+        assert!(
+            content.contains("IdentitiesOnly yes\n"),
+            "snippet:\n{content}"
+        );
+        assert!(
+            content.contains(&format!(
+                "IdentityFile {}/panzir-t-alpha/id_ed25519\n",
+                dir.path().display()
+            )),
+            "snippet:\n{content}"
+        );
+        // Карточка показывает добавленного хоста.
+        harness.get_by_label_contains("devbox");
+    }
+
+    #[test]
+    fn invalid_ssh_host_field_is_refused_with_message_and_draft_kept() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_ssh_draft(&mut harness);
+        fill_ssh_draft(&mut harness, "Bad Host", "9281");
+
+        harness.get_by_label("Сохранить хост").click();
+        harness.run();
+
+        harness.get_by_label_contains("не подходит");
+        assert!(
+            harness.state().ssh_draft.is_some(),
+            "черновик обязан пережить отказ валидации — иначе набранное пропало молча"
+        );
+        // Реестр не тронут.
+        let text = std::fs::read_to_string(dir.path().join("vaults.toml")).expect("registry");
+        assert!(
+            !text.contains("ssh_hosts"),
+            "registry must stay clean:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unparsable_ssh_port_is_refused_with_message() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_ssh_draft(&mut harness);
+        fill_ssh_draft(&mut harness, "devbox", "не число");
+
+        harness.get_by_label("Сохранить хост").click();
+        harness.run();
+
+        harness.get_by_label_contains("порт");
+        assert!(harness.state().ssh_draft.is_some());
+    }
+
+    #[test]
+    fn ssh_host_without_port_is_stored_without_port() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_ssh_draft(&mut harness);
+        fill_ssh_draft(&mut harness, "devbox", "");
+
+        harness.get_by_label("Сохранить хост").click();
+        harness.run();
+        harness.state_mut().block_until_idle();
+        harness.run();
+
+        let content =
+            std::fs::read_to_string(dir.path().join("ssh-t-alpha.conf")).expect("snippet");
+        assert!(
+            !content.contains("Port"),
+            "no Port line expected:\n{content}"
+        );
+    }
+
+    // ---------- Ш-7, шаг 3: вставка Include по подтверждению ----------
+
+    /// Фикстура: одна запись t-alpha (файл, закрыто) с SSH-хостом devbox.
+    /// Возвращает пути реестра и config, который пойдёт в окно.
+    fn fixture_ssh(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let registry = dir.join("vaults.toml");
+        let container = dir.join("t-alpha.vault");
+        std::fs::write(&container, b"").expect("создать файл-пустышку");
+
+        let rt = Runtime::new().expect("рантайм для фикстуры");
+        rt.block_on(Registry::with_write_lock_at(&registry, |r| {
+            let mut e = VaultEntry::new(
+                Label::new("t-alpha").expect("метка"),
+                VaultKind::File(container.clone()),
+                VaultState::Closed,
+            );
+            e.add_ssh_host(
+                SshHost::new("devbox", "192.0.2.10", "devbox", None, "id_ed25519")
+                    .expect("valid host"),
+            );
+            r.add(e)
+        }))
+        .expect("записать фикстуру");
+        (registry, dir.join(".ssh").join("config"))
+    }
+
+    fn expand_first_card(harness: &mut Harness<'static, App>) {
+        harness
+            .get_all_by_label("Подробнее")
+            .next()
+            .expect("кнопка раскрытия первой записи")
+            .click();
+        harness.run();
+    }
+
+    /// Кадр → дождаться фоновых задач → кадр.
+    fn settle(harness: &mut Harness<'static, App>) {
+        harness.run();
+        harness.state_mut().block_until_idle();
+        harness.run();
+    }
+
+    #[test]
+    fn include_insertion_shows_exact_line_and_writes_only_after_confirm() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let (registry, config) = fixture_ssh(dir.path());
+        std::fs::create_dir(config.parent().expect(".ssh")).expect("mkdir .ssh");
+        std::fs::write(&config, "# мой конфиг\n").expect("чужой config");
+        let mut harness = harness_at(registry);
+        let line = format!("Include {}/ssh-t-alpha.conf", dir.path().display());
+
+        expand_first_card(&mut harness);
+        settle(&mut harness);
+
+        harness.get_by_label("Включить SSH-связку").click();
+        harness.run();
+        // Точная строка показана ДО записи — и записи без подтверждения нет.
+        harness.get_by_label_contains(&line);
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config"),
+            "# мой конфиг\n",
+            "без подтверждения чужой config не трогаем"
+        );
+
+        harness.get_by_label("Подтвердить").click();
+        settle(&mut harness);
+        settle(&mut harness);
+
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config"),
+            format!("{line}\n# мой конфиг\n")
+        );
+        harness.get_by_label_contains("связка включена");
+    }
+
+    #[test]
+    fn shadowed_include_warns_and_repair_moves_line_first() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let (registry, config) = fixture_ssh(dir.path());
+        std::fs::create_dir(config.parent().expect(".ssh")).expect("mkdir .ssh");
+        let line = format!("Include {}/ssh-t-alpha.conf", dir.path().display());
+        let foreign = "Host *\n    ServerAliveInterval 30\n";
+        std::fs::write(&config, format!("{foreign}{line}\n")).expect("shadowed config");
+        let mut harness = harness_at(registry);
+
+        expand_first_card(&mut harness);
+        settle(&mut harness);
+
+        harness.get_by_label_contains("съехала");
+        harness.get_by_label("Поднять строку первой").click();
+        harness.run();
+        harness.get_by_label_contains(&line);
+
+        harness.get_by_label("Подтвердить").click();
+        settle(&mut harness);
+
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config"),
+            format!("{line}\n{foreign}"),
+            "строка поднята первой, чужое содержимое байт-в-байт"
+        );
+    }
+
+    #[test]
+    fn foreign_host_with_same_name_shows_collision_warning() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let (registry, config) = fixture_ssh(dir.path());
+        std::fs::create_dir(config.parent().expect(".ssh")).expect("mkdir .ssh");
+        std::fs::write(&config, "Host devbox\n    HostName 203.0.113.9\n").expect("config");
+        let mut harness = harness_at(registry);
+
+        expand_first_card(&mut harness);
+        settle(&mut harness);
+
+        harness.get_by_label_contains("уже занято");
+    }
+
+    #[test]
+    fn closed_vault_card_says_keys_unavailable() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let (registry, _config) = fixture_ssh(dir.path());
+        let mut harness = harness_at(registry);
+
+        expand_first_card(&mut harness);
+        harness.run();
+
+        harness.get_by_label_contains("ключи недоступны");
+    }
+
+    // ---------- Ш-7, шаг 4: резолюция ssh -G на карточке ----------
+
+    /// Фикстура: запись t-alpha ОТКРЫТА (симуляция — без udisks), с хостом
+    /// devbox. Проба с резолюцией в харнессе не бежит (звала бы настоящий
+    /// ssh против настоящего config): статус подставляется в состояние
+    /// напрямую, а механику `ssh -G` покрывают юниты разбора и Т-5.
+    fn fixture_ssh_open(dir: &Path) -> std::path::PathBuf {
+        let registry = dir.join("vaults.toml");
+        let container = dir.join("t-alpha.vault");
+        std::fs::write(&container, b"").expect("создать файл-пустышку");
+
+        let rt = Runtime::new().expect("рантайм для фикстуры");
+        rt.block_on(Registry::with_write_lock_at(&registry, |r| {
+            let mut e = VaultEntry::new(
+                Label::new("t-alpha").expect("метка"),
+                VaultKind::File(container.clone()),
+                VaultState::Closed,
+            );
+            e.add_ssh_host(
+                SshHost::new("devbox", "192.0.2.10", "devbox", None, "id_ed25519")
+                    .expect("valid host"),
+            );
+            e.set_state(VaultState::Open {
+                mount_point: dir.join("mnt"),
+                until: None,
+            })
+            .expect("closed -> open");
+            r.add(e)
+        }))
+        .expect("записать фикстуру");
+        registry
+    }
+
+    fn inject_ssh_status(harness: &mut Harness<'static, App>, resolutions: Vec<SshResolution>) {
+        harness.state_mut().ssh_status = Some(SshCardStatus {
+            label: Label::new("t-alpha").expect("метка"),
+            include: IncludeStatus::Ok,
+            collision: None,
+            error: None,
+            resolutions,
+        });
+    }
+
+    #[test]
+    fn open_vault_card_shows_confirmed_resolution() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture_ssh_open(dir.path()));
+        inject_ssh_status(
+            &mut harness,
+            vec![SshResolution {
+                host: "devbox".to_owned(),
+                ok: true,
+                detail: None,
+            }],
+        );
+
+        expand_first_card(&mut harness);
+        harness.run();
+
+        harness.get_by_label_contains("devbox: ssh -G подтверждает связку");
+        harness.get_by_label_contains("связка включена");
+    }
+
+    #[test]
+    fn open_vault_card_warns_when_resolution_not_confirmed() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture_ssh_open(dir.path()));
+        inject_ssh_status(
+            &mut harness,
+            vec![SshResolution {
+                host: "devbox".to_owned(),
+                ok: false,
+                detail: None,
+            }],
+        );
+
+        expand_first_card(&mut harness);
+        harness.run();
+
+        harness.get_by_label_contains("devbox: ssh -G не подтверждает связку");
+    }
+
+    #[test]
+    fn open_vault_card_shows_ssh_g_failure_text() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture_ssh_open(dir.path()));
+        inject_ssh_status(
+            &mut harness,
+            vec![SshResolution {
+                host: "devbox".to_owned(),
+                ok: false,
+                detail: Some("ssh -G devbox timed out".to_owned()),
+            }],
+        );
+
+        expand_first_card(&mut harness);
+        harness.run();
+
+        harness.get_by_label_contains("devbox: ssh -G devbox timed out");
     }
 
     #[test]

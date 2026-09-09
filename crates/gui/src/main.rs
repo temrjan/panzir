@@ -95,6 +95,10 @@ fn run_window(registry_path: PathBuf, home: PathBuf) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Путь `~/.ssh/config` определяется здесь, в единственной встрече с
+    // системой, и приходит в окно параметром (инвариант 9): тест подставляет
+    // свой, настоящий config разработчика прогонами не трогается.
+    let ssh_config = home.join(".ssh").join("config");
     // Единственное чтение этой переменной: разбор — в чистой функции, иначе
     // её нечем проверить (подменить переменную в тесте не даёт
     // `unsafe_code = "forbid"`).
@@ -116,6 +120,7 @@ fn run_window(registry_path: PathBuf, home: PathBuf) -> ExitCode {
                 cc,
                 registry_path,
                 home,
+                ssh_config,
                 closer,
                 smoke_frames,
                 OP_TIMEOUT,

@@ -15,6 +15,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt as _;
 use tokio::task;
 
+use crate::ssh::SshError;
 use crate::vault::{DEFAULT_AUTO_CLOSE, Label, VaultKind, VaultState};
 use crate::{Error, Result};
 
@@ -33,6 +34,9 @@ pub struct VaultEntry {
     /// Момент первой неудачи текущей серии, секунды Unix — карточке есть что
     /// показать («не закрывается с …»).
     close_deferred_since: Option<u64>,
+    /// SSH-хосты хранилища (спека Ш-7, Р-2: реестр — единственная правда;
+    /// сниппет — перезаписываемая производная).
+    ssh_hosts: Vec<SshHost>,
 }
 
 impl VaultEntry {
@@ -45,7 +49,19 @@ impl VaultEntry {
             auto_close: Some(DEFAULT_AUTO_CLOSE),
             close_attempts: 0,
             close_deferred_since: None,
+            ssh_hosts: Vec::new(),
         }
+    }
+
+    /// SSH-хосты хранилища (спека Ш-7).
+    pub fn ssh_hosts(&self) -> &[SshHost] {
+        &self.ssh_hosts
+    }
+
+    /// Добавить SSH-хоста (внутри [`Registry::with_write_lock`]). Поля уже
+    /// проверены конструктором [`SshHost::new`].
+    pub fn add_ssh_host(&mut self, host: SshHost) {
+        self.ssh_hosts.push(host);
     }
 
     /// Сколько раз подряд автозакрытие отступило перед занятым томом.
@@ -169,6 +185,87 @@ pub struct Registry {
     entries: Vec<VaultEntry>,
 }
 
+/// SSH-хост хранилища (спека Ш-7): одна Host-запись генерируемого сниппета.
+/// Хранится в реестре (Р-2) — реестр единственная правда; сниппет
+/// `~/.config/panzir/ssh-<метка>.conf` — перезаписываемая производная.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHost {
+    /// Алиас из строки `Host` — то, что пользователь набирает: `ssh devbox`.
+    pub host: String,
+    /// Адрес (`HostName`).
+    pub hostname: String,
+    /// Логин (`User`).
+    pub user: String,
+    /// Порт (`Port`); `None` — строка не пишется, действует дефолт ssh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Имя файла ключа внутри хранилища (basename); полный путь строится
+    /// через симлинк `~/panzir-<метка>` при рендере сниппета.
+    pub key_file: String,
+}
+
+impl SshHost {
+    /// Проверить поля и собрать запись.
+    ///
+    /// `host` и `key_file` — белый список `[a-z0-9._-]` (образец [`Label`]):
+    /// оба попадают в генерируемый конфиг, `key_file` ещё и в путь.
+    /// `hostname` и `user` — непустые строки без пробельных символов и `#`
+    /// (иначе — инъекция лишней строки в генерируемый конфиг).
+    ///
+    /// # Errors
+    /// [`SshError::InvalidField`] с именем отвергнутого поля.
+    pub fn new(
+        host: &str,
+        hostname: &str,
+        user: &str,
+        port: Option<u16>,
+        key_file: &str,
+    ) -> std::result::Result<Self, SshError> {
+        // Белый список [a-z0-9._-]; «.»/«..» отвергаются — это выход за
+        // пределы каталога хранилища при join в путь ключа.
+        fn strict(field: &'static str, value: &str) -> std::result::Result<(), SshError> {
+            let ok = !value.is_empty()
+                && value != "."
+                && value != ".."
+                && value.chars().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+                });
+            if ok {
+                Ok(())
+            } else {
+                Err(SshError::InvalidField {
+                    field,
+                    value: value.to_owned(),
+                })
+            }
+        }
+        // Непустая строка без пробельных символов и '#': иначе значение
+        // ломает строку генерируемого конфига или начинает комментарий.
+        fn loose(field: &'static str, value: &str) -> std::result::Result<(), SshError> {
+            let ok = !value.is_empty() && value.chars().all(|c| !c.is_whitespace() && c != '#');
+            if ok {
+                Ok(())
+            } else {
+                Err(SshError::InvalidField {
+                    field,
+                    value: value.to_owned(),
+                })
+            }
+        }
+        strict("host", host)?;
+        loose("hostname", hostname)?;
+        loose("user", user)?;
+        strict("key_file", key_file)?;
+        Ok(Self {
+            host: host.to_owned(),
+            hostname: hostname.to_owned(),
+            user: user.to_owned(),
+            port,
+            key_file: key_file.to_owned(),
+        })
+    }
+}
+
 /// Представление реестра на диске.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredRegistry {
@@ -190,6 +287,11 @@ struct StoredEntry {
     close_attempts: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     close_deferred_since: Option<u64>,
+    /// Отсутствует в файлах до SSH-связки → пустой список, миграции нет.
+    /// Последнее поле: массив таблиц `[[vaults.ssh_hosts]]` обязан идти после
+    /// скаляров и таблицы `[vaults.state]`, иначе TOML не сходится.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ssh_hosts: Vec<SshHost>,
 }
 
 fn is_zero(n: &u8) -> bool {
@@ -296,7 +398,7 @@ impl Registry {
             .vaults
             .into_iter()
             .map(|v| {
-                Ok(VaultEntry {
+                let entry = VaultEntry {
                     label: Label::new(&v.label)?,
                     kind: match v.kind {
                         StoredKind::File { path } => VaultKind::File(path),
@@ -312,7 +414,15 @@ impl Registry {
                     auto_close: v.auto_close_sec.into(),
                     close_attempts: v.close_attempts,
                     close_deferred_since: v.close_deferred_since,
-                })
+                    ssh_hosts: v.ssh_hosts,
+                };
+                // Граница доверия: реестр мог быть правлен руками. Поля,
+                // попадающие в генерируемый конфиг, обязаны пройти ту же
+                // валидацию, что и ввод из окна.
+                for h in &entry.ssh_hosts {
+                    SshHost::new(&h.host, &h.hostname, &h.user, h.port, &h.key_file)?;
+                }
+                Ok(entry)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -434,6 +544,7 @@ impl Registry {
                     auto_close_sec: e.auto_close.into(),
                     close_attempts: e.close_attempts,
                     close_deferred_since: e.close_deferred_since,
+                    ssh_hosts: e.ssh_hosts.clone(),
                 })
                 .collect(),
         };
@@ -532,6 +643,127 @@ mod tests {
             VaultKind::File(PathBuf::from(format!("/tmp/{label}.vault"))),
             VaultState::Closed,
         )
+    }
+
+    /// Реестр, правленный руками с невалидным хостом, отвергается на границе
+    /// чтения: иначе произвольная строка уехала бы в генерируемый конфиг
+    /// в обход конструктора (ревью Гейта-2, минор №2).
+    #[tokio::test]
+    async fn hand_edited_registry_with_invalid_ssh_host_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        tokio::fs::write(
+            &path,
+            "[[vaults]]\nlabel = \"work\"\nkind = \"file\"\npath = \"/tmp/work.vault\"\n\
+             [vaults.state]\nclosed = {}\n\n\
+             [[vaults.ssh_hosts]]\nhost = \"Bad Host\"\nhostname = \"192.0.2.10\"\n\
+             user = \"u\"\nkey_file = \"id\"\n",
+        )
+        .await
+        .expect("write hand-edited registry");
+        let err = Registry::load_from(&path)
+            .await
+            .expect_err("invalid host must fail load");
+        assert!(
+            matches!(err, Error::Ssh(_)),
+            "expected Ssh error, got {err:?}"
+        );
+    }
+
+    /// SSH-хосты хранятся в реестре массивом таблиц и переживают
+    /// запись/чтение; старый файл без ключа читается с пустым списком.
+    #[tokio::test]
+    async fn ssh_hosts_roundtrip_and_absent_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        Registry::with_write_lock_at(&path, |r| {
+            let mut a = entry("a");
+            a.add_ssh_host(
+                SshHost::new("devbox", "192.0.2.10", "devbox", Some(9281), "id_ed25519")
+                    .expect("valid host"),
+            );
+            a.add_ssh_host(
+                SshHost::new("nas", "nas.lan", "root", None, "id_nas").expect("valid host"),
+            );
+            r.add(a)?;
+            r.add(entry("b"))
+        })
+        .await
+        .expect("write");
+        let text = tokio::fs::read_to_string(&path).await.expect("read");
+        assert_eq!(
+            text.matches("[[vaults.ssh_hosts]]").count(),
+            2,
+            "hosts must be an array of tables, got:\n{text}"
+        );
+        assert!(
+            text.contains("port = 9281"),
+            "port must roundtrip, got:\n{text}"
+        );
+        let reg = Registry::load_from(&path).await.expect("reload");
+        let a = &reg.entries()[0];
+        assert_eq!(a.ssh_hosts().len(), 2);
+        assert_eq!(a.ssh_hosts()[0].host, "devbox");
+        assert_eq!(a.ssh_hosts()[0].port, Some(9281));
+        assert_eq!(a.ssh_hosts()[1].host, "nas");
+        assert_eq!(a.ssh_hosts()[1].port, None);
+        assert!(
+            reg.entries()[1].ssh_hosts().is_empty(),
+            "entry without hosts stays empty"
+        );
+    }
+
+    /// Файл времён до SSH-связки (ключа `ssh_hosts` нет) читается без
+    /// миграции — список хостов пуст.
+    #[tokio::test]
+    async fn load_registry_without_ssh_hosts_uses_empty_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        tokio::fs::write(
+            &path,
+            "[[vaults]]\nlabel = \"work\"\nkind = \"file\"\npath = \"/tmp/work.vault\"\n\
+             [vaults.state]\nclosed = {}\n",
+        )
+        .await
+        .expect("write old-format registry");
+        let reg = Registry::load_from(&path)
+            .await
+            .expect("old file must parse");
+        assert!(reg.entries()[0].ssh_hosts().is_empty());
+    }
+
+    #[test]
+    fn ssh_host_accepts_valid_fields() {
+        let h = SshHost::new("devbox", "192.0.2.10", "devbox", Some(9281), "id_ed25519")
+            .expect("valid host");
+        assert_eq!(h.port, Some(9281));
+        let h = SshHost::new("my_host.1", "nas.lan", "root", None, "id_nas").expect("valid");
+        assert_eq!(h.port, None);
+    }
+
+    #[test]
+    fn ssh_host_rejects_dangerous_input() {
+        // Белый список [a-z0-9._-] для host/key_file; «.»/«..» — выход из каталога.
+        for (host, key_file) in [
+            ("", "id"),
+            ("Dev Box", "id"),
+            ("dev/box", "id"),
+            ("devbox", ".."),
+            ("devbox", "."),
+            ("devbox", "../escape"),
+            ("devbox", ""),
+        ] {
+            assert!(
+                SshHost::new(host, "192.0.2.10", "u", None, key_file).is_err(),
+                "host={host:?} key_file={key_file:?} must be rejected"
+            );
+        }
+        // Инъекция строки конфига в hostname/user: пробелы, '#', перевод строки.
+        assert!(SshHost::new("d", "bad host.lan", "u", None, "id").is_err());
+        assert!(SshHost::new("d", "host#x", "u", None, "id").is_err());
+        assert!(SshHost::new("d", "192.0.2.10", "root toor", None, "id").is_err());
+        assert!(SshHost::new("d", "192.0.2.10\nHost evil", "u", None, "id").is_err());
+        assert!(SshHost::new("d", "", "u", None, "id").is_err());
     }
 
     #[test]
