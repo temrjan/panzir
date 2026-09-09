@@ -28,6 +28,20 @@ pub enum SshError {
     /// Ошибка ввода-вывода при записи сниппета или правке config.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// `ssh -G` завершился с ошибкой.
+    #[error("ssh -G {host} failed: {status}")]
+    Query {
+        /// Хост, которого резолвили.
+        host: String,
+        /// Код завершения.
+        status: String,
+    },
+    /// `ssh -G` не ответил за отведённое время.
+    #[error("ssh -G {host} timed out")]
+    QueryTimeout {
+        /// Хост, которого резолвили.
+        host: String,
+    },
 }
 
 /// Статус строки `Include` в `~/.ssh/config`.
@@ -260,6 +274,82 @@ async fn write_config_preserving_mode(path: &Path, text: &str) -> Result<(), Ssh
     write_atomic(path, text, mode).await
 }
 
+/// Резолюция `ssh -G <host>` — что ssh реально разрешил (проверка по
+/// результату, К-7: «команда не упала» ничего не значит).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedHost {
+    /// Все строки `identityfile` из вывода, в порядке вывода.
+    pub identity_files: Vec<String>,
+    /// `identitiesonly yes` в выводе.
+    pub identities_only: bool,
+}
+
+/// Разбор вывода `ssh -G` (шов «текст на входе», как `holders_from_entries`).
+#[must_use]
+pub fn parse_ssh_g(output: &str) -> ResolvedHost {
+    let mut resolved = ResolvedHost {
+        identity_files: Vec::new(),
+        identities_only: false,
+    };
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("identityfile ") {
+            resolved.identity_files.push(rest.trim().to_owned());
+        } else if line.trim() == "identitiesonly yes" {
+            resolved.identities_only = true;
+        }
+    }
+    resolved
+}
+
+/// Связка подтверждена резолюцией: `identitiesonly yes` и наш ключ —
+/// среди `identityfile`.
+#[must_use]
+pub fn resolution_confirms(resolved: &ResolvedHost, expected_identity: &Path) -> bool {
+    resolved.identities_only
+        && resolved
+            .identity_files
+            .iter()
+            .any(|f| f == &expected_identity.display().to_string())
+}
+
+/// Вызов `ssh -G <host>` с таймаутом.
+///
+/// `config` — тестовый шов: `Some(path)` идёт как `-F <path>` (изоляция
+/// харнесса Т-5; `-F` отсекает и системный config), прод зовёт с `None` —
+/// резолюция обязана читать настоящий `~/.ssh/config`, это смысл сверки.
+///
+/// # Errors
+/// - [`SshError::Io`] — ssh не запустился.
+/// - [`SshError::Query`] — ненулевой код завершения.
+/// - [`SshError::QueryTimeout`] — не ответил за `timeout`.
+pub async fn ssh_g(
+    host: &str,
+    config: Option<&Path>,
+    timeout: std::time::Duration,
+) -> Result<ResolvedHost, SshError> {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.arg("-G");
+    if let Some(config) = config {
+        cmd.arg("-F").arg(config);
+    }
+    cmd.arg(host);
+    let out = match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(SshError::QueryTimeout {
+                host: host.to_owned(),
+            });
+        }
+    };
+    if !out.status.success() {
+        return Err(SshError::Query {
+            host: host.to_owned(),
+            status: out.status.to_string(),
+        });
+    }
+    Ok(parse_ssh_g(&String::from_utf8_lossy(&out.stdout)))
+}
+
 /// Вставить строку `Include` первой (по подтверждению пользователя).
 ///
 /// Идемпотентно: строка уже присутствует — файл не трогается, даже если она
@@ -471,6 +561,52 @@ mod tests {
             .expect("read dir")
             .count();
         assert_eq!(leftovers, 1, "only the snippet should remain");
+    }
+
+    /// Разбор `ssh -G`: identityfile собираются все и по порядку,
+    /// identitiesonly читается точным значением.
+    #[test]
+    fn parse_ssh_g_reads_identity_lines() {
+        let out = "host devbox\nuser devbox\nidentitiesonly yes\nidentityfile /home/u/panzir-work/id_ed25519\nport 9281\n";
+        let r = parse_ssh_g(out);
+        assert!(r.identities_only);
+        assert_eq!(
+            r.identity_files,
+            vec!["/home/u/panzir-work/id_ed25519".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parse_ssh_g_defaults_mean_no() {
+        let r = parse_ssh_g(
+            "identitiesonly no\nidentityfile ~/.ssh/id_rsa\nidentityfile ~/.ssh/id_ed25519\n",
+        );
+        assert!(!r.identities_only);
+        assert_eq!(r.identity_files.len(), 2);
+    }
+
+    /// Подтверждение связки: identitiesonly yes И наш ключ в identityfile;
+    /// чужой набор ключей — не подтверждение.
+    #[test]
+    fn resolution_confirms_only_with_our_key_and_identities_only() {
+        let expected = Path::new("/home/u/panzir-work/id_ed25519");
+        let good = ResolvedHost {
+            identity_files: vec!["/home/u/panzir-work/id_ed25519".to_owned()],
+            identities_only: true,
+        };
+        assert!(resolution_confirms(&good, expected));
+        // Посторонний ключ по умолчанию вместо нашего.
+        let foreign = ResolvedHost {
+            identity_files: vec!["~/.ssh/id_ed25519".to_owned()],
+            identities_only: true,
+        };
+        assert!(!resolution_confirms(&foreign, expected));
+        // Наш ключ, но без identitiesonly — посторонний ключ тоже участвует.
+        let loose = ResolvedHost {
+            identity_files: good.identity_files.clone(),
+            identities_only: false,
+        };
+        assert!(!resolution_confirms(&loose, expected));
     }
 
     #[test]

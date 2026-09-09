@@ -53,8 +53,20 @@ pub struct EnvLine {
     pub hint: String,
 }
 
+/// Итог резолюции одного хоста через `ssh -G` (проверка по результату, К-7).
+/// Считается только для открытого хранилища.
+#[derive(Clone, Debug)]
+pub struct SshResolution {
+    /// Алиас хоста.
+    pub host: String,
+    /// `identitiesonly yes` и наш `identityfile` подтверждены резолюцией.
+    pub ok: bool,
+    /// Текст отказа `ssh -G` (не запустился/ошибка/таймаут), если был.
+    pub detail: Option<String>,
+}
+
 /// Статус SSH-связки раскрытой карточки — результат фоновой пробы: чтение
-/// `~/.ssh/config`, без `ssh -G` (резолюция — часть сверки при открытии).
+/// `~/.ssh/config` плюс, для открытого хранилища, резолюция `ssh -G`.
 #[derive(Clone, Debug)]
 pub struct SshCardStatus {
     /// Метка записи, к которой относится статус.
@@ -66,6 +78,8 @@ pub struct SshCardStatus {
     /// Config существует, но не прочитался — отказ показывается, а не
     /// проглатывается как «строки нет» (инвариант 10).
     pub error: Option<String>,
+    /// Резолюция по хостам; пусто для закрытого хранилища.
+    pub resolutions: Vec<SshResolution>,
 }
 
 /// Подтверждение вставки/починки строки `Include`: человек видит точную
@@ -151,6 +165,10 @@ enum Op {
 enum OpOutcome {
     /// Свежий список записей.
     Loaded(Vec<VaultEntry>),
+    /// Свежий список плюс ворнинг человеку: операция состоялась, но её
+    /// производная часть отказала (например, сниппет при открытии) —
+    /// молчать нельзя (инвариант 10), а отказом это не является.
+    LoadedWith(Vec<VaultEntry>, String),
     /// Операция отказала; строка уже переведена на человеческий язык.
     Failed(String),
 }
@@ -368,6 +386,12 @@ pub fn error_text(err: &Error) -> String {
             format!("SSH-хост: поле «{field}» не подходит: «{value}» — {rule}")
         }
         Error::Ssh(SshError::Io(e)) => format!("SSH-связка: ошибка ввода-вывода: {e}"),
+        Error::Ssh(SshError::Query { host, status }) => {
+            format!("ssh -G {host} завершился с ошибкой ({status}) — связку показать не удалось")
+        }
+        Error::Ssh(SshError::QueryTimeout { host }) => {
+            format!("ssh -G {host} не ответил за отведённое время — связку показать не удалось")
+        }
     }
 }
 
@@ -612,13 +636,24 @@ impl App {
     }
 
     /// Проба SSH-связки раскрытой карточки: читает config и считает статус
-    /// строки `Include` и коллизию имён. Пробуждение окна — через
+    /// строки `Include` и коллизию имён; для открытого хранилища — ещё и
+    /// резолюцию `ssh -G` по каждому хосту (К-7). Пробуждение окна — через
     /// [`App::spawn_waking`], как у любой фоновой задачи (инвариант 8).
-    fn spawn_ssh_probe(&mut self, ctx: &egui::Context, label: Label, hosts: Vec<SshHost>) {
+    /// Резолюция зовётся с `config = None`: она обязана читать настоящий
+    /// config пользователя — в этом смысл сверки.
+    fn spawn_ssh_probe(
+        &mut self,
+        ctx: &egui::Context,
+        label: Label,
+        hosts: Vec<SshHost>,
+        resolve: bool,
+    ) {
         if self.ssh_probe.is_some() {
             return;
         }
         let config = self.ssh_config.clone();
+        let home = self.home.clone();
+        let timeout = self.op_timeout;
         let config_dir = self
             .registry_path
             .parent()
@@ -632,12 +667,32 @@ impl App {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
                 Err(e) => (None, Some(e.to_string())),
             };
+            let mut resolutions = Vec::new();
+            if resolve {
+                let symlink = panzir_core::mountpoint::symlink_path(&home, &label);
+                for h in &hosts {
+                    let expected = symlink.join(&h.key_file);
+                    resolutions.push(match ssh::ssh_g(&h.host, None, timeout).await {
+                        Ok(r) => SshResolution {
+                            ok: ssh::resolution_confirms(&r, &expected),
+                            host: h.host.clone(),
+                            detail: None,
+                        },
+                        Err(e) => SshResolution {
+                            ok: false,
+                            host: h.host.clone(),
+                            detail: Some(e.to_string()),
+                        },
+                    });
+                }
+            }
             SshCardStatus {
                 include: ssh::include_status(text.as_deref(), &line),
                 collision: text
                     .as_deref()
                     .and_then(|t| ssh::detect_collision(t, &hosts)),
                 error,
+                resolutions,
                 label,
             }
         }));
@@ -682,6 +737,11 @@ impl App {
                 self.message = None;
                 // Список сменился — статус связки устарел, карточка
                 // переспросит его следующим кадром.
+                self.ssh_status = None;
+            }
+            Ok(OpOutcome::LoadedWith(entries, note)) => {
+                self.entries = entries;
+                self.message = Some(note);
                 self.ssh_status = None;
             }
             Ok(OpOutcome::Failed(text)) => self.message = Some(text),
@@ -1103,7 +1163,10 @@ impl eframe::App for App {
             && !entry.ssh_hosts().is_empty()
         {
             let hosts = entry.ssh_hosts().to_vec();
-            self.spawn_ssh_probe(ui.ctx(), label, hosts);
+            // Резолюция `ssh -G` — только по открытому хранилищу: у закрытого
+            // она ничего не добавляет к «ключи недоступны».
+            let resolve = matches!(entry.state(), VaultState::Open { .. });
+            self.spawn_ssh_probe(ui.ctx(), label, hosts, resolve);
         }
 
         self.tick_smoke(ui.ctx());
@@ -1248,7 +1311,7 @@ async fn run_open(
         // Точка монтирования — из ответа udisks2, не угаданная: путь симлинка
         // сюда не подставляется (спека п.2 скоупа).
         Ok(opened) => {
-            set_state_then_read(
+            let outcome = set_state_then_read(
                 path,
                 label,
                 VaultState::Open {
@@ -1256,7 +1319,35 @@ async fn run_open(
                     until: opened.until,
                 },
             )
-            .await
+            .await;
+            // Ш-7: сниппет пересоздаётся из реестра при каждом открытии —
+            // он производная, а не правда. Сверка связки и `ssh -G` по
+            // хостам показываются пробой карточки (список сменился → статус
+            // инвалидирован → переспрос).
+            let OpOutcome::Loaded(entries) = &outcome else {
+                return outcome;
+            };
+            let Some(entry) = entries
+                .iter()
+                .find(|e| e.label().as_str() == label.as_str())
+                .filter(|e| !e.ssh_hosts().is_empty())
+            else {
+                return outcome;
+            };
+            let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let snippet = ssh::snippet_path(config_dir, label);
+            let symlink = panzir_core::mountpoint::symlink_path(home, label);
+            let text = ssh::render_snippet(entry.ssh_hosts(), &symlink);
+            match ssh::write_snippet_atomic(&snippet, &text).await {
+                Ok(()) => outcome,
+                Err(e) => OpOutcome::LoadedWith(
+                    entries.clone(),
+                    format!(
+                        "хранилище открыто, но SSH-сниппет не обновился: {}",
+                        error_text(&Error::from(e))
+                    ),
+                ),
+            }
         }
         Err(e) => OpOutcome::Failed(error_text(&e)),
     }
@@ -1619,6 +1710,13 @@ mod tests {
                 value: "Bad Host".to_owned(),
             }),
             Error::Ssh(SshError::Io(std::io::Error::other("проба"))),
+            Error::Ssh(SshError::Query {
+                host: "devbox".to_owned(),
+                status: "exit status: 255".to_owned(),
+            }),
+            Error::Ssh(SshError::QueryTimeout {
+                host: "devbox".to_owned(),
+            }),
         ]
     }
 
@@ -2539,6 +2637,107 @@ mod tests {
         harness.run();
 
         harness.get_by_label_contains("ключи недоступны");
+    }
+
+    // ---------- Ш-7, шаг 4: резолюция ssh -G на карточке ----------
+
+    /// Фикстура: запись t-alpha ОТКРЫТА (симуляция — без udisks), с хостом
+    /// devbox. Проба с резолюцией в харнессе не бежит (звала бы настоящий
+    /// ssh против настоящего config): статус подставляется в состояние
+    /// напрямую, а механику `ssh -G` покрывают юниты разбора и Т-5.
+    fn fixture_ssh_open(dir: &Path) -> std::path::PathBuf {
+        let registry = dir.join("vaults.toml");
+        let container = dir.join("t-alpha.vault");
+        std::fs::write(&container, b"").expect("создать файл-пустышку");
+
+        let rt = Runtime::new().expect("рантайм для фикстуры");
+        rt.block_on(Registry::with_write_lock_at(&registry, |r| {
+            let mut e = VaultEntry::new(
+                Label::new("t-alpha").expect("метка"),
+                VaultKind::File(container.clone()),
+                VaultState::Closed,
+            );
+            e.add_ssh_host(
+                SshHost::new("devbox", "192.0.2.10", "devbox", None, "id_ed25519")
+                    .expect("valid host"),
+            );
+            e.set_state(VaultState::Open {
+                mount_point: dir.join("mnt"),
+                until: None,
+            })
+            .expect("closed -> open");
+            r.add(e)
+        }))
+        .expect("записать фикстуру");
+        registry
+    }
+
+    fn inject_ssh_status(harness: &mut Harness<'static, App>, resolutions: Vec<SshResolution>) {
+        harness.state_mut().ssh_status = Some(SshCardStatus {
+            label: Label::new("t-alpha").expect("метка"),
+            include: IncludeStatus::Ok,
+            collision: None,
+            error: None,
+            resolutions,
+        });
+    }
+
+    #[test]
+    fn open_vault_card_shows_confirmed_resolution() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture_ssh_open(dir.path()));
+        inject_ssh_status(
+            &mut harness,
+            vec![SshResolution {
+                host: "devbox".to_owned(),
+                ok: true,
+                detail: None,
+            }],
+        );
+
+        expand_first_card(&mut harness);
+        harness.run();
+
+        harness.get_by_label_contains("devbox: ssh -G подтверждает связку");
+        harness.get_by_label_contains("связка включена");
+    }
+
+    #[test]
+    fn open_vault_card_warns_when_resolution_not_confirmed() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture_ssh_open(dir.path()));
+        inject_ssh_status(
+            &mut harness,
+            vec![SshResolution {
+                host: "devbox".to_owned(),
+                ok: false,
+                detail: None,
+            }],
+        );
+
+        expand_first_card(&mut harness);
+        harness.run();
+
+        harness.get_by_label_contains("devbox: ssh -G не подтверждает связку");
+    }
+
+    #[test]
+    fn open_vault_card_shows_ssh_g_failure_text() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture_ssh_open(dir.path()));
+        inject_ssh_status(
+            &mut harness,
+            vec![SshResolution {
+                host: "devbox".to_owned(),
+                ok: false,
+                detail: Some("ssh -G devbox timed out".to_owned()),
+            }],
+        );
+
+        expand_first_card(&mut harness);
+        harness.run();
+
+        harness.get_by_label_contains("devbox: ssh -G devbox timed out");
     }
 
     #[test]

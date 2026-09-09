@@ -436,6 +436,24 @@ fn show_ssh_section(
                     ),
                 );
             }
+            // Резолюция по `ssh -G` — проверка по результату (К-7), только у
+            // открытого хранилища.
+            for r in &status.resolutions {
+                if r.ok {
+                    ui.label(format!("{}: ssh -G подтверждает связку", r.host));
+                } else if let Some(detail) = &r.detail {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("{}: {detail}", r.host));
+                } else {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!(
+                            "{}: ssh -G не подтверждает связку — нет нашего identityfile \
+                             или identitiesonly yes",
+                            r.host
+                        ),
+                    );
+                }
+            }
         }
 
         // Подтверждение: человек видит точную строку до записи в его config.
