@@ -190,7 +190,12 @@ pub async fn write_snippet_atomic(path: &Path, text: &str) -> Result<(), SshErro
         tokio::fs::create_dir_all(parent).await?;
         tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
     }
+    write_atomic(path, text, 0o600).await
+}
 
+/// Общий хвост атомарной записи: временный файл с заданным mode →
+/// write/flush/sync → rename. При отказе временный файл убирается.
+async fn write_atomic(path: &Path, text: &str, mode: u32) -> Result<(), SshError> {
     let uniq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -201,7 +206,7 @@ pub async fn write_snippet_atomic(path: &Path, text: &str) -> Result<(), SshErro
         let mut file = tokio::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .mode(0o600)
+            .mode(mode)
             .open(&temp)
             .await?;
         file.write_all(text.as_bytes()).await?;
@@ -223,6 +228,74 @@ pub async fn write_snippet_atomic(path: &Path, text: &str) -> Result<(), SshErro
     Ok(())
 }
 
+/// Прочитать config как текст; отсутствующий файл — `None`, а не ошибка.
+async fn read_config_text(path: &Path) -> Result<Option<String>, SshError> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Записать config, сохранив права существующего файла (М-2: rename поверх
+/// заменяет inode, поэтому mode читается ДО записи и переносится на временный
+/// файл). Новый config получает 0600. Отсутствующий `~/.ssh` создаётся 0700
+/// (М-3); существующий каталог не трогаем — он чужой.
+async fn write_config_preserving_mode(path: &Path, text: &str) -> Result<(), SshError> {
+    if let Some(parent) = path.parent() {
+        match tokio::fs::metadata(parent).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::create_dir_all(parent).await?;
+                tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mode = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta.permissions().mode() & 0o777,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0o600,
+        Err(e) => return Err(e.into()),
+    };
+    write_atomic(path, text, mode).await
+}
+
+/// Вставить строку `Include` первой (по подтверждению пользователя).
+///
+/// Идемпотентно: строка уже присутствует — файл не трогается, даже если она
+/// не первая (это работа [`repair_include`]). Возвращает `true`, если файл
+/// изменился.
+///
+/// # Errors
+/// [`SshError::Io`] — ошибка FS (включая не-UTF8 config).
+pub async fn apply_include(config: &Path, snippet: &Path) -> Result<bool, SshError> {
+    let line = include_line(snippet);
+    let current = read_config_text(config).await?.unwrap_or_default();
+    let new = insert_include_line(&current, &line);
+    if new == current {
+        return Ok(false);
+    }
+    write_config_preserving_mode(config, &new).await?;
+    Ok(true)
+}
+
+/// Починка `Shadowed` (М-1, по подтверждению): поднять строку `Include`
+/// первой, чужое содержимое и права сохранить. Возвращает `true`, если файл
+/// изменился.
+///
+/// # Errors
+/// [`SshError::Io`] — ошибка FS.
+pub async fn repair_include(config: &Path, snippet: &Path) -> Result<bool, SshError> {
+    let line = include_line(snippet);
+    let current = read_config_text(config).await?.unwrap_or_default();
+    let new = repair_include_first(&current, &line);
+    if new == current {
+        return Ok(false);
+    }
+    write_config_preserving_mode(config, &new).await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 // expect/unwrap в тестах — осознанно (закон №3: unwrap/expect только в тестах и main).
 #[allow(clippy::expect_used, clippy::unwrap_used)]
@@ -238,6 +311,131 @@ mod tests {
 
     fn nas() -> SshHost {
         SshHost::new("nas", "nas.lan", "root", None, "id_nas").expect("valid host")
+    }
+
+    /// Вставка в отсутствующий config: `~/.ssh` создаётся 0700 (М-3), файл —
+    /// 0600 из одной строки; повторный вызов ничего не меняет.
+    #[tokio::test]
+    async fn apply_creates_missing_dotssh_0700_and_config_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join(".ssh").join("config");
+        let snippet = dir.path().join(".config/panzir/ssh-work.conf");
+        let line = include_line(&snippet);
+
+        assert!(
+            apply_include(&config, &snippet).await.expect("apply"),
+            "first apply must report a change"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read"),
+            format!("{line}\n")
+        );
+        let dir_mode = std::fs::metadata(config.parent().expect("parent"))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, ".ssh mode is {dir_mode:o}");
+        let file_mode = std::fs::metadata(&config)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "config mode is {file_mode:o}");
+
+        assert!(
+            !apply_include(&config, &snippet).await.expect("apply"),
+            "second apply must be a no-op"
+        );
+    }
+
+    /// Чужое содержимое и mode существующего config сохраняются (М-2).
+    #[tokio::test]
+    async fn apply_preserves_foreign_bytes_and_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ssh_dir = dir.path().join(".ssh");
+        std::fs::create_dir(&ssh_dir).expect("mkdir");
+        std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod dir");
+        let config = ssh_dir.join("config");
+        let foreign = "Host *\n    ServerAliveInterval 30\r\n# моё\r\n";
+        std::fs::write(&config, foreign).expect("write");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let snippet = dir.path().join("ssh-work.conf");
+        let line = include_line(&snippet);
+        assert!(apply_include(&config, &snippet).await.expect("apply"));
+
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read"),
+            format!("{line}\n{foreign}")
+        );
+        let mode = std::fs::metadata(&config)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "foreign mode must survive rename, got {mode:o}"
+        );
+        let dir_mode = std::fs::metadata(&ssh_dir)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o755, "existing .ssh must not be rechmodded");
+    }
+
+    /// Строка есть, но не первая (Shadowed): вставка её НЕ двигает — это
+    /// работа починки.
+    #[tokio::test]
+    async fn apply_does_not_move_shadowed_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config");
+        let snippet = dir.path().join("ssh-work.conf");
+        let line = include_line(&snippet);
+        let drifted = format!("Host *\n{line}\n");
+        std::fs::write(&config, &drifted).expect("write");
+
+        assert!(
+            !apply_include(&config, &snippet).await.expect("apply"),
+            "shadowed line must not move on plain apply"
+        );
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), drifted);
+
+        assert!(repair_include(&config, &snippet).await.expect("repair"));
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read"),
+            format!("{line}\nHost *\n")
+        );
+        // Повторная починка — без изменений.
+        assert!(!repair_include(&config, &snippet).await.expect("repair"));
+    }
+
+    /// Починка сохраняет mode чужого config (М-2 при М-1).
+    #[tokio::test]
+    async fn repair_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config");
+        let snippet = dir.path().join("ssh-work.conf");
+        let line = include_line(&snippet);
+        std::fs::write(&config, format!("Host *\n{line}\n")).expect("write");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+
+        assert!(repair_include(&config, &snippet).await.expect("repair"));
+        let mode = std::fs::metadata(&config)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "mode must survive repair, got {mode:o}");
     }
 
     /// Сниппет пишется атомарно, с правами 0600 и перезаписывается поверх

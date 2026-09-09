@@ -15,7 +15,7 @@ use panzir_core::deps::{self, DepsReport};
 use panzir_core::lifecycle::{self, CloseDecision, close_decision};
 use panzir_core::registry::{Registry, SshHost, VaultEntry};
 use panzir_core::schedule::SystemdUser;
-use panzir_core::ssh::SshError;
+use panzir_core::ssh::{self, IncludeStatus, SshError};
 use panzir_core::udisks::Udisks;
 use panzir_core::vault::{DEFAULT_AUTO_CLOSE, Label, VaultKind, VaultState, container_path};
 use panzir_core::{AuthRefusal, Error};
@@ -51,6 +51,33 @@ pub struct EnvLine {
     pub ok: bool,
     /// Что сделать, если не работает.
     pub hint: String,
+}
+
+/// Статус SSH-связки раскрытой карточки — результат фоновой пробы: чтение
+/// `~/.ssh/config`, без `ssh -G` (резолюция — часть сверки при открытии).
+#[derive(Clone, Debug)]
+pub struct SshCardStatus {
+    /// Метка записи, к которой относится статус.
+    pub label: Label,
+    /// Где строка `Include` в config.
+    pub include: IncludeStatus,
+    /// Имя нашего хоста, уже занятое в чужом config (ворнинг по чтению).
+    pub collision: Option<String>,
+    /// Config существует, но не прочитался — отказ показывается, а не
+    /// проглатывается как «строки нет» (инвариант 10).
+    pub error: Option<String>,
+}
+
+/// Подтверждение вставки/починки строки `Include`: человек видит точную
+/// строку до того, как мы пишем в его config (М-1).
+#[derive(Clone, Debug)]
+pub struct SshConfirm {
+    /// Метка записи.
+    pub target: Label,
+    /// `true` — починка `Shadowed` (поднять строку первой), `false` — вставка.
+    pub repair: bool,
+    /// Точная строка `Include` — показывается перед записью.
+    pub line: String,
 }
 
 /// Что окно просит у ядра. Все операции идут через одну дверь — [`App::spawn_op`].
@@ -107,6 +134,14 @@ enum Op {
         label: Label,
         /// Проверенный конструктором хост.
         host: SshHost,
+    },
+    /// Вставить строку `Include` первой или поднять её (починка `Shadowed`).
+    /// Только по подтверждению: человек видел точную строку.
+    SshInclude {
+        /// Метка записи.
+        label: Label,
+        /// `true` — починка (М-1), `false` — вставка.
+        repair: bool,
     },
 }
 
@@ -395,6 +430,9 @@ pub struct App {
     rt: Runtime,
     registry_path: PathBuf,
     home: PathBuf,
+    /// Путь `~/.ssh/config` — параметром (инвариант 9), читает/пишет только
+    /// по запросу человека (вставка `Include` — по подтверждению).
+    ssh_config: PathBuf,
     /// Часы автозакрытия: окно только передаёт их в ядро.
     scheduler: SystemdUser,
     op_timeout: Duration,
@@ -409,12 +447,18 @@ pub struct App {
     /// Не блокирует кнопки: `pending` остаётся свободен для операций человека.
     reload_tick: Option<JoinHandle<OpOutcome>>,
     bus_probe: Option<JoinHandle<UdisksStatus>>,
+    /// Проба SSH-связки раскрытой карточки (чтение config).
+    ssh_probe: Option<JoinHandle<SshCardStatus>>,
+    /// Последний известный статус связки; инвалидируется при смене списка.
+    ssh_status: Option<SshCardStatus>,
     message: Option<String>,
     rename: Option<RenameDraft>,
     expanded: Option<Label>,
     unlock: Option<UnlockDraft>,
     /// Черновик добавления SSH-хоста (не секрет — затирать не нужно).
     ssh_draft: Option<SshHostDraft>,
+    /// Ожидающее подтверждение вставление/починка строки `Include`.
+    ssh_confirm: Option<SshConfirm>,
     screen: Screen,
     /// Черновик формы создания (секреты внутри). `Some` даже после ухода с
     /// формы — затирается единым местом (`forget_stale_passphrase`), когда
@@ -441,6 +485,7 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         registry_path: PathBuf,
         home: PathBuf,
+        ssh_config: PathBuf,
         closer: PathBuf,
         smoke_frames: Option<u32>,
         op_timeout: Duration,
@@ -451,6 +496,7 @@ impl App {
             rt,
             registry_path,
             home,
+            ssh_config,
             // Ждать бегущее закрытие в `disarm` — не дольше, чем операцию целиком.
             scheduler: SystemdUser::new(vec![closer.into()], op_timeout),
             op_timeout,
@@ -463,11 +509,14 @@ impl App {
             pending: None,
             reload_tick: None,
             bus_probe: None,
+            ssh_probe: None,
+            ssh_status: None,
             message: None,
             rename: None,
             expanded: None,
             unlock: None,
             ssh_draft: None,
+            ssh_confirm: None,
             screen: Screen::List,
             create: None,
         };
@@ -509,12 +558,15 @@ impl App {
         }
         let path = self.registry_path.clone();
         let home = self.home.clone();
+        let ssh_config = self.ssh_config.clone();
         let scheduler = self.scheduler.clone();
         let limit = self.op_timeout;
         self.pending = Some(self.spawn_waking(ctx, async move {
             // Таймаут накрывает операцию ЦЕЛИКОМ, включая пробу: человеку не
             // важно, на каком шаге застряло, ему важно, что окно не висит.
-            match tokio::time::timeout(limit, run_op(&path, &home, &scheduler, op)).await {
+            match tokio::time::timeout(limit, run_op(&path, &home, &ssh_config, &scheduler, op))
+                .await
+            {
                 Ok(outcome) => outcome,
                 Err(_) => OpOutcome::Failed(format!(
                     "хранилище не откликнулось {}. Возможно, том занят другой программой. \
@@ -559,6 +611,38 @@ impl App {
         }));
     }
 
+    /// Проба SSH-связки раскрытой карточки: читает config и считает статус
+    /// строки `Include` и коллизию имён. Пробуждение окна — через
+    /// [`App::spawn_waking`], как у любой фоновой задачи (инвариант 8).
+    fn spawn_ssh_probe(&mut self, ctx: &egui::Context, label: Label, hosts: Vec<SshHost>) {
+        if self.ssh_probe.is_some() {
+            return;
+        }
+        let config = self.ssh_config.clone();
+        let config_dir = self
+            .registry_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        self.ssh_probe = Some(self.spawn_waking(ctx, async move {
+            let snippet = ssh::snippet_path(&config_dir, &label);
+            let line = ssh::include_line(&snippet);
+            let (text, error) = match tokio::fs::read_to_string(&config).await {
+                Ok(text) => (Some(text), None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+            SshCardStatus {
+                include: ssh::include_status(text.as_deref(), &line),
+                collision: text
+                    .as_deref()
+                    .and_then(|t| ssh::detect_collision(t, &hosts)),
+                error,
+                label,
+            }
+        }));
+    }
+
     /// Снимает результаты завершившихся задач. Не блокирует.
     fn take_finished(&mut self) {
         if self.pending.as_ref().is_some_and(JoinHandle::is_finished)
@@ -583,6 +667,12 @@ impl App {
             self.udisks = Some(status);
             self.rebuild_env();
         }
+        if self.ssh_probe.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(handle) = self.ssh_probe.take()
+            && let Ok(status) = self.rt.block_on(handle)
+        {
+            self.ssh_status = Some(status);
+        }
     }
 
     fn apply(&mut self, outcome: Result<OpOutcome, tokio::task::JoinError>) {
@@ -590,6 +680,9 @@ impl App {
             Ok(OpOutcome::Loaded(entries)) => {
                 self.entries = entries;
                 self.message = None;
+                // Список сменился — статус связки устарел, карточка
+                // переспросит его следующим кадром.
+                self.ssh_status = None;
             }
             Ok(OpOutcome::Failed(text)) => self.message = Some(text),
             Err(e) => {
@@ -808,6 +901,37 @@ impl App {
                     Err(e) => self.message = Some(error_text(&Error::from(e))),
                 }
             }
+            ListAction::AskSshInclude { target, repair } => {
+                // Точная строка считается здесь, а не в виджете: человеку
+                // показывается ровно то, что уйдёт в его config.
+                let config_dir = self
+                    .registry_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf();
+                let line = ssh::include_line(&ssh::snippet_path(&config_dir, &target));
+                self.ssh_confirm = Some(SshConfirm {
+                    target,
+                    repair,
+                    line,
+                });
+            }
+            ListAction::ConfirmSshInclude => {
+                let Some(confirm) = self.ssh_confirm.clone() else {
+                    return;
+                };
+                // Черновик снимается, только если операция ушла в работу —
+                // как у переименования и добавления хоста.
+                if self.spawn_op(
+                    ctx,
+                    Op::SshInclude {
+                        label: confirm.target,
+                        repair: confirm.repair,
+                    },
+                ) {
+                    self.ssh_confirm = None;
+                }
+            }
         }
     }
 
@@ -900,6 +1024,14 @@ impl App {
         if let Some(handle) = self.reload_tick.take() {
             handle.abort();
         }
+        if let Some(handle) = self.ssh_probe.take()
+            && let Ok(status) = self
+                .rt
+                .block_on(async move { tokio::time::timeout(TEST_DEADLINE, handle).await })
+                .expect("проба SSH-связки не завершилась за отведённое время")
+        {
+            self.ssh_status = Some(status);
+        }
         if let Some(handle) = self.pending.take() {
             let outcome = self
                 .rt
@@ -939,6 +1071,8 @@ impl eframe::App for App {
                         expanded: &mut self.expanded,
                         unlock: &mut self.unlock,
                         ssh_draft: &mut self.ssh_draft,
+                        ssh_status: &self.ssh_status,
+                        ssh_confirm: &mut self.ssh_confirm,
                     },
                 );
                 if let Some(action) = action {
@@ -959,6 +1093,19 @@ impl eframe::App for App {
         }
         self.forget_stale_passphrase();
 
+        // Проба связки — для раскрытой карточки с хостами, когда статус
+        // устарел (список сменился) или ещё не запрошен.
+        if self.screen == Screen::List
+            && self.ssh_probe.is_none()
+            && let Some(label) = self.expanded.clone()
+            && self.ssh_status.as_ref().is_none_or(|s| s.label != label)
+            && let Some(entry) = self.entries.iter().find(|e| e.label() == &label)
+            && !entry.ssh_hosts().is_empty()
+        {
+            let hosts = entry.ssh_hosts().to_vec();
+            self.spawn_ssh_probe(ui.ctx(), label, hosts);
+        }
+
         self.tick_smoke(ui.ctx());
     }
 }
@@ -966,6 +1113,7 @@ impl eframe::App for App {
 async fn run_op(
     path: &std::path::Path,
     home: &std::path::Path,
+    ssh_config: &std::path::Path,
     scheduler: &SystemdUser,
     op: Op,
 ) -> OpOutcome {
@@ -1003,6 +1151,32 @@ async fn run_op(
             passphrase,
         } => run_create(path, home, &label, &container, size_bytes, &passphrase).await,
         Op::AddSshHost { label, host } => run_add_ssh_host(path, home, &label, host).await,
+        Op::SshInclude { label, repair } => run_ssh_include(path, ssh_config, &label, repair).await,
+    }
+}
+
+/// Вставка/починка строки `Include` — по подтверждению (М-1): чужой config
+/// правится только здесь, содержимое и права сохраняет ядро (М-2, М-3).
+/// Реестр не меняется; перечитываем его, чтобы инвалидировать статус связки.
+async fn run_ssh_include(
+    path: &std::path::Path,
+    ssh_config: &std::path::Path,
+    label: &Label,
+    repair: bool,
+) -> OpOutcome {
+    let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let snippet = ssh::snippet_path(config_dir, label);
+    let result = if repair {
+        ssh::repair_include(ssh_config, &snippet).await
+    } else {
+        ssh::apply_include(ssh_config, &snippet).await
+    };
+    match result {
+        Ok(_) => match Registry::load_from(path).await {
+            Ok(reg) => OpOutcome::Loaded(reg.entries().to_vec()),
+            Err(e) => OpOutcome::Failed(error_text(&e)),
+        },
+        Err(e) => OpOutcome::Failed(error_text(&Error::from(e))),
     }
 }
 
@@ -2090,16 +2264,26 @@ mod tests {
             .parent()
             .expect("у фикстуры есть каталог")
             .to_path_buf();
-        let mut harness = Harness::new_eframe(move |cc| {
-            App::new(
-                cc,
-                registry.clone(),
-                home.clone(),
-                PathBuf::from("/bin/true"),
-                None,
-                Duration::from_secs(5),
-            )
-        });
+        let ssh_config = home.join(".ssh").join("config");
+        let mut harness = egui_kittest::HarnessBuilder::default()
+            // Реактивное окно: завершение каждой фоновой задачи — отдельный
+            // немедленный repaint (инвариант 8). Кадр после подтверждения
+            // связки видит пачку: конец операции + конец переспроса статуса;
+            // четырёх шагов по умолчанию на это не хватает. Это конечные
+            // всплески, не вечный repaint: run() всё равно останавливается,
+            // когда задачи кончились.
+            .with_max_steps(64)
+            .build_eframe(move |cc| {
+                App::new(
+                    cc,
+                    registry.clone(),
+                    home.clone(),
+                    ssh_config.clone(),
+                    PathBuf::from("/bin/true"),
+                    None,
+                    Duration::from_secs(5),
+                )
+            });
         harness.state_mut().block_until_idle();
         harness.run();
         harness
@@ -2226,6 +2410,135 @@ mod tests {
             !content.contains("Port"),
             "no Port line expected:\n{content}"
         );
+    }
+
+    // ---------- Ш-7, шаг 3: вставка Include по подтверждению ----------
+
+    /// Фикстура: одна запись t-alpha (файл, закрыто) с SSH-хостом devbox.
+    /// Возвращает пути реестра и config, который пойдёт в окно.
+    fn fixture_ssh(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let registry = dir.join("vaults.toml");
+        let container = dir.join("t-alpha.vault");
+        std::fs::write(&container, b"").expect("создать файл-пустышку");
+
+        let rt = Runtime::new().expect("рантайм для фикстуры");
+        rt.block_on(Registry::with_write_lock_at(&registry, |r| {
+            let mut e = VaultEntry::new(
+                Label::new("t-alpha").expect("метка"),
+                VaultKind::File(container.clone()),
+                VaultState::Closed,
+            );
+            e.add_ssh_host(
+                SshHost::new("devbox", "192.0.2.10", "devbox", None, "id_ed25519")
+                    .expect("valid host"),
+            );
+            r.add(e)
+        }))
+        .expect("записать фикстуру");
+        (registry, dir.join(".ssh").join("config"))
+    }
+
+    fn expand_first_card(harness: &mut Harness<'static, App>) {
+        harness
+            .get_all_by_label("Подробнее")
+            .next()
+            .expect("кнопка раскрытия первой записи")
+            .click();
+        harness.run();
+    }
+
+    /// Кадр → дождаться фоновых задач → кадр.
+    fn settle(harness: &mut Harness<'static, App>) {
+        harness.run();
+        harness.state_mut().block_until_idle();
+        harness.run();
+    }
+
+    #[test]
+    fn include_insertion_shows_exact_line_and_writes_only_after_confirm() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let (registry, config) = fixture_ssh(dir.path());
+        std::fs::create_dir(config.parent().expect(".ssh")).expect("mkdir .ssh");
+        std::fs::write(&config, "# мой конфиг\n").expect("чужой config");
+        let mut harness = harness_at(registry);
+        let line = format!("Include {}/ssh-t-alpha.conf", dir.path().display());
+
+        expand_first_card(&mut harness);
+        settle(&mut harness);
+
+        harness.get_by_label("Включить SSH-связку").click();
+        harness.run();
+        // Точная строка показана ДО записи — и записи без подтверждения нет.
+        harness.get_by_label_contains(&line);
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config"),
+            "# мой конфиг\n",
+            "без подтверждения чужой config не трогаем"
+        );
+
+        harness.get_by_label("Подтвердить").click();
+        settle(&mut harness);
+        settle(&mut harness);
+
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config"),
+            format!("{line}\n# мой конфиг\n")
+        );
+        harness.get_by_label_contains("связка включена");
+    }
+
+    #[test]
+    fn shadowed_include_warns_and_repair_moves_line_first() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let (registry, config) = fixture_ssh(dir.path());
+        std::fs::create_dir(config.parent().expect(".ssh")).expect("mkdir .ssh");
+        let line = format!("Include {}/ssh-t-alpha.conf", dir.path().display());
+        let foreign = "Host *\n    ServerAliveInterval 30\n";
+        std::fs::write(&config, format!("{foreign}{line}\n")).expect("shadowed config");
+        let mut harness = harness_at(registry);
+
+        expand_first_card(&mut harness);
+        settle(&mut harness);
+
+        harness.get_by_label_contains("съехала");
+        harness.get_by_label("Поднять строку первой").click();
+        harness.run();
+        harness.get_by_label_contains(&line);
+
+        harness.get_by_label("Подтвердить").click();
+        settle(&mut harness);
+
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config"),
+            format!("{line}\n{foreign}"),
+            "строка поднята первой, чужое содержимое байт-в-байт"
+        );
+    }
+
+    #[test]
+    fn foreign_host_with_same_name_shows_collision_warning() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let (registry, config) = fixture_ssh(dir.path());
+        std::fs::create_dir(config.parent().expect(".ssh")).expect("mkdir .ssh");
+        std::fs::write(&config, "Host devbox\n    HostName 203.0.113.9\n").expect("config");
+        let mut harness = harness_at(registry);
+
+        expand_first_card(&mut harness);
+        settle(&mut harness);
+
+        harness.get_by_label_contains("уже занято");
+    }
+
+    #[test]
+    fn closed_vault_card_says_keys_unavailable() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let (registry, _config) = fixture_ssh(dir.path());
+        let mut harness = harness_at(registry);
+
+        expand_first_card(&mut harness);
+        harness.run();
+
+        harness.get_by_label_contains("ключи недоступны");
     }
 
     #[test]
