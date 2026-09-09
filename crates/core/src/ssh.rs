@@ -333,6 +333,9 @@ pub async fn ssh_g(
         cmd.arg("-F").arg(config);
     }
     cmd.arg(host);
+    // Таймаут дропает future, но не процесс: без kill_on_drop ssh (и его
+    // Match exec) жил бы дальше (прецедент — header.rs/keyslot.rs).
+    cmd.kill_on_drop(true);
     let out = match tokio::time::timeout(timeout, cmd.output()).await {
         Ok(result) => result?,
         Err(_) => {

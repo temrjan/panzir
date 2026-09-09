@@ -1282,10 +1282,15 @@ async fn run_add_ssh_host(
     let text = panzir_core::ssh::render_snippet(entry.ssh_hosts(), &symlink);
     match panzir_core::ssh::write_snippet_atomic(&snippet, &text).await {
         Ok(()) => OpOutcome::Loaded(entries),
-        Err(e) => OpOutcome::Failed(format!(
-            "хост записан в список, но сниппет не обновился: {}",
-            error_text(&Error::from(e))
-        )),
+        // Хост уже записан в реестр — это успех с отказавшей производной,
+        // а не отказ операции: список обновляем, ворнинг говорим (инв. 10).
+        Err(e) => OpOutcome::LoadedWith(
+            entries,
+            format!(
+                "хост записан в список, но сниппет не обновился: {}",
+                error_text(&Error::from(e))
+            ),
+        ),
     }
 }
 

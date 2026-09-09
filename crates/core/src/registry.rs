@@ -398,7 +398,7 @@ impl Registry {
             .vaults
             .into_iter()
             .map(|v| {
-                Ok(VaultEntry {
+                let entry = VaultEntry {
                     label: Label::new(&v.label)?,
                     kind: match v.kind {
                         StoredKind::File { path } => VaultKind::File(path),
@@ -415,7 +415,14 @@ impl Registry {
                     close_attempts: v.close_attempts,
                     close_deferred_since: v.close_deferred_since,
                     ssh_hosts: v.ssh_hosts,
-                })
+                };
+                // Граница доверия: реестр мог быть правлен руками. Поля,
+                // попадающие в генерируемый конфиг, обязаны пройти ту же
+                // валидацию, что и ввод из окна.
+                for h in &entry.ssh_hosts {
+                    SshHost::new(&h.host, &h.hostname, &h.user, h.port, &h.key_file)?;
+                }
+                Ok(entry)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -636,6 +643,31 @@ mod tests {
             VaultKind::File(PathBuf::from(format!("/tmp/{label}.vault"))),
             VaultState::Closed,
         )
+    }
+
+    /// Реестр, правленный руками с невалидным хостом, отвергается на границе
+    /// чтения: иначе произвольная строка уехала бы в генерируемый конфиг
+    /// в обход конструктора (ревью Гейта-2, минор №2).
+    #[tokio::test]
+    async fn hand_edited_registry_with_invalid_ssh_host_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        tokio::fs::write(
+            &path,
+            "[[vaults]]\nlabel = \"work\"\nkind = \"file\"\npath = \"/tmp/work.vault\"\n\
+             [vaults.state]\nclosed = {}\n\n\
+             [[vaults.ssh_hosts]]\nhost = \"Bad Host\"\nhostname = \"192.0.2.10\"\n\
+             user = \"u\"\nkey_file = \"id\"\n",
+        )
+        .await
+        .expect("write hand-edited registry");
+        let err = Registry::load_from(&path)
+            .await
+            .expect_err("invalid host must fail load");
+        assert!(
+            matches!(err, Error::Ssh(_)),
+            "expected Ssh error, got {err:?}"
+        );
     }
 
     /// SSH-хосты хранятся в реестре массивом таблиц и переживают
