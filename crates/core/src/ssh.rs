@@ -6,7 +6,10 @@
 //! config молча не редактируем: вставка и починка строки — только по
 //! подтверждению пользователя, чужое содержимое сохраняется байт-в-байт.
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+
+use tokio::io::AsyncWriteExt as _;
 
 use crate::registry::SshHost;
 use crate::vault::Label;
@@ -22,6 +25,9 @@ pub enum SshError {
         /// Отвергнутое значение.
         value: String,
     },
+    /// Ошибка ввода-вывода при записи сниппета или правке config.
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Статус строки `Include` в `~/.ssh/config`.
@@ -172,6 +178,51 @@ pub fn repair_include_first(text: &str, include_line: &str) -> String {
     insert_include_line(&without, include_line)
 }
 
+/// Атомарно (пере)записать сниппет с правами 0600 — образец
+/// `Registry::save_atomic`: временный файл `create_new` + mode → write →
+/// flush → sync_all → rename поверх старого. Сниппет — производная реестра,
+/// перезапись штатна. Родительский каталог создаётся 0700, если его нет.
+///
+/// # Errors
+/// [`SshError::Io`] — ошибка FS.
+pub async fn write_snippet_atomic(path: &Path, text: &str) -> Result<(), SshError> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+        tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp = path.with_extension(format!("tmp.{}-{}", std::process::id(), uniq));
+
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)
+            .await?;
+        file.write_all(text.as_bytes()).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+
+    if let Err(e) = write_result {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(e.into());
+    }
+
+    if let Err(e) = tokio::fs::rename(&temp, path).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 // expect/unwrap в тестах — осознанно (закон №3: unwrap/expect только в тестах и main).
 #[allow(clippy::expect_used, clippy::unwrap_used)]
@@ -187,6 +238,41 @@ mod tests {
 
     fn nas() -> SshHost {
         SshHost::new("nas", "nas.lan", "root", None, "id_nas").expect("valid host")
+    }
+
+    /// Сниппет пишется атомарно, с правами 0600 и перезаписывается поверх
+    /// старого; родитель создаётся 0700.
+    #[tokio::test]
+    async fn snippet_write_is_atomic_and_restricted() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("ssh-work.conf");
+        write_snippet_atomic(&path, "Host devbox\n")
+            .await
+            .expect("write snippet");
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(text, "Host devbox\n");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "snippet mode is {mode:o}, expected 600");
+        let parent_mode = std::fs::metadata(path.parent().expect("parent"))
+            .expect("parent meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(parent_mode, 0o700, "parent mode is {parent_mode:o}");
+
+        // Перезапись поверх существующего — штатна (производная реестра).
+        write_snippet_atomic(&path, "Host nas\n")
+            .await
+            .expect("rewrite snippet");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "Host nas\n");
+        // Временных файлов рядом не остаётся.
+        let leftovers = std::fs::read_dir(path.parent().expect("parent"))
+            .expect("read dir")
+            .count();
+        assert_eq!(leftovers, 1, "only the snippet should remain");
     }
 
     #[test]

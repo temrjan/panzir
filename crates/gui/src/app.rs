@@ -13,8 +13,9 @@ use eframe::egui;
 use panzir_core::create;
 use panzir_core::deps::{self, DepsReport};
 use panzir_core::lifecycle::{self, CloseDecision, close_decision};
-use panzir_core::registry::{Registry, VaultEntry};
+use panzir_core::registry::{Registry, SshHost, VaultEntry};
 use panzir_core::schedule::SystemdUser;
+use panzir_core::ssh::SshError;
 use panzir_core::udisks::Udisks;
 use panzir_core::vault::{DEFAULT_AUTO_CLOSE, Label, VaultKind, VaultState, container_path};
 use panzir_core::{AuthRefusal, Error};
@@ -24,7 +25,7 @@ use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
 use crate::view_create::{self, CreateAction, CreateDraft};
-use crate::view_list::{self, ListAction, ListInput, RenameDraft, UnlockDraft};
+use crate::view_list::{self, ListAction, ListInput, RenameDraft, SshHostDraft, UnlockDraft};
 
 /// Сколько ждём завершения операции в тестах, прежде чем признать зависание.
 /// Не «пауза для стабилизации»: ожидание идёт по настоящему сигналу завершения
@@ -99,6 +100,13 @@ enum Op {
         /// Пароль. Дальше окна в открытом виде не живёт: `SecretString`
         /// затирает себя при уничтожении.
         passphrase: SecretString,
+    },
+    /// Добавить SSH-хоста к записи и перезаписать сниппет (спека Ш-7).
+    AddSshHost {
+        /// Метка записи.
+        label: Label,
+        /// Проверенный конструктором хост.
+        host: SshHost,
     },
 }
 
@@ -315,6 +323,16 @@ pub fn error_text(err: &Error) -> String {
                 "на файле {path} найдено {count} подключений вместо одного — это уже повреждение, закройте хранилище сторонними средствами"
             )
         }
+        Error::Ssh(SshError::InvalidField { field, value }) => {
+            let rule = match *field {
+                "host" | "key_file" => {
+                    "разрешены строчные буквы, цифры, точка, дефис и подчёркивание"
+                }
+                _ => "без пробелов и символа «#»",
+            };
+            format!("SSH-хост: поле «{field}» не подходит: «{value}» — {rule}")
+        }
+        Error::Ssh(SshError::Io(e)) => format!("SSH-связка: ошибка ввода-вывода: {e}"),
     }
 }
 
@@ -395,6 +413,8 @@ pub struct App {
     rename: Option<RenameDraft>,
     expanded: Option<Label>,
     unlock: Option<UnlockDraft>,
+    /// Черновик добавления SSH-хоста (не секрет — затирать не нужно).
+    ssh_draft: Option<SshHostDraft>,
     screen: Screen,
     /// Черновик формы создания (секреты внутри). `Some` даже после ухода с
     /// формы — затирается единым местом (`forget_stale_passphrase`), когда
@@ -447,6 +467,7 @@ impl App {
             rename: None,
             expanded: None,
             unlock: None,
+            ssh_draft: None,
             screen: Screen::List,
             create: None,
         };
@@ -748,6 +769,45 @@ impl App {
                 self.screen = Screen::Create;
                 self.create = Some(CreateDraft::default());
             }
+            ListAction::AddSshHost {
+                target,
+                host,
+                hostname,
+                user,
+                port,
+                key_file,
+            } => {
+                // Порт — опциональное поле: пусто → None, иначе число.
+                let port = match port.trim() {
+                    "" => None,
+                    raw => match raw.parse::<u16>() {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            self.message = Some(
+                                "порт не подходит: целое число от 1 до 65535, либо пусто"
+                                    .to_owned(),
+                            );
+                            return;
+                        }
+                    },
+                };
+                match SshHost::new(&host, &hostname, &user, port, &key_file) {
+                    Ok(host) => {
+                        // Черновик снимается только если операция началась —
+                        // как у переименования: набранное не пропадает молча.
+                        if self.spawn_op(
+                            ctx,
+                            Op::AddSshHost {
+                                label: target,
+                                host,
+                            },
+                        ) {
+                            self.ssh_draft = None;
+                        }
+                    }
+                    Err(e) => self.message = Some(error_text(&Error::from(e))),
+                }
+            }
         }
     }
 
@@ -878,6 +938,7 @@ impl eframe::App for App {
                         rename: &mut self.rename,
                         expanded: &mut self.expanded,
                         unlock: &mut self.unlock,
+                        ssh_draft: &mut self.ssh_draft,
                     },
                 );
                 if let Some(action) = action {
@@ -941,6 +1002,53 @@ async fn run_op(
             size_bytes,
             passphrase,
         } => run_create(path, home, &label, &container, size_bytes, &passphrase).await,
+        Op::AddSshHost { label, host } => run_add_ssh_host(path, home, &label, host).await,
+    }
+}
+
+/// Добавление SSH-хоста: правда — в реестр под локом, затем сниппет
+/// перезаписывается как производная (спека Ш-7). Отказ записи сниппета не
+/// откатывает реестр: при открытии сниппет пересоздаётся из реестра.
+async fn run_add_ssh_host(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    label: &Label,
+    host: SshHost,
+) -> OpOutcome {
+    let written = Registry::with_write_lock_at(path, {
+        let label = label.clone();
+        move |r| {
+            let entry = r
+                .entries_mut()
+                .iter_mut()
+                .find(|e| e.label().as_str() == label.as_str())
+                .ok_or_else(|| Error::VaultNotFound(label.as_str().to_owned()))?;
+            entry.add_ssh_host(host);
+            Ok(r.entries().to_vec())
+        }
+    })
+    .await;
+    let entries = match written {
+        Ok(entries) => entries,
+        Err(e) => return OpOutcome::Failed(error_text(&e)),
+    };
+
+    let Some(entry) = entries
+        .iter()
+        .find(|e| e.label().as_str() == label.as_str())
+    else {
+        return OpOutcome::Loaded(entries);
+    };
+    let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let snippet = panzir_core::ssh::snippet_path(config_dir, label);
+    let symlink = panzir_core::mountpoint::symlink_path(home, label);
+    let text = panzir_core::ssh::render_snippet(entry.ssh_hosts(), &symlink);
+    match panzir_core::ssh::write_snippet_atomic(&snippet, &text).await {
+        Ok(()) => OpOutcome::Loaded(entries),
+        Err(e) => OpOutcome::Failed(format!(
+            "хост записан в список, но сниппет не обновился: {}",
+            error_text(&Error::from(e))
+        )),
     }
 }
 
@@ -1332,6 +1440,11 @@ mod tests {
                 path: "/tmp/x.vault".to_owned(),
                 count: 2,
             },
+            Error::Ssh(SshError::InvalidField {
+                field: "host",
+                value: "Bad Host".to_owned(),
+            }),
+            Error::Ssh(SshError::Io(std::io::Error::other("проба"))),
         ]
     }
 
@@ -1990,6 +2103,129 @@ mod tests {
         harness.state_mut().block_until_idle();
         harness.run();
         harness
+    }
+
+    // ---------- Ш-7: добавление SSH-хоста с карточки ----------
+
+    /// Раскрыть карточку первой записи и начать черновик добавления хоста.
+    fn start_ssh_draft(harness: &mut Harness<'static, App>) {
+        harness
+            .get_all_by_label("Подробнее")
+            .next()
+            .expect("кнопка раскрытия первой записи")
+            .click();
+        harness.run();
+        harness.get_by_label("Добавить хост").click();
+        harness.run();
+    }
+
+    fn fill_ssh_draft(harness: &mut Harness<'static, App>, host: &str, port: &str) {
+        let mut draft = harness
+            .state_mut()
+            .ssh_draft
+            .take()
+            .expect("черновик хоста");
+        draft.host = host.to_owned();
+        draft.hostname = "192.0.2.10".to_owned();
+        draft.user = "devbox".to_owned();
+        draft.port = port.to_owned();
+        draft.key_file = "id_ed25519".to_owned();
+        harness.state_mut().ssh_draft = Some(draft);
+    }
+
+    #[test]
+    fn adding_ssh_host_writes_registry_and_snippet() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_ssh_draft(&mut harness);
+        fill_ssh_draft(&mut harness, "devbox", "9281");
+
+        harness.get_by_label("Сохранить хост").click();
+        harness.run();
+        harness.state_mut().block_until_idle();
+        harness.run();
+
+        // Правда — в реестре.
+        let text = std::fs::read_to_string(dir.path().join("vaults.toml")).expect("registry");
+        assert!(
+            text.contains("[[vaults.ssh_hosts]]"),
+            "host must be stored:\n{text}"
+        );
+        assert!(text.contains("port = 9281"), "port must be stored:\n{text}");
+        // Сниппет — производная, записана рядом с реестром, 0600.
+        let snippet = dir.path().join("ssh-t-alpha.conf");
+        let content = std::fs::read_to_string(&snippet).expect("snippet written");
+        assert!(content.contains("Host devbox\n"), "snippet:\n{content}");
+        assert!(
+            content.contains("IdentitiesOnly yes\n"),
+            "snippet:\n{content}"
+        );
+        assert!(
+            content.contains(&format!(
+                "IdentityFile {}/panzir-t-alpha/id_ed25519\n",
+                dir.path().display()
+            )),
+            "snippet:\n{content}"
+        );
+        // Карточка показывает добавленного хоста.
+        harness.get_by_label_contains("devbox");
+    }
+
+    #[test]
+    fn invalid_ssh_host_field_is_refused_with_message_and_draft_kept() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_ssh_draft(&mut harness);
+        fill_ssh_draft(&mut harness, "Bad Host", "9281");
+
+        harness.get_by_label("Сохранить хост").click();
+        harness.run();
+
+        harness.get_by_label_contains("не подходит");
+        assert!(
+            harness.state().ssh_draft.is_some(),
+            "черновик обязан пережить отказ валидации — иначе набранное пропало молча"
+        );
+        // Реестр не тронут.
+        let text = std::fs::read_to_string(dir.path().join("vaults.toml")).expect("registry");
+        assert!(
+            !text.contains("ssh_hosts"),
+            "registry must stay clean:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unparsable_ssh_port_is_refused_with_message() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_ssh_draft(&mut harness);
+        fill_ssh_draft(&mut harness, "devbox", "не число");
+
+        harness.get_by_label("Сохранить хост").click();
+        harness.run();
+
+        harness.get_by_label_contains("порт");
+        assert!(harness.state().ssh_draft.is_some());
+    }
+
+    #[test]
+    fn ssh_host_without_port_is_stored_without_port() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+        start_ssh_draft(&mut harness);
+        fill_ssh_draft(&mut harness, "devbox", "");
+
+        harness.get_by_label("Сохранить хост").click();
+        harness.run();
+        harness.state_mut().block_until_idle();
+        harness.run();
+
+        let content =
+            std::fs::read_to_string(dir.path().join("ssh-t-alpha.conf")).expect("snippet");
+        assert!(
+            !content.contains("Port"),
+            "no Port line expected:\n{content}"
+        );
     }
 
     #[test]

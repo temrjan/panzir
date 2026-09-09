@@ -34,6 +34,9 @@ pub struct VaultEntry {
     /// Момент первой неудачи текущей серии, секунды Unix — карточке есть что
     /// показать («не закрывается с …»).
     close_deferred_since: Option<u64>,
+    /// SSH-хосты хранилища (спека Ш-7, Р-2: реестр — единственная правда;
+    /// сниппет — перезаписываемая производная).
+    ssh_hosts: Vec<SshHost>,
 }
 
 impl VaultEntry {
@@ -46,7 +49,19 @@ impl VaultEntry {
             auto_close: Some(DEFAULT_AUTO_CLOSE),
             close_attempts: 0,
             close_deferred_since: None,
+            ssh_hosts: Vec::new(),
         }
+    }
+
+    /// SSH-хосты хранилища (спека Ш-7).
+    pub fn ssh_hosts(&self) -> &[SshHost] {
+        &self.ssh_hosts
+    }
+
+    /// Добавить SSH-хоста (внутри [`Registry::with_write_lock`]). Поля уже
+    /// проверены конструктором [`SshHost::new`].
+    pub fn add_ssh_host(&mut self, host: SshHost) {
+        self.ssh_hosts.push(host);
     }
 
     /// Сколько раз подряд автозакрытие отступило перед занятым томом.
@@ -272,6 +287,11 @@ struct StoredEntry {
     close_attempts: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     close_deferred_since: Option<u64>,
+    /// Отсутствует в файлах до SSH-связки → пустой список, миграции нет.
+    /// Последнее поле: массив таблиц `[[vaults.ssh_hosts]]` обязан идти после
+    /// скаляров и таблицы `[vaults.state]`, иначе TOML не сходится.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ssh_hosts: Vec<SshHost>,
 }
 
 fn is_zero(n: &u8) -> bool {
@@ -394,6 +414,7 @@ impl Registry {
                     auto_close: v.auto_close_sec.into(),
                     close_attempts: v.close_attempts,
                     close_deferred_since: v.close_deferred_since,
+                    ssh_hosts: v.ssh_hosts,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -516,6 +537,7 @@ impl Registry {
                     auto_close_sec: e.auto_close.into(),
                     close_attempts: e.close_attempts,
                     close_deferred_since: e.close_deferred_since,
+                    ssh_hosts: e.ssh_hosts.clone(),
                 })
                 .collect(),
         };
@@ -614,6 +636,68 @@ mod tests {
             VaultKind::File(PathBuf::from(format!("/tmp/{label}.vault"))),
             VaultState::Closed,
         )
+    }
+
+    /// SSH-хосты хранятся в реестре массивом таблиц и переживают
+    /// запись/чтение; старый файл без ключа читается с пустым списком.
+    #[tokio::test]
+    async fn ssh_hosts_roundtrip_and_absent_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        Registry::with_write_lock_at(&path, |r| {
+            let mut a = entry("a");
+            a.add_ssh_host(
+                SshHost::new("devbox", "192.0.2.10", "devbox", Some(9281), "id_ed25519")
+                    .expect("valid host"),
+            );
+            a.add_ssh_host(
+                SshHost::new("nas", "nas.lan", "root", None, "id_nas").expect("valid host"),
+            );
+            r.add(a)?;
+            r.add(entry("b"))
+        })
+        .await
+        .expect("write");
+        let text = tokio::fs::read_to_string(&path).await.expect("read");
+        assert_eq!(
+            text.matches("[[vaults.ssh_hosts]]").count(),
+            2,
+            "hosts must be an array of tables, got:\n{text}"
+        );
+        assert!(
+            text.contains("port = 9281"),
+            "port must roundtrip, got:\n{text}"
+        );
+        let reg = Registry::load_from(&path).await.expect("reload");
+        let a = &reg.entries()[0];
+        assert_eq!(a.ssh_hosts().len(), 2);
+        assert_eq!(a.ssh_hosts()[0].host, "devbox");
+        assert_eq!(a.ssh_hosts()[0].port, Some(9281));
+        assert_eq!(a.ssh_hosts()[1].host, "nas");
+        assert_eq!(a.ssh_hosts()[1].port, None);
+        assert!(
+            reg.entries()[1].ssh_hosts().is_empty(),
+            "entry without hosts stays empty"
+        );
+    }
+
+    /// Файл времён до SSH-связки (ключа `ssh_hosts` нет) читается без
+    /// миграции — список хостов пуст.
+    #[tokio::test]
+    async fn load_registry_without_ssh_hosts_uses_empty_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vaults.toml");
+        tokio::fs::write(
+            &path,
+            "[[vaults]]\nlabel = \"work\"\nkind = \"file\"\npath = \"/tmp/work.vault\"\n\
+             [vaults.state]\nclosed = {}\n",
+        )
+        .await
+        .expect("write old-format registry");
+        let reg = Registry::load_from(&path)
+            .await
+            .expect("old file must parse");
+        assert!(reg.entries()[0].ssh_hosts().is_empty());
     }
 
     #[test]

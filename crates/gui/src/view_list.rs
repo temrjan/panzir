@@ -30,6 +30,23 @@ pub struct UnlockDraft {
     pub text: String,
 }
 
+/// Начатое добавление SSH-хоста: для какой записи и что набрано.
+/// Поля — сырые строки; проверяет ядро (`SshHost::new`) при отправке.
+pub struct SshHostDraft {
+    /// Метка записи, к которой добавляют хоста.
+    pub target: Label,
+    /// Алиас (`Host`), как его наберут в командной строке.
+    pub host: String,
+    /// Адрес (`HostName`).
+    pub hostname: String,
+    /// Логин (`User`).
+    pub user: String,
+    /// Порт — пусто или число (`Port` пишется только при числе).
+    pub port: String,
+    /// Имя файла ключа внутри хранилища.
+    pub key_file: String,
+}
+
 /// Что человек попросил сделать.
 pub enum ListAction {
     /// Открыть хранилище набранной фразой.
@@ -47,6 +64,21 @@ pub enum ListAction {
     },
     /// Перейти на экран создания нового хранилища.
     StartCreate,
+    /// Добавить SSH-хоста к записи. Поля — сырые строки из черновика.
+    AddSshHost {
+        /// Метка записи.
+        target: Label,
+        /// Набранный алиас.
+        host: String,
+        /// Набранный адрес.
+        hostname: String,
+        /// Набранный логин.
+        user: String,
+        /// Набранный порт (пусто — без порта).
+        port: String,
+        /// Набранное имя файла ключа.
+        key_file: String,
+    },
 }
 
 /// Всё, что экрану нужно для отрисовки.
@@ -63,6 +95,8 @@ pub struct ListInput<'a> {
     pub rename: &'a mut Option<RenameDraft>,
     /// Начатый ввод парольной фразы.
     pub unlock: &'a mut Option<UnlockDraft>,
+    /// Начатое добавление SSH-хоста.
+    pub ssh_draft: &'a mut Option<SshHostDraft>,
     /// Метка записи, чья карточка раскрыта. Раскрыта не более одной: операция
     /// всё равно идёт одна за раз, а два раскрытых поля пароля означали бы два
     /// секрета в памяти вместо одного.
@@ -101,6 +135,7 @@ pub fn show(ui: &mut egui::Ui, input: ListInput<'_>) -> Option<ListAction> {
                 input.rename,
                 input.expanded,
                 input.unlock,
+                input.ssh_draft,
             ) {
                 action = Some(a);
             }
@@ -128,6 +163,7 @@ fn show_entry(
     rename: &mut Option<RenameDraft>,
     expanded: &mut Option<Label>,
     unlock: &mut Option<UnlockDraft>,
+    ssh_draft: &mut Option<SshHostDraft>,
 ) -> Option<ListAction> {
     let mut action = None;
     let label = entry.label().clone();
@@ -204,7 +240,9 @@ fn show_entry(
 
     if is_expanded
         && let Some(a) = ui
-            .indent(label.as_str(), |ui| show_card(ui, entry, busy, unlock))
+            .indent(label.as_str(), |ui| {
+                show_card(ui, entry, busy, unlock, ssh_draft)
+            })
             .inner
     {
         action = Some(a);
@@ -219,6 +257,7 @@ fn show_card(
     entry: &VaultEntry,
     busy: bool,
     unlock: &mut Option<UnlockDraft>,
+    ssh_draft: &mut Option<SshHostDraft>,
 ) -> Option<ListAction> {
     match entry.kind() {
         VaultKind::File(path) => ui.label(format!("Файл: {}", path.display())),
@@ -244,7 +283,7 @@ fn show_card(
     }
 
     let label = entry.label().clone();
-    let mut action = None;
+    let mut action = show_ssh_section(ui, entry, busy, ssh_draft);
 
     ui.add_enabled_ui(!busy, |ui| {
         if matches!(entry.state(), VaultState::Open { .. }) {
@@ -285,6 +324,95 @@ fn show_card(
             *unlock = Some(UnlockDraft {
                 target: label.clone(),
                 text: String::new(),
+            });
+        }
+    });
+    action
+}
+
+/// Секция SSH-связки на карточке (спека Ш-7): список хостов из реестра и
+/// черновик добавления. Кнопка вставки `Include` (по подтверждению) и
+/// ворнинги сверки — отдельные шаги спеки; здесь их нет намеренно.
+fn show_ssh_section(
+    ui: &mut egui::Ui,
+    entry: &VaultEntry,
+    busy: bool,
+    ssh_draft: &mut Option<SshHostDraft>,
+) -> Option<ListAction> {
+    let mut action = None;
+    let label = entry.label().clone();
+
+    ui.separator();
+    ui.label("SSH-связка:");
+    if entry.ssh_hosts().is_empty() {
+        ui.label("хостов нет");
+    } else {
+        for h in entry.ssh_hosts() {
+            let port = h.port.map_or(String::new(), |p| format!(":{p}"));
+            ui.label(format!(
+                "{} → {}@{}{} · ключ {}",
+                h.host, h.user, h.hostname, port, h.key_file
+            ));
+        }
+        // Контракт, видимый пользователю: закрытое хранилище — ключи
+        // недоступны (IdentityFile указывает в мёртвый симлинк).
+        if !matches!(entry.state(), VaultState::Open { .. }) {
+            ui.label("хранилище закрыто — ключи недоступны");
+        }
+    }
+
+    ui.add_enabled_ui(!busy, |ui| {
+        let drafting = ssh_draft
+            .as_ref()
+            .is_some_and(|d| d.target.as_str() == label.as_str());
+        if drafting {
+            if let Some(d) = ssh_draft.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.label("Имя хоста:");
+                    ui.text_edit_singleline(&mut d.host);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Адрес:");
+                    ui.text_edit_singleline(&mut d.hostname);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Логин:");
+                    ui.text_edit_singleline(&mut d.user);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Порт (необязательно):");
+                    ui.text_edit_singleline(&mut d.port);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Файл ключа:");
+                    ui.text_edit_singleline(&mut d.key_file);
+                });
+            }
+            // Черновик здесь НЕ забираем: его снимает `app.rs`, и только если
+            // операция ушла в работу — как у переименования.
+            if ui.button("Сохранить хост").clicked()
+                && let Some(d) = ssh_draft.as_ref()
+            {
+                action = Some(ListAction::AddSshHost {
+                    target: d.target.clone(),
+                    host: d.host.clone(),
+                    hostname: d.hostname.clone(),
+                    user: d.user.clone(),
+                    port: d.port.clone(),
+                    key_file: d.key_file.clone(),
+                });
+            }
+            if ui.button("Отмена").clicked() {
+                *ssh_draft = None;
+            }
+        } else if ui.button("Добавить хост").clicked() {
+            *ssh_draft = Some(SshHostDraft {
+                target: label.clone(),
+                host: String::new(),
+                hostname: String::new(),
+                user: String::new(),
+                port: String::new(),
+                key_file: String::new(),
             });
         }
     });
