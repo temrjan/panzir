@@ -55,7 +55,8 @@ fn in_path(bin: &str) -> bool {
 
 /// Проверяет локальные зависимости: утилиты, которыми пользуется прод-путь
 /// (stat/chattr/fallocate — создание контейнера; cryptsetup — keyslot/backup,
-/// PR-2) и `pkexec`. udisks2 проверяется отдельно — он требует async-контекста
+/// PR-2; ssh — SSH-связка хранилища, Ш-7) и `pkexec`. udisks2 проверяется
+/// отдельно — он требует async-контекста
 /// (см. [`crate::udisks::Udisks::connect`]).
 ///
 /// Агента аутентификации polkit здесь нет намеренно, и заводить обратно его
@@ -75,6 +76,7 @@ pub fn check_local_deps() -> DepsReport {
         ("cryptsetup", "cryptsetup"),
         ("pkexec", "polkit"),
         ("systemd-run", "systemd"),
+        ("ssh", "openssh-clients"),
     ] {
         statuses.push(DepStatus {
             name,
@@ -109,6 +111,7 @@ mod tests {
                 "cryptsetup",
                 "pkexec",
                 "systemd-run",
+                "ssh",
             ],
             "плашка обязана называть только то, что проверено измерением: \
              запись, чьё значение получено догадкой, — ложная тревога при каждом запуске"
