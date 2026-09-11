@@ -9,7 +9,9 @@ use panzir_core::ssh::IncludeStatus;
 use panzir_core::vault::{Label, VaultKind, VaultState};
 use secrecy::zeroize::Zeroize as _;
 
-use crate::app::{EnvLine, SshCardStatus, SshConfirm, busy_message, kind_text, state_text};
+use crate::app::{
+    DeleteDraft, EnvLine, SshCardStatus, SshConfirm, busy_message, kind_text, state_text,
+};
 
 /// Начатое переименование: какую запись меняем и что уже набрано.
 pub struct RenameDraft {
@@ -65,8 +67,10 @@ pub enum ListAction {
     Open(Label),
     /// Закрыть хранилище.
     Close(Label),
-    /// Убрать запись из списка. Файл на диске не трогается.
-    Remove(Label),
+    /// Показать баннер удаления записи (П-1): сам по себе ничего не удаляет.
+    AskDelete(Label),
+    /// Человек подтвердил удаление в баннере. Файл на диске не трогается.
+    ConfirmDelete,
     /// Применить новое имя.
     CommitRename {
         /// Старая метка.
@@ -122,6 +126,8 @@ pub struct ListInput<'a> {
     pub ssh_status: &'a Option<SshCardStatus>,
     /// Ожидающее подтверждение вставление/починка строки `Include`.
     pub ssh_confirm: &'a mut Option<SshConfirm>,
+    /// Начатое удаление записи: баннер на карточке (П-1).
+    pub delete: &'a mut Option<DeleteDraft>,
     /// Метка записи, чья карточка раскрыта. Раскрыта не более одной: операция
     /// всё равно идёт одна за раз, а два раскрытых поля пароля означали бы два
     /// секрета в памяти вместо одного.
@@ -153,26 +159,37 @@ pub fn show(ui: &mut egui::Ui, input: ListInput<'_>) -> Option<ListAction> {
         ui.label("Хранилищ пока нет");
     } else {
         for entry in input.entries {
+            let mut card = EntryCard {
+                rename: &mut *input.rename,
+                expanded: &mut *input.expanded,
+                unlock: &mut *input.unlock,
+                delete: &mut *input.delete,
+            };
             let mut ssh = SshCard {
                 draft: &mut *input.ssh_draft,
                 status: input.ssh_status,
                 confirm: &mut *input.ssh_confirm,
             };
-            if let Some(a) = show_entry(
-                ui,
-                entry,
-                input.busy,
-                input.rename,
-                input.expanded,
-                input.unlock,
-                &mut ssh,
-            ) {
+            if let Some(a) = show_entry(ui, entry, input.busy, &mut card, &mut ssh) {
                 action = Some(a);
             }
         }
     }
 
     action
+}
+
+/// Черновики и раскрытие одной записи — собраны в одну структуру, чтобы
+/// сигнатуры рендера не расползались (тот же приём, что `SshCard`).
+struct EntryCard<'a> {
+    /// Начатое переименование.
+    rename: &'a mut Option<RenameDraft>,
+    /// Метка раскрытой карточки.
+    expanded: &'a mut Option<Label>,
+    /// Начатый ввод парольной фразы разблокировки.
+    unlock: &'a mut Option<UnlockDraft>,
+    /// Начатое удаление записи (баннер П-1).
+    delete: &'a mut Option<DeleteDraft>,
 }
 
 fn show_env(ui: &mut egui::Ui, env: &[EnvLine]) {
@@ -190,16 +207,15 @@ fn show_entry(
     ui: &mut egui::Ui,
     entry: &VaultEntry,
     busy: bool,
-    rename: &mut Option<RenameDraft>,
-    expanded: &mut Option<Label>,
-    unlock: &mut Option<UnlockDraft>,
+    card: &mut EntryCard,
     ssh: &mut SshCard,
 ) -> Option<ListAction> {
     let mut action = None;
     let label = entry.label().clone();
     // Считаем ДО кнопки: переключение вступает в силу следующим кадром, иначе
     // карточка раскрывалась бы и схлопывалась в одном и том же кадре.
-    let is_expanded = expanded
+    let is_expanded = card
+        .expanded
         .as_ref()
         .is_some_and(|l| l.as_str() == label.as_str());
 
@@ -211,13 +227,14 @@ fn show_entry(
             state_text(entry.state())
         ));
 
-        let editing = rename
+        let editing = card
+            .rename
             .as_ref()
             .is_some_and(|draft| draft.target.as_str() == label.as_str());
 
         if editing {
             ui.add_enabled_ui(!busy, |ui| {
-                if let Some(draft) = rename.as_mut() {
+                if let Some(draft) = card.rename.as_mut() {
                     ui.text_edit_singleline(&mut draft.text);
                 }
                 // Черновик здесь НЕ забираем: его чистит `app.rs`, и только
@@ -225,7 +242,7 @@ fn show_entry(
                 // имя пропадало бы молча — поле закрылось, имя прежнее,
                 // сообщения нет.
                 if ui.button("Сохранить").clicked()
-                    && let Some(draft) = rename.as_ref()
+                    && let Some(draft) = card.rename.as_ref()
                 {
                     action = Some(ListAction::CommitRename {
                         old: draft.target.clone(),
@@ -233,16 +250,18 @@ fn show_entry(
                     });
                 }
                 if ui.button("Отмена").clicked() {
-                    *rename = None;
+                    *card.rename = None;
                 }
             });
         } else {
             ui.add_enabled_ui(!busy, |ui| {
+                // П-1: клик не удаляет, а просит баннер — решение об
+                // осиротелости и раскрытии карточки принимает `app.rs`.
                 if ui.button("Удалить из списка").clicked() {
-                    action = Some(ListAction::Remove(label.clone()));
+                    action = Some(ListAction::AskDelete(label.clone()));
                 }
                 if ui.button("Переименовать").clicked() {
-                    *rename = Some(RenameDraft {
+                    *card.rename = Some(RenameDraft {
                         target: label.clone(),
                         text: label.as_str().to_owned(),
                     });
@@ -260,7 +279,7 @@ fn show_entry(
             })
             .clicked()
         {
-            *expanded = if is_expanded {
+            *card.expanded = if is_expanded {
                 None
             } else {
                 Some(label.clone())
@@ -270,7 +289,9 @@ fn show_entry(
 
     if is_expanded
         && let Some(a) = ui
-            .indent(label.as_str(), |ui| show_card(ui, entry, busy, unlock, ssh))
+            .indent(label.as_str(), |ui| {
+                show_card(ui, entry, busy, card.unlock, card.delete, ssh)
+            })
             .inner
     {
         action = Some(a);
@@ -285,6 +306,7 @@ fn show_card(
     entry: &VaultEntry,
     busy: bool,
     unlock: &mut Option<UnlockDraft>,
+    delete: &mut Option<DeleteDraft>,
     ssh: &mut SshCard,
 ) -> Option<ListAction> {
     match entry.kind() {
@@ -311,7 +333,10 @@ fn show_card(
     }
 
     let label = entry.label().clone();
-    let mut action = show_ssh_section(ui, entry, busy, ssh);
+    let mut action = show_delete_banner(ui, &label, busy, delete);
+    if let Some(a) = show_ssh_section(ui, entry, busy, ssh) {
+        action = Some(a);
+    }
 
     ui.add_enabled_ui(!busy, |ui| {
         if matches!(entry.state(), VaultState::Open { .. }) {
@@ -353,6 +378,65 @@ fn show_card(
                 target: label.clone(),
                 text: String::new(),
             });
+        }
+    });
+    action
+}
+
+/// Баннер удаления записи (П-1/П-2): ратифицированный текст «что будет
+/// удалено», поле фразы (нет у сироты), «Удалить»/«Отмена». Тексты
+/// ратифицированы Капитаном дословно (гриль 10.09) — правка текста = правка
+/// спеки.
+fn show_delete_banner(
+    ui: &mut egui::Ui,
+    label: &Label,
+    busy: bool,
+    delete: &mut Option<DeleteDraft>,
+) -> Option<ListAction> {
+    let drafting = delete
+        .as_ref()
+        .is_some_and(|d| d.target.as_str() == label.as_str());
+    if !drafting {
+        return None;
+    }
+    let mut action = None;
+    ui.separator();
+    if let Some(d) = delete.as_mut() {
+        if d.orphan {
+            ui.label(
+                "Файла хранилища нет на месте. Если он на отключённом носителе — подключите \
+                 его и отмените удаление. Если переместили или удалили — удалится только \
+                 запись и SSH-след, хранилище из списка придётся добавлять заново.",
+            );
+        } else {
+            ui.label(format!(
+                "Будет удалено: — запись «{label}» из списка; — SSH-связка (строка в \
+                 ~/.ssh/config и файл-сниппет); — симлинк ~/panzir-{label}. Если хранилище \
+                 открыто, оно будет закрыто. Файл хранилища остаётся на диске — данные не \
+                 пострадают, хранилище можно добавить заново. Для подтверждения введите \
+                 парольную фразу хранилища."
+            ));
+            ui.horizontal(|ui| {
+                ui.label("Парольная фраза:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.passphrase)
+                        .password(true)
+                        .hint_text("фраза хранилища"),
+                );
+            });
+        }
+    }
+    ui.add_enabled_ui(!busy, |ui| {
+        if ui.button("Удалить").clicked() {
+            action = Some(ListAction::ConfirmDelete);
+        }
+        if ui.button("Отмена").clicked() {
+            // Отмена — уход секрета из памяти: буфер затирается ДО того, как
+            // черновик выпадет из области видимости (как у разблокировки).
+            if let Some(d) = delete.as_mut() {
+                d.passphrase.zeroize();
+            }
+            *delete = None;
         }
     });
     action
