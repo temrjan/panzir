@@ -99,7 +99,7 @@ pub struct SshConfirm {
 /// Начатое удаление записи (спека П-1/П-2): баннер на карточке с текстом
 /// «что будет удалено» и, если файл на месте, полем парольной фразы.
 /// Случайное нажатие «Удалить из списка» ничего не делает.
-#[derive(Debug)]
+/// `Debug` сознательно не выводится — как у `UnlockDraft`: внутри секрет.
 pub struct DeleteDraft {
     /// Метка записи.
     pub target: Label,
@@ -957,6 +957,12 @@ impl App {
                         // Осиротелость — проверкой пути в момент клика
                         // (гриль 6), не кэшем списка.
                         let orphan = !container.exists();
+                        // Прежний черновик мог держать набранную фразу (клик
+                        // по «Удалить из списка» при висевшем баннере): снятие
+                        // — только с затиранием, не прямым присваиванием (К-4).
+                        if let Some(mut old) = self.delete.take() {
+                            old.passphrase.zeroize();
+                        }
                         self.delete = Some(DeleteDraft {
                             target: label.clone(),
                             orphan,
@@ -3310,6 +3316,29 @@ mod tests {
             "ветка (б) обязана назвать препятствие: {closed_but_failed}"
         );
         assert!(foreign.contains("uid 1001"), "чужой uid: {foreign}");
+    }
+
+    /// Регрессия (Гейт-2, раунд 4, МИНОР): повторный клик «Удалить из
+    /// списка» при висевшем баннере обязан снять старый черновик С
+    /// затиранием, а не дропнуть набранную фразу прямым присваиванием.
+    /// Доказывается замена черновика (свежий — с пустым полем); затирание
+    /// старого буфера держится `zeroize` в `AskDelete` и читается глазами —
+    /// содержимое освобождённой памяти безопасный Rust не читает.
+    #[test]
+    fn reopening_the_delete_banner_replaces_the_draft() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+
+        open_delete_banner(&mut harness);
+        type_delete_passphrase(&mut harness, "набрано-но-не-отправлено");
+        // Второй клик по той же кнопке при висевшем баннере.
+        open_delete_banner(&mut harness);
+
+        let draft = harness.state().delete.as_ref().expect("черновик удаления");
+        assert!(
+            draft.passphrase.is_empty(),
+            "старая набранная фраза перешла в новый черновик"
+        );
     }
 
     /// Skip-страж по образцу М-4 (ssh_it.rs): без `cryptsetup` в PATH
