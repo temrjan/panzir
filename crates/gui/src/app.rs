@@ -12,7 +12,9 @@ use std::time::Duration;
 use eframe::egui;
 use panzir_core::create;
 use panzir_core::deps::{self, DepsReport};
+use panzir_core::keyslot;
 use panzir_core::lifecycle::{self, CloseDecision, close_decision};
+use panzir_core::passphrase::Passphrase;
 use panzir_core::registry::{Registry, SshHost, VaultEntry};
 use panzir_core::schedule::SystemdUser;
 use panzir_core::ssh::{self, IncludeStatus, SshError};
@@ -94,13 +96,42 @@ pub struct SshConfirm {
     pub line: String,
 }
 
+/// Начатое удаление записи (спека П-1/П-2): баннер на карточке с текстом
+/// «что будет удалено» и, если файл на месте, полем парольной фразы.
+/// Случайное нажатие «Удалить из списка» ничего не делает.
+/// `Debug` сознательно не выводится — как у `UnlockDraft`: внутри секрет.
+pub struct DeleteDraft {
+    /// Метка записи.
+    pub target: Label,
+    /// `true` — файла контейнера нет на месте (сирота): шаг фразы
+    /// пропускается, проверять не по чему (гриль 6).
+    pub orphan: bool,
+    /// Набранная фраза. Обычная `String`, как `UnlockDraft`: другого способа
+    /// принять ввод у egui нет. Живёт до нажатия кнопки — [`App`] забирает
+    /// содержимое `mem::take` и сразу кладёт в `SecretString`; на остальных
+    /// путях выхода затирается (`forget_stale_passphrase`, отмена).
+    pub passphrase: String,
+}
+
 /// Что окно просит у ядра. Все операции идут через одну дверь — [`App::spawn_op`].
 #[derive(Debug)]
 enum Op {
     /// Перечитать реестр.
     Reload,
-    /// Убрать запись из реестра. Контейнер на диске не трогается.
-    Remove(Label),
+    /// Удалить запись по двухшаговому сценарию (П-1/П-2): фраза → закрытие
+    /// (если открыт) → SSH-след → запись. Контейнер на диске не трогается.
+    Delete {
+        /// Метка записи.
+        label: Label,
+        /// Путь к файлу-контейнеру; `None` — сирота (файла нет на месте):
+        /// шаги фразы и закрытия пропускаются. Носитель сюда не доходит —
+        /// отказан ещё в `handle` (`refuse_device`).
+        container: Option<PathBuf>,
+        /// Фраза с баннера; `None` у сироты. Пара с `container`: файл на
+        /// месте без фразы — комбинация, которую окно не строит, и ядро-сторона
+        /// обязана отказать, а не молча пропустить проверку.
+        passphrase: Option<SecretString>,
+    },
     /// Открыть хранилище набранной фразой.
     Open {
         /// Метка записи.
@@ -483,6 +514,8 @@ pub struct App {
     ssh_draft: Option<SshHostDraft>,
     /// Ожидающее подтверждение вставление/починка строки `Include`.
     ssh_confirm: Option<SshConfirm>,
+    /// Начатое удаление записи — баннер на карточке (секрет внутри).
+    delete: Option<DeleteDraft>,
     screen: Screen,
     /// Черновик формы создания (секреты внутри). `Some` даже после ухода с
     /// формы — затирается единым местом (`forget_stale_passphrase`), когда
@@ -541,6 +574,7 @@ impl App {
             unlock: None,
             ssh_draft: None,
             ssh_confirm: None,
+            delete: None,
             screen: Screen::List,
             create: None,
         };
@@ -813,6 +847,15 @@ impl App {
         if !matches_card && let Some(mut draft) = self.unlock.take() {
             draft.text.zeroize();
         }
+        // Удаление (П-1): то же правило для фразы баннера — свернули
+        // карточку или раскрыли другую — набранное затирается (К-4).
+        let matches_card = match (&self.delete, &self.expanded) {
+            (Some(draft), Some(label)) => draft.target.as_str() == label.as_str(),
+            _ => false,
+        };
+        if !matches_card && let Some(mut draft) = self.delete.take() {
+            draft.passphrase.zeroize();
+        }
         // Создание: ушли с формы (`screen != Create`), а черновик завис —
         // затираем оба поля пароля. Одно место на оба черновика, чтобы новую
         // точку выхода не пришлось помнить (инвариант 5).
@@ -905,8 +948,70 @@ impl App {
                     None => self.refuse_device(),
                 }
             }
-            ListAction::Remove(label) => {
-                self.spawn_op(ctx, Op::Remove(label));
+            ListAction::AskDelete(label) => {
+                // Носитель — отказ словами, а не сирота: `container_of` даёт
+                // `None` для носителей (находка 1 ревью плана). Сирота —
+                // только файл, которого нет на месте.
+                match self.container_of(&label) {
+                    Some(container) => {
+                        // Осиротелость — проверкой пути в момент клика
+                        // (гриль 6), не кэшем списка.
+                        let orphan = !container.exists();
+                        // Прежний черновик мог держать набранную фразу (клик
+                        // по «Удалить из списка» при висевшем баннере): снятие
+                        // — только с затиранием, не прямым присваиванием (К-4).
+                        if let Some(mut old) = self.delete.take() {
+                            old.passphrase.zeroize();
+                        }
+                        self.delete = Some(DeleteDraft {
+                            target: label.clone(),
+                            orphan,
+                            passphrase: String::new(),
+                        });
+                        // Баннер живёт на карточке — раскрываем её, иначе
+                        // подтверждение осталось бы невидимым.
+                        self.expanded = Some(label);
+                    }
+                    None => self.refuse_device(),
+                }
+            }
+            ListAction::ConfirmDelete => {
+                // Секрет забирается `mem::take` и черновик снимается сразу —
+                // как у разблокировки: и при успехе, и при отказе.
+                let Some(draft) = self.delete.as_mut() else {
+                    return;
+                };
+                let orphan = draft.orphan;
+                let label = draft.target.clone();
+                let mut typed = std::mem::take(&mut draft.passphrase);
+                self.delete = None;
+                let (container, passphrase) = if orphan {
+                    (None, None)
+                } else {
+                    let Some(container) = self.container_of(&label) else {
+                        // Запись исчезла из списка, пока баннер висел: удалять
+                        // вслепую нельзя — фраза относилась к другой правде.
+                        typed.zeroize();
+                        self.message = Some(format!(
+                            "записи «{label}» больше нет в списке — обновите окно"
+                        ));
+                        return;
+                    };
+                    // Секрет строится из `&str`: перевод `String` вправе
+                    // оставить незачищенную копию в куче (находка Гейта-2),
+                    // поэтому исходник затираем сами.
+                    let passphrase = SecretString::from(typed.as_str());
+                    typed.zeroize();
+                    (Some(container), Some(passphrase))
+                };
+                self.spawn_op(
+                    ctx,
+                    Op::Delete {
+                        label,
+                        container,
+                        passphrase,
+                    },
+                );
             }
             ListAction::CommitRename { old, new } => match Label::new(&new) {
                 Ok(new) => {
@@ -1133,6 +1238,7 @@ impl eframe::App for App {
                         ssh_draft: &mut self.ssh_draft,
                         ssh_status: &self.ssh_status,
                         ssh_confirm: &mut self.ssh_confirm,
+                        delete: &mut self.delete,
                     },
                 );
                 if let Some(action) = action {
@@ -1185,7 +1291,16 @@ async fn run_op(
             Ok(reg) => OpOutcome::Loaded(reg.entries().to_vec()),
             Err(e) => OpOutcome::Failed(error_text(&e)),
         },
-        Op::Remove(label) => write_then_read(path, move |r| r.remove(&label)).await,
+        Op::Delete {
+            label,
+            container,
+            passphrase,
+        } => {
+            run_delete(
+                path, home, ssh_config, scheduler, &label, container, passphrase,
+            )
+            .await
+        }
         Op::Rename { old, new } => write_then_read(path, move |r| r.rename(&old, new)).await,
         Op::Close { label, container } => {
             run_close(path, home, scheduler, &label, &container).await
@@ -1453,6 +1568,165 @@ async fn run_close(
             }
         }
     }
+}
+
+/// Текст ветки (а) отказа закрытия внутри удаления: том фактически ещё
+/// открыт (занят чужими программами) — удаление прервано, запись и след целы.
+fn delete_still_open_text() -> String {
+    "закройте программы, работающие с хранилищем, затем закройте его и повторите удаление"
+        .to_owned()
+}
+
+/// Текст ветки (б): повторная проба показала, что том фактически закрыт
+/// (`AlreadyDetached`), — значит отказал шаг ПОСЛЕ закрытия. Честно называем
+/// препятствие при повторе (добавка раунда 3): `~/panzir-<метка>` занят
+/// чужим путём, симлинк снять нельзя.
+fn delete_closed_but_failed_text(label: &Label) -> String {
+    format!(
+        "закрытие прошло, повторите удаление; если повтор не проходит — ~/panzir-{label} мешает"
+    )
+}
+
+/// Файл подключён другим пользователем: не трогаем ни при первой пробе, ни
+/// при повторной (инвариант 3 — второй loop на тот же файл портит данные).
+fn delete_foreign_text(uid: u32) -> String {
+    format!(
+        "файл подключён другим пользователем (uid {uid}) — удаление отменено: \
+         закрывать его отсюда нельзя, второе подключение испортило бы данные"
+    )
+}
+
+/// Удаление записи (спека П-1/П-2). Порядок жёсткий: **проверка фразы
+/// (ничего не меняет) → закрытие тома (если открыт) → уборка SSH-следа
+/// (симлинк → сниппет → строка `Include`) → удаление записи из реестра**.
+/// Каждый шаг видит успех предыдущего; при отказе запись и всё, что правится
+/// позже отказавшего шага, не трогаются. Файл контейнера остаётся на диске.
+async fn run_delete(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    ssh_config: &std::path::Path,
+    scheduler: &SystemdUser,
+    label: &Label,
+    container: Option<PathBuf>,
+    passphrase: Option<SecretString>,
+) -> OpOutcome {
+    // Гонка «файл исчез между баннером и кнопкой» (гриль 6): проверять фразу
+    // и закрывать том не по чему — удаление идёт сиротской веткой; записи
+    // и следу файл не нужен.
+    let container = match container {
+        Some(c) => match tokio::fs::try_exists(&c).await {
+            Ok(true) => Some(c),
+            Ok(false) => None,
+            Err(e) => return OpOutcome::Failed(error_text(&Error::Io(e))),
+        },
+        None => None,
+    };
+
+    if let Some(container) = &container {
+        // Файл на месте, а фразы нет — окно такую комбинацию не строит;
+        // молча пропустить проверку владения нельзя (защита, а не удобство).
+        let Some(passphrase) = passphrase else {
+            return OpOutcome::Failed(format!(
+                "файл хранилища «{label}» на месте, а парольная фраза не передана — \
+                 ничего не удалено"
+            ));
+        };
+        // Шаг 0: проверка фразы ничего не меняет — неверная фраза оставляет
+        // мир нетронутым. `verify_passphrase` отвечает `Error::Command` и на
+        // чужую фразу, и на сбой cryptsetup: сырой текст человеку не
+        // показываем, любой провал проверки — «фраза не подошла» (спека,
+        // МИНОР-3 раунда 2).
+        if keyslot::verify_passphrase(container, &Passphrase::new(passphrase))
+            .await
+            .is_err()
+        {
+            return OpOutcome::Failed(
+                "парольная фраза не подошла — запись, файлы и SSH-связка не тронуты".to_owned(),
+            );
+        }
+
+        // «Открыт ли том» читаем из реестра — тем же состоянием рисовался
+        // баннер, который человек подтвердил. Том, открытый мимо приложения
+        // после последней перечитки, остаётся открытым: запись и след снять
+        // можно, данные не пострадают (контейнер не трогаем никогда).
+        let state = match Registry::load_from(path).await {
+            Ok(reg) => reg
+                .entries()
+                .iter()
+                .find(|e| e.label() == label)
+                .map(|e| e.state().clone()),
+            Err(e) => return OpOutcome::Failed(error_text(&e)),
+        };
+        let Some(state) = state else {
+            return OpOutcome::Failed(error_text(&Error::VaultNotFound(label.as_str().to_owned())));
+        };
+        if matches!(state, VaultState::Open { .. }) {
+            let ud = match Udisks::connect().await {
+                Ok(ud) => ud,
+                Err(e) => return OpOutcome::Failed(error_text(&e)),
+            };
+            // Проба → решение → действие — как `run_close`.
+            let probe = match lifecycle::probe_file_vault(&ud, container).await {
+                Ok(p) => p,
+                Err(e) => return OpOutcome::Failed(error_text(&e)),
+            };
+            match close_decision(probe) {
+                // Реестр сказал «открыто», факт — закрыт: закрывать нечего.
+                CloseDecision::AlreadyDetached => {}
+                CloseDecision::Foreign(uid) => {
+                    return OpOutcome::Failed(delete_foreign_text(uid));
+                }
+                CloseDecision::Close(loop_object) => {
+                    if let Err(e) = lifecycle::close_file_vault(
+                        &ud,
+                        &loop_object,
+                        label,
+                        home,
+                        false,
+                        scheduler,
+                    )
+                    .await
+                    {
+                        // Раунд 2 (БЛОКЕР): текст по СТАДИИ отказа, не по
+                        // варианту ошибки — `UnexpectedUdisksState` при
+                        // `detach_loop=false` означает два противоположных
+                        // состояния. Повторная проба различает их.
+                        let after = lifecycle::probe_file_vault(&ud, container)
+                            .await
+                            .ok()
+                            .map(close_decision);
+                        return OpOutcome::Failed(match after {
+                            Some(CloseDecision::AlreadyDetached) => {
+                                delete_closed_but_failed_text(label)
+                            }
+                            Some(CloseDecision::Close(_)) => delete_still_open_text(),
+                            Some(CloseDecision::Foreign(uid)) => delete_foreign_text(uid),
+                            // Повторная проба тоже отказала — честнее исходный
+                            // отказ закрытия, чем выдуманное состояние.
+                            None => error_text(&e),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Шаг «след»: симлинк → сниппет → строка (НИТ-4 раунда 2). Открытый том
+    // снял симлинк внутри `close_file_vault`; здесь — lingering-симлинк при
+    // уже закрытом томе (no-op при отсутствии).
+    if let Err(e) = panzir_core::mountpoint::remove_symlink(home, label).await {
+        return OpOutcome::Failed(error_text(&e));
+    }
+    let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let snippet = ssh::snippet_path(config_dir, label);
+    if let Err(e) = ssh::remove_trace(ssh_config, &snippet).await {
+        return OpOutcome::Failed(error_text(&Error::from(e)));
+    }
+
+    // Шаг «запись» — последним: `Registry::remove` трёт только запись,
+    // контейнер остаётся на диске (решение Капитана, названо в баннере).
+    let label = label.clone();
+    write_then_read(path, move |r| r.remove(&label)).await
 }
 
 /// Как назвать человеку отведённое время. Секунды — для продукта,
@@ -2754,8 +3028,14 @@ mod tests {
         harness.get_by_label_contains("t-beta");
     }
 
+    /// П-1: клик «Удалить из списка» сам по себе ничего не удаляет — открывает
+    /// баннер «что будет удалено» с полем фразы (файл на месте). Запись в
+    /// реестре и контейнер на диске нетронуты.
+    ///
+    /// Красная фаза (обязательна по спеке): на коде до П-1 клик удалял
+    /// мгновенно — ни баннера, ни записи.
     #[test]
-    fn removing_an_entry_keeps_the_container_file_on_disk() {
+    fn delete_button_opens_a_banner_and_removes_nothing_by_itself() {
         let dir = tempfile::tempdir().expect("временный каталог");
         let container = dir.path().join("t-alpha.vault");
         let mut harness = harness_at(fixture(dir.path()));
@@ -2767,18 +3047,394 @@ mod tests {
             .expect("кнопка удаления первой записи")
             .click();
         harness.run();
-        harness.state_mut().block_until_idle();
+
+        // Баннер с ратифицированным текстом и полем фразы.
+        harness.get_by_label_contains("Будет удалено");
+        harness.get_by_label_contains("парольную фразу хранилища");
+        harness.get_by_label("Парольная фраза:");
+        harness.get_by_label("Удалить");
+        harness.get_by_label("Отмена");
+        // Ничего не удалено: запись в реестре на месте, контейнер на диске.
+        let text = std::fs::read_to_string(dir.path().join("vaults.toml")).expect("registry");
+        assert!(text.contains("t-alpha"), "запись удалена кликом:\n{text}");
+        assert!(
+            container.exists(),
+            "контейнер тронут кликом — это данные человека"
+        );
+    }
+
+    // ---------- П-1/П-2: двухшаговое удаление ----------
+
+    /// SSH-след записи t-alpha: сниппет рядом с реестром, строка `Include` в
+    /// config с чужим содержимым ниже, симлинк `panzir-t-alpha` в «доме».
+    const TRACE_FOREIGN: &str = "Host *\n    ServerAliveInterval 30\n";
+
+    fn plant_ssh_trace(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let ssh_dir = dir.join(".ssh");
+        std::fs::create_dir(&ssh_dir).expect("mkdir .ssh");
+        let config = ssh_dir.join("config");
+        let snippet = dir.join("ssh-t-alpha.conf");
+        std::fs::write(&snippet, "Host devbox\n").expect("сниппет");
+        std::fs::write(
+            &config,
+            format!("Include {}\n{TRACE_FOREIGN}", snippet.display()),
+        )
+        .expect("config");
+        let symlink = dir.join("panzir-t-alpha");
+        // Цель не создаётся: dangling-симлинк — штатное состояние закрытого
+        // тома, `remove_symlink` смотрит на basename, а не на цель.
+        std::os::unix::fs::symlink(dir.join("mnt-t-alpha"), &symlink).expect("симлинк");
+        (config, snippet, symlink)
+    }
+
+    fn assert_trace_intact(dir: &Path) {
+        let config = dir.join(".ssh").join("config");
+        let text = std::fs::read_to_string(&config).expect("config");
+        assert!(
+            text.contains("Include"),
+            "строка Include снята при отказе:\n{text}"
+        );
+        assert!(
+            dir.join("ssh-t-alpha.conf").exists(),
+            "сниппет снят при отказе"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.join("panzir-t-alpha")).is_ok(),
+            "симлинк снят при отказе"
+        );
+    }
+
+    fn assert_trace_clean(dir: &Path) {
+        let config = dir.join(".ssh").join("config");
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config"),
+            TRACE_FOREIGN,
+            "чужое содержимое обязано остаться байт-в-байт"
+        );
+        assert!(!dir.join("ssh-t-alpha.conf").exists(), "сниппет остался");
+        assert!(
+            std::fs::symlink_metadata(dir.join("panzir-t-alpha")).is_err(),
+            "симлинк остался"
+        );
+    }
+
+    /// Открыть баннер удаления первой записи (t-alpha).
+    fn open_delete_banner(harness: &mut Harness<'static, App>) {
+        harness
+            .get_all_by_label("Удалить из списка")
+            .next()
+            .expect("кнопка удаления первой записи")
+            .click();
         harness.run();
+    }
+
+    fn type_delete_passphrase(harness: &mut Harness<'static, App>, phrase: &str) {
+        harness
+            .state_mut()
+            .delete
+            .as_mut()
+            .expect("черновик удаления")
+            .passphrase = phrase.to_owned();
+        harness.run();
+    }
+
+    /// Сирота (файла нет на месте): баннер сироты без поля фразы, «Удалить»
+    /// снимает запись и SSH-след целиком; удалению файл не нужен (гриль 6).
+    #[test]
+    fn orphan_delete_needs_no_passphrase_and_cleans_the_trace() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let registry = fixture(dir.path());
+        std::fs::remove_file(dir.path().join("t-alpha.vault")).expect("убрать контейнер");
+        plant_ssh_trace(dir.path());
+        let mut harness = harness_at(registry);
+
+        open_delete_banner(&mut harness);
+        harness.get_by_label_contains("Файла хранилища нет на месте");
+        assert!(
+            harness.query_by_label("Парольная фраза:").is_none(),
+            "у сироты не должно быть поля фразы — проверять не по чему"
+        );
+
+        harness.get_by_label("Удалить").click();
+        settle(&mut harness);
+
+        assert!(
+            harness.query_by_label_contains("t-alpha ·").is_none(),
+            "запись сироты осталась в списке"
+        );
+        harness.get_by_label_contains("t-beta");
+        let text = std::fs::read_to_string(dir.path().join("vaults.toml")).expect("registry");
+        assert!(
+            !text.contains("t-alpha"),
+            "запись осталась в реестре:\n{text}"
+        );
+        assert_trace_clean(dir.path());
+    }
+
+    /// Носитель — НЕ сирота (находка 1 ревью плана): отказ `refuse_device`,
+    /// баннер не открывается, запись на месте. Иначе отключённая флешка
+    /// проходила бы удалением записи без фразы.
+    #[test]
+    fn device_delete_is_refused_without_a_banner() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+
+        harness
+            .get_all_by_label("Удалить из списка")
+            .nth(1)
+            .expect("кнопка удаления второй записи (t-beta, носитель)")
+            .click();
+        harness.run();
+
+        harness.get_by_label_contains("носители пока не поддержаны");
+        assert!(
+            harness.query_by_label_contains("Будет удалено").is_none(),
+            "баннер открылся на носителе"
+        );
+        assert!(
+            harness.state().delete.is_none(),
+            "черновик удаления завёлся на носителе"
+        );
+        let text = std::fs::read_to_string(dir.path().join("vaults.toml")).expect("registry");
+        assert!(text.contains("t-beta"), "запись носителя удалена:\n{text}");
+    }
+
+    /// Неверная фраза: мир нетронут — запись, контейнер и след целы, текст
+    /// «фраза не подошла» (проверка — шаг 0, ничего не меняет).
+    #[test]
+    fn wrong_passphrase_aborts_delete_and_leaves_everything_untouched() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let container = dir.path().join("t-alpha.vault");
+        let mut harness = harness_at(fixture(dir.path()));
+        plant_ssh_trace(dir.path());
+
+        open_delete_banner(&mut harness);
+        type_delete_passphrase(&mut harness, "не-та-фраза");
+        harness.get_by_label("Удалить").click();
+        settle(&mut harness);
+
+        harness.get_by_label_contains("фраза не подошла");
+        let text = std::fs::read_to_string(dir.path().join("vaults.toml")).expect("registry");
+        assert!(
+            text.contains("t-alpha"),
+            "запись удалена при неверной фразе:\n{text}"
+        );
+        assert!(container.exists(), "контейнер тронут");
+        assert_trace_intact(dir.path());
+    }
+
+    /// Отказ шага «след» (симлинк занят чужим путём — каталог, не наш
+    /// симлинк) прерывает удаление ДО записи: запись и остальной след целы.
+    /// Это и есть доказательство порядка «след → запись» без моков.
+    #[test]
+    fn trace_failure_aborts_before_removing_the_entry() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let registry = fixture(dir.path());
+        std::fs::remove_file(dir.path().join("t-alpha.vault")).expect("убрать контейнер");
+        plant_ssh_trace(dir.path());
+        // Чужой путь на месте симлинка: обычный каталог — снимать его нельзя.
+        std::fs::remove_file(dir.path().join("panzir-t-alpha")).expect("убрать симлинк фикстуры");
+        std::fs::create_dir(dir.path().join("panzir-t-alpha")).expect("чужой каталог");
+        let mut harness = harness_at(registry);
+
+        open_delete_banner(&mut harness);
+        harness.get_by_label("Удалить").click();
+        settle(&mut harness);
+
+        harness.get_by_label_contains("неожиданно");
+        let text = std::fs::read_to_string(dir.path().join("vaults.toml")).expect("registry");
+        assert!(
+            text.contains("t-alpha"),
+            "запись удалена при отказе следа:\n{text}"
+        );
+        // След не тронут: строка и сниппет на месте (шаг упал на симлинке).
+        let config =
+            std::fs::read_to_string(dir.path().join(".ssh").join("config")).expect("config");
+        assert!(
+            config.contains("Include"),
+            "строка снята при отказе:\n{config}"
+        );
+        assert!(dir.path().join("ssh-t-alpha.conf").exists());
+    }
+
+    /// Набранная в баннере фраза не переживает отмену и уход с карточки
+    /// (К-4, по образцу теста разблокировки app.rs:1858-1864). Доказывается
+    /// СНЯТИЕ черновика; затирание буфера держится `zeroize` и читается
+    /// глазами — содержимое освобождённой памяти безопасный Rust не читает.
+    #[test]
+    fn delete_passphrase_does_not_survive_cancel_or_collapse() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+
+        // Отмена.
+        open_delete_banner(&mut harness);
+        type_delete_passphrase(&mut harness, "начал-и-передумал");
+        harness.get_by_label("Отмена").click();
+        harness.run();
+        assert!(
+            harness.state().delete.is_none(),
+            "черновик пережил «Отмену» (секрет не затёрт)"
+        );
+
+        // Уход с карточки (свернули).
+        open_delete_banner(&mut harness);
+        type_delete_passphrase(&mut harness, "начал-и-передумал");
+        assert!(
+            harness.state().delete.is_some(),
+            "черновика нет до опыта — проверять нечего"
+        );
+        harness.get_by_label("Свернуть").click();
+        harness.run();
+        assert!(
+            harness.state().delete.is_none(),
+            "брошенная фраза пережила уход с карточки"
+        );
+    }
+
+    /// Два исхода отказа закрытия — два различимых текста (спека, раунд 2):
+    /// ветка (а) зовёт закрыть программы, ветка (б) — повторить удаление и
+    /// называет препятствие при повторе (добавка раунда 3).
+    #[test]
+    fn delete_close_refusal_texts_read_differently() {
+        let label = Label::new("t-alpha").expect("метка");
+        let still_open = delete_still_open_text();
+        let closed_but_failed = delete_closed_but_failed_text(&label);
+        let foreign = delete_foreign_text(1001);
+        assert_ne!(still_open, closed_but_failed);
+        assert_ne!(still_open, foreign);
+        assert_ne!(closed_but_failed, foreign);
+        assert!(
+            still_open.contains("закройте программы"),
+            "ветка (а): {still_open}"
+        );
+        assert!(
+            closed_but_failed.contains("повторите удаление"),
+            "ветка (б): {closed_but_failed}"
+        );
+        assert!(
+            closed_but_failed.contains("~/panzir-t-alpha"),
+            "ветка (б) обязана назвать препятствие: {closed_but_failed}"
+        );
+        assert!(foreign.contains("uid 1001"), "чужой uid: {foreign}");
+    }
+
+    /// Регрессия (Гейт-2, раунд 4, МИНОР): повторный клик «Удалить из
+    /// списка» при висевшем баннере обязан снять старый черновик С
+    /// затиранием, а не дропнуть набранную фразу прямым присваиванием.
+    /// Доказывается замена черновика (свежий — с пустым полем); затирание
+    /// старого буфера держится `zeroize` в `AskDelete` и читается глазами —
+    /// содержимое освобождённой памяти безопасный Rust не читает.
+    #[test]
+    fn reopening_the_delete_banner_replaces_the_draft() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let mut harness = harness_at(fixture(dir.path()));
+
+        open_delete_banner(&mut harness);
+        type_delete_passphrase(&mut harness, "набрано-но-не-отправлено");
+        // Второй клик по той же кнопке при висевшем баннере.
+        open_delete_banner(&mut harness);
+
+        let draft = harness.state().delete.as_ref().expect("черновик удаления");
+        assert!(
+            draft.passphrase.is_empty(),
+            "старая набранная фраза перешла в новый черновик"
+        );
+    }
+
+    /// Skip-страж по образцу М-4 (ssh_it.rs): без `cryptsetup` в PATH
+    /// полный путь пропускается — сьют не `#[ignore]`.
+    fn cryptsetup_available() -> bool {
+        std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join("cryptsetup").is_file())
+        })
+    }
+
+    /// Настоящий LUKS2-контейнер (не пустышка): `luksFormat` на обычном
+    /// файле не требует ни root, ни udisks2 — только заголовок, а проверка
+    /// фразы (`--test-passphrase`) читает ровно его.
+    fn luks_format(container: &Path, passphrase: &str) {
+        use std::io::Write as _;
+
+        let file = std::fs::File::create(container).expect("создать контейнер");
+        // LUKS2-заголовок ~16 МиБ; файл чуть больше, sparse.
+        file.set_len(33 * 1024 * 1024).expect("размер контейнера");
+        let mut child = std::process::Command::new("cryptsetup")
+            .args([
+                "luksFormat",
+                "--type",
+                "luks2",
+                "--pbkdf",
+                "pbkdf2",
+                "--pbkdf-force-iterations",
+                "1000",
+                "--batch-mode",
+                "--key-file",
+                "-",
+            ])
+            .arg(container)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("запустить cryptsetup");
+        // Фраза уходит через stdin, как в `Passphrase::write_to_stdin`:
+        // без перевода строки, конец — EOF.
+        let mut stdin = child.stdin.take().expect("stdin cryptsetup");
+        stdin
+            .write_all(passphrase.as_bytes())
+            .expect("передать фразу");
+        drop(stdin);
+        let status = child.wait().expect("дождаться cryptsetup");
+        assert!(status.success(), "luksFormat завершился с {status}");
+    }
+
+    /// Полный путь (критерий приёмки 2): баннер → верная фраза → «Удалить»
+    /// снимает запись и SSH-след — и не трогает контейнер. Фраза проверяется
+    /// настоящим cryptsetup против настоящего LUKS2-контейнера; том в
+    /// реестре закрыт, поэтому шаг закрытия не зовёт udisks2 и тесту не
+    /// нужна живая шина.
+    #[test]
+    fn full_delete_path_with_the_right_passphrase_keeps_the_container() {
+        if !cryptsetup_available() {
+            eprintln!("skip: нет cryptsetup в PATH — полный путь удаления пропущен (М-4)");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let container = dir.path().join("t-alpha.vault");
+        luks_format(&container, "правильная фраза");
+        let registry = dir.path().join("vaults.toml");
+        let rt = Runtime::new().expect("рантайм для фикстуры");
+        rt.block_on(Registry::with_write_lock_at(&registry, |r| {
+            r.add(VaultEntry::new(
+                Label::new("t-alpha").expect("метка"),
+                VaultKind::File(container.clone()),
+                VaultState::Closed,
+            ))
+        }))
+        .expect("записать фикстуру");
+        plant_ssh_trace(dir.path());
+        let mut harness = harness_at(registry);
+
+        open_delete_banner(&mut harness);
+        harness.get_by_label_contains("Будет удалено");
+        type_delete_passphrase(&mut harness, "правильная фраза");
+        harness.get_by_label("Удалить").click();
+        settle(&mut harness);
 
         assert!(
             harness.query_by_label_contains("t-alpha").is_none(),
-            "запись осталась в списке"
+            "запись осталась в списке после полного пути"
         );
-        harness.get_by_label_contains("t-beta");
+        let text = std::fs::read_to_string(dir.path().join("vaults.toml")).expect("registry");
+        assert!(
+            !text.contains("t-alpha"),
+            "запись осталась в реестре:\n{text}"
+        );
         assert!(
             container.exists(),
             "удаление записи стёрло файл контейнера — это данные человека"
         );
+        assert_trace_clean(dir.path());
     }
 
     #[test]
@@ -2898,6 +3554,10 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("временный каталог");
         let registry = fixture(dir.path());
+        // П-1: удаление запускается кнопкой баннера, а не «Удалить из
+        // списка». Сиротская ветка (файла нет) не спрашивает фразу — тесту
+        // не нужен живой cryptsetup.
+        std::fs::remove_file(dir.path().join("t-alpha.vault")).expect("убрать контейнер");
         let mut harness = harness_at(registry.clone());
 
         // Настоящий внешний держатель лока, а не подделка. Про готовность
@@ -2922,11 +3582,16 @@ mod tests {
             .expect("кнопка удаления")
             .click();
         harness.run();
+        // Баннер сироты: поля фразы нет, удаление — кнопкой «Удалить».
+        harness.get_by_label_contains("Файла хранилища нет на месте");
+        harness.get_by_label("Удалить").click();
+        harness.run();
         harness.state_mut().block_until_idle();
         harness.run();
 
         harness.get_by_label_contains("уже запущен");
-        harness.get_by_label_contains("t-alpha");
+        // Запись осталась в списке: строка записи, а не упоминание в баннере.
+        harness.get_by_label_contains("t-alpha · файл · закрыто");
 
         holder.kill().expect("снять держателя лока");
         holder.wait().expect("дождаться держателя");

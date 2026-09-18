@@ -180,6 +180,27 @@ pub fn insert_include_line(text: &str, include_line: &str) -> String {
     }
 }
 
+/// Текст config без нашей строки `Include` — контрапункт
+/// [`insert_include_line`] (спека П-2). Каноническое сравнение то же;
+/// вырезаются ВСЕ вхождения: содержимое строки детерминировано путём нашего
+/// сниппета, поэтому совпавшая строка семантически наша, где бы ни стояла.
+/// Чужое содержимое сохраняется байт-в-байт, включая чужие переводы строк
+/// (CRLF) и BOM; отсутствие перевода строки на конце файла сохраняется.
+#[must_use]
+pub fn remove_include_line(text: &str, include_line: &str) -> String {
+    text.split_inclusive('\n')
+        .filter_map(|chunk| {
+            if canonical(chunk) == include_line {
+                // BOM — первый байт ФАЙЛА, а не часть нашей строки: остаётся
+                // (симметрия `insert_include_line`, которая его не сдвигает).
+                chunk.starts_with('\u{feff}').then_some("\u{feff}")
+            } else {
+                Some(chunk)
+            }
+        })
+        .collect()
+}
+
 /// Починка `Shadowed` (М-1): удалить строку `Include` где бы она ни была и
 /// вставить первой. Остальное содержимое сохраняется байт-в-байт, включая
 /// чужие переводы строк (CRLF) и BOM.
@@ -387,6 +408,38 @@ pub async fn repair_include(config: &Path, snippet: &Path) -> Result<bool, SshEr
     }
     write_config_preserving_mode(config, &new).await?;
     Ok(true)
+}
+
+/// Снять SSH-след записи (спека П-2): наш сниппет и все вхождения нашей
+/// строки `Include` в config.
+///
+/// Порядок — сначала сниппет, потом строка: пока строка жива, config
+/// ссылается на уже снятый путь, но мёртвый `Include` ssh игнорирует
+/// (замер Ш-7), а обратный порядок дольше держал бы живую ссылку.
+///
+/// Идемпотентно: ни строки, ни файла — `Ok(false)`, не ошибка. Удаляется
+/// только файл по пути `snippet` — он обязан быть [`snippet_path`]
+/// вызывающего; путь, прочитанный из чужого config, сюда не попадает.
+/// Отсутствующий config не создаётся. Права config сохраняются через
+/// `write_config_preserving_mode`.
+///
+/// # Errors
+/// [`SshError::Io`] — ошибка FS (включая не-UTF8 config).
+pub async fn remove_trace(config: &Path, snippet: &Path) -> Result<bool, SshError> {
+    let mut changed = false;
+    match tokio::fs::remove_file(snippet).await {
+        Ok(()) => changed = true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    if let Some(text) = read_config_text(config).await? {
+        let new = remove_include_line(&text, &include_line(snippet));
+        if new != text {
+            write_config_preserving_mode(config, &new).await?;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -722,5 +775,146 @@ mod tests {
         assert_eq!(fixed, format!("{INC}\n{foreign}"));
         // Повторная починка — без изменений.
         assert_eq!(repair_include_first(&fixed, INC), fixed);
+    }
+
+    // ---------- П-2: снятие SSH-следа (remove-контрапункты) ----------
+
+    #[test]
+    fn remove_include_line_removes_ours_first_and_not_first() {
+        let foreign = "Host *\n    ServerAliveInterval 30\n";
+        let ours_first = format!("{INC}\n{foreign}");
+        assert_eq!(remove_include_line(&ours_first, INC), foreign);
+        let ours_last = format!("{foreign}{INC}\n");
+        assert_eq!(remove_include_line(&ours_last, INC), foreign);
+    }
+
+    #[test]
+    fn remove_include_line_absent_is_identity() {
+        let foreign = "Host *\n# моё\n";
+        assert_eq!(remove_include_line(foreign, INC), foreign);
+        assert_eq!(remove_include_line("", INC), "");
+    }
+
+    /// Дубль строки: содержимое строки детерминировано путём нашего сниппета,
+    /// поэтому совпавшая строка семантически наша, где бы ни стояла, —
+    /// вырезаются ВСЕ вхождения.
+    #[test]
+    fn remove_include_line_removes_every_occurrence() {
+        let text = format!("{INC}\nHost *\n{INC}\n");
+        assert_eq!(remove_include_line(&text, INC), "Host *\n");
+    }
+
+    #[test]
+    fn remove_include_line_preserves_crlf_bom_and_missing_trailing_newline() {
+        let foreign = "Host *\r\n    ServerAliveInterval 30\r\n";
+        let text = format!("{INC}\r\n{foreign}");
+        assert_eq!(remove_include_line(&text, INC), foreign);
+        // Наша строка — последняя, без перевода строки на конце.
+        let text = format!("Host *\n{INC}");
+        assert_eq!(remove_include_line(&text, INC), "Host *\n");
+        // BOM остаётся первым байтом файла.
+        let text = format!("\u{feff}{INC}\nHost *\n");
+        assert_eq!(remove_include_line(&text, INC), "\u{feff}Host *\n");
+    }
+
+    /// Строки нет и сниппета нет → `Ok(false)`, и config не перезаписывается:
+    /// содержимое, mode и mtime нетронуты.
+    #[tokio::test]
+    async fn remove_trace_without_trace_is_noop_and_does_not_rewrite() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config");
+        let foreign = "Host *\n    ServerAliveInterval 30\n";
+        std::fs::write(&config, foreign).expect("write");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        let before = std::fs::metadata(&config).expect("meta");
+        let snippet = dir.path().join("ssh-work.conf"); // файла нет
+
+        assert!(
+            !remove_trace(&config, &snippet).await.expect("remove"),
+            "no trace must be reported as no-op"
+        );
+        let after = std::fs::metadata(&config).expect("meta");
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), foreign);
+        assert_eq!(
+            after.permissions().mode() & 0o777,
+            0o640,
+            "mode changed on no-op"
+        );
+        assert_eq!(
+            before.modified().expect("mtime"),
+            after.modified().expect("mtime"),
+            "config rewritten on no-op"
+        );
+    }
+
+    /// Полный след: наша строка вырезана (все вхождения), сниппет удалён,
+    /// чужое содержимое и mode сохранены; повтор — no-op.
+    #[tokio::test]
+    async fn remove_trace_removes_line_and_snippet_preserving_foreign() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config");
+        let snippet = dir.path().join("ssh-work.conf");
+        let line = include_line(&snippet);
+        let foreign = "Host *\n    ServerAliveInterval 30\r\n# моё\r\n";
+        std::fs::write(&config, format!("{foreign}{line}\n{line}\n")).expect("write");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        std::fs::write(&snippet, "Host devbox\n").expect("write snippet");
+
+        assert!(remove_trace(&config, &snippet).await.expect("remove"));
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), foreign);
+        assert!(!snippet.exists(), "snippet must be removed");
+        let mode = std::fs::metadata(&config)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644, "mode must survive removal, got {mode:o}");
+
+        assert!(
+            !remove_trace(&config, &snippet).await.expect("remove"),
+            "second removal must be a no-op"
+        );
+    }
+
+    /// Удаляется только файл по пути `snippet` (обязан быть `snippet_path`
+    /// вызывающего). Config ссылается на чужой путь — чужой файл и чужая
+    /// строка не трогаются.
+    #[tokio::test]
+    async fn remove_trace_never_touches_a_foreign_snippet_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config");
+        let foreign_snippet = dir.path().join("foreign.conf");
+        std::fs::write(&foreign_snippet, "Host mine\n").expect("write foreign");
+        let foreign_line = include_line(&foreign_snippet);
+        std::fs::write(&config, format!("{foreign_line}\n")).expect("write");
+        let our_snippet = dir.path().join("ssh-work.conf"); // не существует
+
+        assert!(
+            !remove_trace(&config, &our_snippet).await.expect("remove"),
+            "no trace of ours — nothing to report"
+        );
+        assert!(foreign_snippet.exists(), "foreign file must survive");
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read"),
+            format!("{foreign_line}\n"),
+            "foreign Include line must survive"
+        );
+    }
+
+    /// Config отсутствует вовсе: сниппет снимается, config НЕ создаётся.
+    #[tokio::test]
+    async fn remove_trace_without_config_removes_snippet_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config"); // файла нет
+        let snippet = dir.path().join("ssh-work.conf");
+        std::fs::write(&snippet, "Host devbox\n").expect("write snippet");
+
+        assert!(remove_trace(&config, &snippet).await.expect("remove"));
+        assert!(!snippet.exists(), "snippet must be removed");
+        assert!(!config.exists(), "missing config must not be created");
     }
 }
