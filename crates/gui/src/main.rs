@@ -13,6 +13,7 @@
 #![deny(missing_docs)]
 
 mod app;
+mod theme;
 mod view_create;
 mod view_list;
 
@@ -105,12 +106,7 @@ fn run_window(registry_path: PathBuf, home: PathBuf) -> ExitCode {
     let raw_frames = std::env::var("PANZIR_SMOKE_FRAMES").ok();
     let smoke_frames = app::smoke_frames_from(raw_frames.as_deref());
 
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("panzir")
-            .with_inner_size([720.0, 480.0]),
-        ..Default::default()
-    };
+    let options = native_options();
 
     match eframe::run_native(
         "panzir",
@@ -132,6 +128,17 @@ fn run_window(registry_path: PathBuf, home: PathBuf) -> ExitCode {
             eprintln!("окно не удалось создать: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Общая геометрия production-окна и test-only native fixture.
+fn native_options() -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title("panzir")
+            .with_inner_size([760.0, 560.0])
+            .with_min_inner_size([560.0, 440.0]),
+        ..Default::default()
     }
 }
 

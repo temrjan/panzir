@@ -7,18 +7,18 @@ use eframe::egui;
 use panzir_core::registry::VaultEntry;
 use panzir_core::ssh::IncludeStatus;
 use panzir_core::vault::{Label, VaultKind, VaultState};
-use secrecy::zeroize::Zeroize as _;
 
 use crate::app::{
-    DeleteDraft, EnvLine, SshCardStatus, SshConfirm, busy_message, kind_text, state_text,
+    DeleteDraft, EnvLine, HolderStatus, ListLoad, Notice, NoticeScope, Operation, SshCardStatus,
+    SshConfirm, busy_message, kind_text, state_text,
 };
 
 /// Начатое переименование: какую запись меняем и что уже набрано.
-pub struct RenameDraft {
+pub(crate) struct RenameDraft {
     /// Метка, которую меняем.
-    pub target: Label,
+    pub(crate) target: Label,
     /// Текущий ввод.
-    pub text: String,
+    pub(crate) text: String,
 }
 
 /// Начатый ввод парольной фразы: для какой записи и что набрано.
@@ -26,471 +26,375 @@ pub struct RenameDraft {
 /// Буфер здесь — обычная `String`: другого способа принять ввод у egui нет.
 /// Живёт он ровно до нажатия кнопки — [`crate::app::App`] забирает содержимое
 /// `mem::take` и сразу кладёт в `SecretString`.
-pub struct UnlockDraft {
+pub(crate) struct UnlockDraft {
     /// Метка записи, которую открывают.
-    pub target: Label,
+    pub(crate) target: Label,
     /// Набранное.
-    pub text: String,
+    pub(crate) text: String,
 }
 
 /// Начатое добавление SSH-хоста: для какой записи и что набрано.
 /// Поля — сырые строки; проверяет ядро (`SshHost::new`) при отправке.
-pub struct SshHostDraft {
+pub(crate) struct SshHostDraft {
     /// Метка записи, к которой добавляют хоста.
-    pub target: Label,
+    pub(crate) target: Label,
     /// Алиас (`Host`), как его наберут в командной строке.
-    pub host: String,
+    pub(crate) host: String,
     /// Адрес (`HostName`).
-    pub hostname: String,
+    pub(crate) hostname: String,
     /// Логин (`User`).
-    pub user: String,
+    pub(crate) user: String,
     /// Порт — пусто или число (`Port` пишется только при числе).
-    pub port: String,
+    pub(crate) port: String,
     /// Имя файла ключа внутри хранилища.
-    pub key_file: String,
+    pub(crate) key_file: String,
 }
 
-/// Всё, что карточке нужно для секции SSH-связки (спека Ш-7).
-/// Собрано в одну структуру, чтобы сигнатуры рендера не расползались.
-pub struct SshCard<'a> {
-    /// Черновик добавления хоста.
-    pub draft: &'a mut Option<SshHostDraft>,
-    /// Статус связки — результат фоновой пробы.
-    pub status: &'a Option<SshCardStatus>,
-    /// Ожидающее подтверждение вставление/починка строки `Include`.
-    pub confirm: &'a mut Option<SshConfirm>,
-}
+use crate::theme::{self, ButtonKind};
 
-/// Что человек попросил сделать.
-pub enum ListAction {
-    /// Открыть хранилище набранной фразой.
+/// Намерения, которые применяет App после последнего store виджетов кадра.
+pub(crate) enum ListAction {
+    BeginUnlock(Label),
+    ToggleDetails(Label),
+    BeginRename(Label),
+    BeginSshHost(Label),
+    Cancel,
     Open(Label),
-    /// Закрыть хранилище.
     Close(Label),
-    /// Показать баннер удаления записи (П-1): сам по себе ничего не удаляет.
     AskDelete(Label),
-    /// Человек подтвердил удаление в баннере. Файл на диске не трогается.
     ConfirmDelete,
-    /// Применить новое имя.
     CommitRename {
-        /// Старая метка.
         old: Label,
-        /// Набранное имя, ещё не проверенное ядром.
         new: String,
     },
-    /// Перейти на экран создания нового хранилища.
     StartCreate,
-    /// Добавить SSH-хоста к записи. Поля — сырые строки из черновика.
+    Reload,
     AddSshHost {
-        /// Метка записи.
         target: Label,
-        /// Набранный алиас.
         host: String,
-        /// Набранный адрес.
         hostname: String,
-        /// Набранный логин.
         user: String,
-        /// Набранный порт (пусто — без порта).
         port: String,
-        /// Набранное имя файла ключа.
         key_file: String,
     },
-    /// Показать точную строку `Include` и спросить подтверждение.
     AskSshInclude {
-        /// Метка записи.
         target: Label,
-        /// `true` — починка `Shadowed` (поднять строку первой).
         repair: bool,
     },
-    /// Человек подтвердил вставку/починку строки `Include`.
     ConfirmSshInclude,
+    Dismiss(NoticeScope),
 }
 
-/// Всё, что экрану нужно для отрисовки.
-pub struct ListInput<'a> {
-    /// Записи реестра.
-    pub entries: &'a [VaultEntry],
-    /// Строки плашки окружения.
-    pub env: &'a [EnvLine],
-    /// Последнее сообщение человеку.
-    pub message: Option<&'a str>,
-    /// Идёт операция — кнопки записей неактивны.
-    pub busy: bool,
-    /// Начатое переименование.
-    pub rename: &'a mut Option<RenameDraft>,
-    /// Начатый ввод парольной фразы.
-    pub unlock: &'a mut Option<UnlockDraft>,
-    /// Начатое добавление SSH-хоста.
-    pub ssh_draft: &'a mut Option<SshHostDraft>,
-    /// Статус SSH-связки раскрытой карточки (результат пробы).
-    pub ssh_status: &'a Option<SshCardStatus>,
-    /// Ожидающее подтверждение вставление/починка строки `Include`.
-    pub ssh_confirm: &'a mut Option<SshConfirm>,
-    /// Начатое удаление записи: баннер на карточке (П-1).
-    pub delete: &'a mut Option<DeleteDraft>,
-    /// Метка записи, чья карточка раскрыта. Раскрыта не более одной: операция
-    /// всё равно идёт одна за раз, а два раскрытых поля пароля означали бы два
-    /// секрета в памяти вместо одного.
-    pub expanded: &'a mut Option<Label>,
+/// Данные и предоставленные App буферы; view не заменяет черновики.
+pub(crate) struct ListInput<'a> {
+    pub(crate) entries: &'a [VaultEntry],
+    pub(crate) env: &'a [EnvLine],
+    pub(crate) message: Option<&'a str>,
+    pub(crate) validation_scope: &'a NoticeScope,
+    pub(crate) notices: &'a [Notice],
+    pub(crate) read_error: Option<&'a str>,
+    pub(crate) load: ListLoad,
+    pub(crate) busy: bool,
+    pub(crate) operation: Option<&'a Operation>,
+    pub(crate) holder: Option<&'a HolderStatus>,
+    pub(crate) rename: &'a mut Option<RenameDraft>,
+    pub(crate) unlock: &'a mut Option<UnlockDraft>,
+    pub(crate) ssh_draft: &'a mut Option<SshHostDraft>,
+    pub(crate) ssh_status: &'a Option<SshCardStatus>,
+    pub(crate) ssh_confirm: &'a mut Option<SshConfirm>,
+    pub(crate) delete: &'a mut Option<DeleteDraft>,
+    pub(crate) expanded: &'a Option<Label>,
 }
 
-/// Рисует экран и возвращает намерение человека, если оно было.
-pub fn show(ui: &mut egui::Ui, input: ListInput<'_>) -> Option<ListAction> {
+pub(crate) fn notice(ui: &mut egui::Ui, n: &Notice) -> Option<ListAction> {
     let mut action = None;
-
-    show_env(ui, input.env);
-    ui.separator();
-
-    if let Some(text) = input.message {
-        ui.colored_label(ui.visuals().error_fg_color, text);
-        ui.separator();
-    }
-
-    // `!busy`, как у остальных действий списка: иначе клик во время операции
-    // увёл бы на экран создания и утопил её сообщение об отказе (инвариант 10).
-    ui.add_enabled_ui(!input.busy, |ui| {
-        if ui.button("Создать хранилище").clicked() {
-            action = Some(ListAction::StartCreate);
-        }
-    });
-    ui.separator();
-
-    if input.entries.is_empty() {
-        ui.label("Хранилищ пока нет");
-    } else {
-        for entry in input.entries {
-            let mut card = EntryCard {
-                rename: &mut *input.rename,
-                expanded: &mut *input.expanded,
-                unlock: &mut *input.unlock,
-                delete: &mut *input.delete,
-            };
-            let mut ssh = SshCard {
-                draft: &mut *input.ssh_draft,
-                status: input.ssh_status,
-                confirm: &mut *input.ssh_confirm,
-            };
-            if let Some(a) = show_entry(ui, entry, input.busy, &mut card, &mut ssh) {
-                action = Some(a);
+    egui::Frame::new()
+        .fill(theme::DANGER_BG)
+        .stroke(egui::Stroke::new(1.0, theme::DANGER_BORDER))
+        .corner_radius(7)
+        .inner_margin(14)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.colored_label(theme::DANGER, &n.title);
+            if let NoticeScope::Card(label) | NoticeScope::Create(label) = &n.scope {
+                theme::helper(ui, &format!("Хранилище: {label}"));
             }
-        }
-    }
-
+            ui.add(egui::Label::new(&n.text).wrap().selectable(true));
+            if theme::button(
+                ui,
+                &n.scope.key(),
+                "dismiss",
+                "Скрыть сообщение",
+                "Скрыть сообщение",
+                true,
+                ButtonKind::Neutral,
+            )
+            .clicked()
+            {
+                action = Some(ListAction::Dismiss(n.scope.clone()));
+            }
+        });
     action
 }
 
-/// Черновики и раскрытие одной записи — собраны в одну структуру, чтобы
-/// сигнатуры рендера не расползались (тот же приём, что `SshCard`).
-struct EntryCard<'a> {
-    /// Начатое переименование.
-    rename: &'a mut Option<RenameDraft>,
-    /// Метка раскрытой карточки.
-    expanded: &'a mut Option<Label>,
-    /// Начатый ввод парольной фразы разблокировки.
-    unlock: &'a mut Option<UnlockDraft>,
-    /// Начатое удаление записи (баннер П-1).
-    delete: &'a mut Option<DeleteDraft>,
+pub(crate) fn show(ui: &mut egui::Ui, mut input: ListInput<'_>) -> Option<ListAction> {
+    theme::centered(ui, 660.0, |ui| {
+        let mut action = None;
+        let create_width = theme::button_width(ui, "Создать хранилище");
+        ui.horizontal_wrapped(|ui| {
+            let title_width = (ui.available_width() - create_width - 28.0).max(170.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(title_width, 42.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_min_width(title_width);
+                    ui.heading("Хранилища");
+                },
+            );
+            if theme::button(
+                ui,
+                "list",
+                "create",
+                "Создать хранилище",
+                "Создать хранилище",
+                !input.busy,
+                ButtonKind::Primary,
+            )
+            .clicked()
+            {
+                action = Some(ListAction::StartCreate);
+            }
+        });
+        if input.load == ListLoad::Loading {
+            ui.label("Загружаем список…");
+        } else if let Some(op) = input.operation {
+            let r = ui.add(
+                egui::Label::new(op.status())
+                    .sense(egui::Sense::focusable_noninteractive())
+                    .wrap(),
+            );
+            if ui
+                .ctx()
+                .data(|d| d.get_temp::<egui::Id>(egui::Id::new("panzir-focus-request")))
+                == Some(theme::id("list", "status"))
+            {
+                r.request_focus();
+                ui.ctx()
+                    .data_mut(|d| d.remove::<egui::Id>(egui::Id::new("panzir-focus-request")));
+            }
+        }
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .id_salt("vault-list-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                show_env(ui, input.env);
+                if let Some(error) = input.read_error {
+                    ui.colored_label(theme::DANGER, "Не удалось прочитать список хранилищ");
+                    ui.add(egui::Label::new(error).wrap().selectable(true));
+                    if theme::button(
+                        ui,
+                        "list",
+                        "reload",
+                        "Обновить список",
+                        "Обновить список",
+                        !input.busy,
+                        ButtonKind::Neutral,
+                    )
+                    .clicked()
+                    {
+                        action = Some(ListAction::Reload);
+                    }
+                }
+                for n in input.notices.iter().filter(|n| match &n.scope {
+                    NoticeScope::Card(label) => !input.entries.iter().any(|e| e.label() == label),
+                    _ => true,
+                }) {
+                    if let Some(a) = notice(ui, n) {
+                        action = Some(a);
+                    }
+                }
+                if matches!(
+                    input.validation_scope,
+                    NoticeScope::Global | NoticeScope::Create(_)
+                ) && let Some(message) = input.message
+                {
+                    ui.colored_label(theme::DANGER, message);
+                }
+                if input.entries.is_empty() && input.load == ListLoad::Loaded {
+                    theme::card(ui).show(ui, |ui| {
+                        ui.label(egui::RichText::new("Хранилищ пока нет").size(22.0));
+                        ui.label("Создайте хранилище для файлов");
+                    });
+                }
+                for entry in input.entries {
+                    ui.scope_builder(
+                        egui::UiBuilder::new().id(theme::id(entry.label().as_str(), "card")),
+                        |ui| {
+                            if let Some(a) = show_entry(ui, entry, &mut input) {
+                                action = Some(a);
+                            }
+                        },
+                    );
+                    ui.add_space(4.0); // item_spacing 12 + 4 = 16
+                }
+            });
+        action
+    })
 }
 
 fn show_env(ui: &mut egui::Ui, env: &[EnvLine]) {
-    let broken: Vec<&EnvLine> = env.iter().filter(|l| !l.ok).collect();
-    if broken.is_empty() {
+    if !env.iter().any(|l| !l.ok) {
         return;
     }
-    ui.heading("Чего не хватает в системе");
-    for line in broken {
-        ui.label(format!("{}: {}", line.name, line.hint));
+    ui.colored_label(theme::DANGER, "Для работы не хватает компонентов");
+    for line in env.iter().filter(|l| !l.ok) {
+        ui.add(
+            egui::Label::new(format!("{}: {}", line.name, line.hint))
+                .wrap()
+                .selectable(true),
+        );
     }
+    ui.separator();
 }
 
 fn show_entry(
     ui: &mut egui::Ui,
     entry: &VaultEntry,
-    busy: bool,
-    card: &mut EntryCard,
-    ssh: &mut SshCard,
+    input: &mut ListInput<'_>,
 ) -> Option<ListAction> {
+    let label = entry.label();
+    let name = label.as_str();
+    let enabled = !input.busy;
+    let expanded = input.expanded.as_ref() == Some(label);
     let mut action = None;
-    let label = entry.label().clone();
-    // Считаем ДО кнопки: переключение вступает в силу следующим кадром, иначе
-    // карточка раскрывалась бы и схлопывалась в одном и том же кадре.
-    let is_expanded = card
-        .expanded
-        .as_ref()
-        .is_some_and(|l| l.as_str() == label.as_str());
-
-    ui.horizontal(|ui| {
-        ui.label(format!(
-            "{} · {} · {}",
-            label.as_str(),
-            kind_text(entry.kind()),
-            state_text(entry.state())
-        ));
-
-        let editing = card
-            .rename
-            .as_ref()
-            .is_some_and(|draft| draft.target.as_str() == label.as_str());
-
-        if editing {
-            ui.add_enabled_ui(!busy, |ui| {
-                if let Some(draft) = card.rename.as_mut() {
-                    ui.text_edit_singleline(&mut draft.text);
-                }
-                // Черновик здесь НЕ забираем: его чистит `app.rs`, и только
-                // если операция действительно ушла в работу. Иначе набранное
-                // имя пропадало бы молча — поле закрылось, имя прежнее,
-                // сообщения нет.
-                if ui.button("Сохранить").clicked()
-                    && let Some(draft) = card.rename.as_ref()
-                {
-                    action = Some(ListAction::CommitRename {
-                        old: draft.target.clone(),
-                        new: draft.text.clone(),
-                    });
-                }
-                if ui.button("Отмена").clicked() {
-                    *card.rename = None;
-                }
+    theme::card(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let primary_text = if matches!(entry.state(), VaultState::Open { .. }) { "Закрыть" } else { "Открыть" };
+        let primary_width = theme::button_width(ui, primary_text);
+        ui.horizontal_wrapped(|ui| {
+            let title_width = (ui.available_width() - primary_width - 28.0).max(160.0);
+            ui.allocate_ui_with_layout(egui::vec2(title_width, 58.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_min_width(title_width);
+                ui.label(egui::RichText::new(name).size(22.0).strong());
+                let state = if entry.close_attempts() > 0 && matches!(entry.state(), VaultState::Open { .. }) { "Открыто · закрытие отложено" } else { state_text(entry.state()) };
+                ui.label(egui::RichText::new(format!("{} · {state}", kind_text(entry.kind()))).size(16.0).color(theme::MUTED));
             });
-        } else {
-            ui.add_enabled_ui(!busy, |ui| {
-                // П-1: клик не удаляет, а просит баннер — решение об
-                // осиротелости и раскрытии карточки принимает `app.rs`.
-                if ui.button("Удалить из списка").clicked() {
-                    action = Some(ListAction::AskDelete(label.clone()));
-                }
-                if ui.button("Переименовать").clicked() {
-                    *card.rename = Some(RenameDraft {
-                        target: label.clone(),
-                        text: label.as_str().to_owned(),
-                    });
-                }
+            let open = matches!(entry.state(), VaultState::Open { .. });
+            let text = if open { "Закрыть" } else { "Открыть" };
+            if theme::button(ui, name, "primary", text, &format!("{text} хранилище {name}"), enabled, ButtonKind::Neutral).clicked() {
+                action = Some(if open { ListAction::Close(label.clone()) } else { ListAction::BeginUnlock(label.clone()) });
+            }
+        });
+        if let VaultState::Open { mount_point, .. } = entry.state() {
+            theme::helper(ui, "Папка хранилища"); theme::technical(ui, mount_point.display().to_string());
+            if entry.close_attempts() > 0 {
+                let names = input.holder.filter(|h| h.label == *label && h.mount_point == *mount_point).map_or(&[][..], |h| h.names.as_slice());
+                ui.label(busy_message(names));
+            }
+        }
+        if let Some(op) = input.operation.filter(|o| o.target.as_ref() == Some(label)) { ui.label(op.status()); }
+        for n in input.notices.iter().filter(|n| n.scope == NoticeScope::Card(label.clone())) { if let Some(a) = notice(ui, n) { action = Some(a); } }
+        if *input.validation_scope == NoticeScope::Card(label.clone()) && let Some(message) = input.message { ui.colored_label(theme::DANGER, message); }
+        if let Some(d) = input.unlock.as_mut().filter(|d| d.target == *label) {
+            let response = theme::field(ui, (name, "unlock"), "Пароль хранилища", &mut d.text, true, enabled, "");
+            let valid = !d.text.is_empty() && enabled;
+            let enter = theme::enter(ui, &[response]);
+            ui.horizontal_wrapped(|ui| {
+                if theme::button(ui, name, "unlock-submit", "Открыть", &format!("Открыть с паролем {name}"), valid, ButtonKind::Primary).clicked() || (valid && enter) { action = Some(ListAction::Open(label.clone())); }
+                if theme::button(ui, name, "cancel", "Отмена", "Отмена", true, ButtonKind::Neutral).clicked() { action = Some(ListAction::Cancel); }
             });
         }
-
-        // Раскрытие карточки доступно и во время операции: оно ничего не
-        // меняет ни в системе, ни в реестре — только показывает.
-        if ui
-            .button(if is_expanded {
-                "Свернуть"
+        let details = if expanded { "Свернуть" } else { "Подробнее" };
+        if theme::button(ui, name, "details", details, &format!("{details} {name}"), true, ButtonKind::Neutral).clicked() { action = Some(ListAction::ToggleDetails(label.clone())); }
+        if !expanded { return; }
+        ui.separator();
+        match entry.kind() { VaultKind::File(path) => { theme::helper(ui, "Файл хранилища"); theme::technical(ui, path.display().to_string()); }, VaultKind::Device { uuid } => { theme::helper(ui, "UUID тома"); theme::technical(ui, uuid); } }
+        theme::helper(ui, "Формат: стандартный LUKS2 — открывается GNOME Disks и cryptsetup");
+        if let Some(a) = show_ssh(ui, entry, input) { action = Some(a); }
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            if theme::button(ui, name, "rename", "Переименовать", &format!("Переименовать {name}"), enabled, ButtonKind::Neutral).clicked() { action = Some(ListAction::BeginRename(label.clone())); }
+            if theme::button(ui, name, "delete", "Удалить из списка", &format!("Удалить из списка {name}"), enabled, ButtonKind::Danger).clicked() { action = Some(ListAction::AskDelete(label.clone())); }
+        });
+        if let Some(d) = input.rename.as_mut().filter(|d| d.target == *label) {
+            let field = theme::field(ui, (name, "rename-field"), "Новое название", &mut d.text, false, enabled, "");
+            let enter = theme::enter(ui, &[field]);
+            ui.horizontal_wrapped(|ui| {
+                if theme::button(ui, name, "rename-submit", "Сохранить", "Сохранить", enabled, ButtonKind::Primary).clicked() || (enabled && enter) { action = Some(ListAction::CommitRename { old: label.clone(), new: d.text.clone() }); }
+                if theme::button(ui, name, "cancel", "Отмена", "Отмена", true, ButtonKind::Neutral).clicked() { action = Some(ListAction::Cancel); }
+            });
+        }
+        if let Some(d) = input.delete.as_mut().filter(|d| d.target == *label) {
+            ui.separator();
+            ui.label(if d.orphan {
+                "Файла хранилища нет на месте. Если он на отключённом носителе — подключите его и отмените удаление. Если переместили или удалили — удалится только запись и SSH-след, хранилище из списка придётся добавлять заново.".to_owned()
             } else {
-                "Подробнее"
-            })
-            .clicked()
-        {
-            *card.expanded = if is_expanded {
-                None
-            } else {
-                Some(label.clone())
-            };
+                format!("Будет удалено: — запись «{label}» из списка; — SSH-связка (строка в ~/.ssh/config и файл-сниппет); — симлинк ~/panzir-{label}. Если хранилище открыто, оно будет закрыто. Файл хранилища остаётся на диске — данные не пострадают, хранилище можно добавить заново. Для подтверждения введите парольную фразу хранилища.")
+            });
+            if !d.orphan { theme::field(ui, (name, "delete-password"), "Парольная фраза:", &mut d.passphrase, true, enabled, ""); }
+            ui.horizontal_wrapped(|ui| {
+                if theme::button(ui, name, "delete-submit", "Удалить", "Удалить", enabled && (d.orphan || !d.passphrase.is_empty()), ButtonKind::Danger).clicked() { action = Some(ListAction::ConfirmDelete); }
+                if theme::button(ui, name, "cancel", "Отмена", "Отмена", true, ButtonKind::Neutral).clicked() { action = Some(ListAction::Cancel); }
+            });
         }
     });
-
-    if is_expanded
-        && let Some(a) = ui
-            .indent(label.as_str(), |ui| {
-                show_card(ui, entry, busy, card.unlock, card.delete, ssh)
-            })
-            .inner
-    {
-        action = Some(a);
-    }
-
     action
 }
 
-/// Карточка хранилища: где лежит, где смонтировано и что с ним можно сделать.
-fn show_card(
+fn show_ssh(
     ui: &mut egui::Ui,
     entry: &VaultEntry,
-    busy: bool,
-    unlock: &mut Option<UnlockDraft>,
-    delete: &mut Option<DeleteDraft>,
-    ssh: &mut SshCard,
+    input: &mut ListInput<'_>,
 ) -> Option<ListAction> {
-    match entry.kind() {
-        VaultKind::File(path) => ui.label(format!("Файл: {}", path.display())),
-        VaultKind::Device { uuid } => ui.label(format!("Носитель, UUID тома: {uuid}")),
-    };
-
-    // Обещание продукта (инвариант про стандартный LUKS2): том — обычный LUKS2,
-    // открывается штатным инструментом без panzir. Показываем ПОСЛЕ `match`, а не
-    // в ветке `File`: обещание одинаково верно и для файла, и для носителя.
-    ui.label("Формат: стандартный LUKS2 — открывается GNOME Disks и cryptsetup");
-
-    // Точка монтирования — фактическая, из ответа udisks2, сохранённая в
-    // записи. Путь симлинка сюда не подставляется: симлинк — наша выдумка,
-    // а человеку нужно место, где лежат его файлы.
-    if let VaultState::Open { mount_point, .. } = entry.state() {
-        ui.label(format!("Смонтировано: {}", mount_point.display()));
-
-        // E-minimal: автозакрытие отложено из-за «занято» — показываем держателей.
-        if entry.close_attempts() > 0 {
-            let holders = panzir_core::holders::find_holders(mount_point);
-            ui.colored_label(ui.visuals().error_fg_color, busy_message(&holders));
-        }
-    }
-
-    let label = entry.label().clone();
-    let mut action = show_delete_banner(ui, &label, busy, delete);
-    if let Some(a) = show_ssh_section(ui, entry, busy, ssh) {
-        action = Some(a);
-    }
-
-    ui.add_enabled_ui(!busy, |ui| {
-        if matches!(entry.state(), VaultState::Open { .. }) {
-            if ui.button("Закрыть").clicked() {
-                action = Some(ListAction::Close(label.clone()));
-            }
-            return;
-        }
-
-        // Закрыто или отключено — предлагаем открыть. Носители в этом круге
-        // не поддержаны; отказ произносится словами в `app.rs`, а не молчанием.
-        let typing = unlock
-            .as_ref()
-            .is_some_and(|d| d.target.as_str() == label.as_str());
-        if typing {
-            if let Some(draft) = unlock.as_mut() {
-                ui.horizontal(|ui| {
-                    ui.label("Парольная фраза:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.text)
-                            .password(true)
-                            .hint_text("фраза хранилища"),
-                    );
-                });
-            }
-            if ui.button("Открыть").clicked() {
-                action = Some(ListAction::Open(label.clone()));
-            }
-            if ui.button("Отмена").clicked() {
-                // Отмена — уход секрета из памяти, а не закрытие поля: буфер
-                // затирается ДО того, как черновик выпадет из области видимости.
-                if let Some(draft) = unlock.as_mut() {
-                    draft.text.zeroize();
-                }
-                *unlock = None;
-            }
-        } else if ui.button("Открыть").clicked() {
-            *unlock = Some(UnlockDraft {
-                target: label.clone(),
-                text: String::new(),
-            });
-        }
-    });
-    action
-}
-
-/// Баннер удаления записи (П-1/П-2): ратифицированный текст «что будет
-/// удалено», поле фразы (нет у сироты), «Удалить»/«Отмена». Тексты
-/// ратифицированы Капитаном дословно (гриль 10.09) — правка текста = правка
-/// спеки.
-fn show_delete_banner(
-    ui: &mut egui::Ui,
-    label: &Label,
-    busy: bool,
-    delete: &mut Option<DeleteDraft>,
-) -> Option<ListAction> {
-    let drafting = delete
-        .as_ref()
-        .is_some_and(|d| d.target.as_str() == label.as_str());
-    if !drafting {
-        return None;
-    }
+    let label = entry.label();
+    let name = label.as_str();
+    let enabled = !input.busy;
     let mut action = None;
-    ui.separator();
-    if let Some(d) = delete.as_mut() {
-        if d.orphan {
-            ui.label(
-                "Файла хранилища нет на месте. Если он на отключённом носителе — подключите \
-                 его и отмените удаление. Если переместили или удалили — удалится только \
-                 запись и SSH-след, хранилище из списка придётся добавлять заново.",
-            );
-        } else {
-            ui.label(format!(
-                "Будет удалено: — запись «{label}» из списка; — SSH-связка (строка в \
-                 ~/.ssh/config и файл-сниппет); — симлинк ~/panzir-{label}. Если хранилище \
-                 открыто, оно будет закрыто. Файл хранилища остаётся на диске — данные не \
-                 пострадают, хранилище можно добавить заново. Для подтверждения введите \
-                 парольную фразу хранилища."
-            ));
-            ui.horizontal(|ui| {
-                ui.label("Парольная фраза:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut d.passphrase)
-                        .password(true)
-                        .hint_text("фраза хранилища"),
-                );
-            });
-        }
-    }
-    ui.add_enabled_ui(!busy, |ui| {
-        if ui.button("Удалить").clicked() {
-            action = Some(ListAction::ConfirmDelete);
-        }
-        if ui.button("Отмена").clicked() {
-            // Отмена — уход секрета из памяти: буфер затирается ДО того, как
-            // черновик выпадет из области видимости (как у разблокировки).
-            if let Some(d) = delete.as_mut() {
-                d.passphrase.zeroize();
-            }
-            *delete = None;
-        }
-    });
-    action
-}
-
-/// Секция SSH-связки на карточке (спека Ш-7): список хостов из реестра,
-/// статус строки `Include` из пробы, подтверждение вставки/починки и
-/// черновик добавления хоста.
-fn show_ssh_section(
-    ui: &mut egui::Ui,
-    entry: &VaultEntry,
-    busy: bool,
-    ssh: &mut SshCard,
-) -> Option<ListAction> {
-    let mut action = None;
-    let label = entry.label().clone();
-
-    ui.separator();
-    ui.label("SSH-связка:");
+    ui.label("SSH-подключения");
     if entry.ssh_hosts().is_empty() {
-        ui.label("хостов нет");
+        theme::helper(ui, "Хостов пока нет");
     } else {
         for h in entry.ssh_hosts() {
-            let port = h.port.map_or(String::new(), |p| format!(":{p}"));
-            ui.label(format!(
-                "{} → {}@{}{} · ключ {}",
-                h.host, h.user, h.hostname, port, h.key_file
-            ));
+            theme::technical(
+                ui,
+                format!(
+                    "{} → {}@{}{} · ключ {}",
+                    h.host,
+                    h.user,
+                    h.hostname,
+                    h.port.map_or(String::new(), |p| format!(":{p}")),
+                    h.key_file
+                ),
+            );
         }
-        // Контракт, видимый пользователю: закрытое хранилище — ключи
-        // недоступны (IdentityFile указывает в мёртвый симлинк).
         if !matches!(entry.state(), VaultState::Open { .. }) {
-            ui.label("хранилище закрыто — ключи недоступны");
+            ui.label("Хранилище закрыто — SSH-ключи недоступны");
         }
-
-        // Статус связки — результат пробы; `None` — проба ещё не вернулась,
-        // и кадр ничего не утверждает, вместо того чтобы соврать на кадр.
-        if let Some(status) = ssh
-            .status
-            .as_ref()
-            .filter(|s| s.label.as_str() == label.as_str())
-        {
-            if let Some(err) = &status.error {
+        if let Some(status) = input.ssh_status.as_ref().filter(|s| s.label == *label) {
+            if let Some(e) = &status.error {
                 ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    format!("ваш ~/.ssh/config не прочитался: {err}"),
+                    theme::DANGER,
+                    format!("Ваш ~/.ssh/config не прочитался: {e}"),
                 );
             }
-            ui.add_enabled_ui(!busy, |ui| match status.include {
+            match status.include {
                 IncludeStatus::Ok => {
                     ui.label("связка включена: строка Include — первая в ~/.ssh/config");
                 }
                 IncludeStatus::Missing => {
-                    if ui.button("Включить SSH-связку").clicked() {
+                    if theme::button(
+                        ui,
+                        name,
+                        "include",
+                        "Включить SSH-связку",
+                        &format!("Включить SSH-связку {name}"),
+                        enabled,
+                        ButtonKind::Neutral,
+                    )
+                    .clicked()
+                    {
                         action = Some(ListAction::AskSshInclude {
                             target: label.clone(),
                             repair: false,
@@ -498,108 +402,152 @@ fn show_ssh_section(
                     }
                 }
                 IncludeStatus::Shadowed => {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        "строка Include съехала ниже чужого блока Host/Match — \
-                         наши имена будут перехвачены",
-                    );
-                    if ui.button("Поднять строку первой").clicked() {
+                    ui.colored_label(theme::DANGER, "строка Include съехала ниже чужого блока Host/Match — наши имена будут перехвачены");
+                    if theme::button(
+                        ui,
+                        name,
+                        "include",
+                        "Поднять строку первой",
+                        &format!("Поднять строку первой {name}"),
+                        enabled,
+                        ButtonKind::Neutral,
+                    )
+                    .clicked()
+                    {
                         action = Some(ListAction::AskSshInclude {
                             target: label.clone(),
                             repair: true,
                         });
                     }
                 }
-            });
-            if let Some(name) = &status.collision {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    format!(
-                        "имя «{name}» уже занято в вашем ~/.ssh/config — \
-                         переименуйте хоста, иначе сработает чужая запись"
-                    ),
-                );
             }
-            // Резолюция по `ssh -G` — проверка по результату (К-7), только у
-            // открытого хранилища.
+            if let Some(n) = &status.collision {
+                ui.colored_label(theme::DANGER, format!("имя «{n}» уже занято в вашем ~/.ssh/config — переименуйте хоста, иначе сработает чужая запись"));
+            }
             for r in &status.resolutions {
                 if r.ok {
                     ui.label(format!("{}: ssh -G подтверждает связку", r.host));
-                } else if let Some(detail) = &r.detail {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("{}: {detail}", r.host));
                 } else {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        format!(
-                            "{}: ssh -G не подтверждает связку — нет нашего identityfile \
-                             или identitiesonly yes",
-                            r.host
-                        ),
-                    );
+                    ui.colored_label(theme::DANGER, format!("{}: {}", r.host, r.detail.as_deref().unwrap_or("ssh -G не подтверждает связку — нет нашего identityfile или identitiesonly yes")));
                 }
             }
-        }
-
-        // Подтверждение: человек видит точную строку до записи в его config.
-        let confirming = ssh
-            .confirm
-            .as_ref()
-            .is_some_and(|c| c.target.as_str() == label.as_str());
-        if confirming {
-            if let Some(c) = ssh.confirm.as_ref() {
-                ui.label(if c.repair {
-                    "Строка будет поднята первой:"
-                } else {
-                    "В ваш ~/.ssh/config будет вставлена строка:"
-                });
-                ui.monospace(&c.line);
-            }
-            ui.add_enabled_ui(!busy, |ui| {
-                if ui.button("Подтвердить").clicked() {
-                    action = Some(ListAction::ConfirmSshInclude);
-                }
-                if ui.button("Отмена").clicked() {
-                    *ssh.confirm = None;
-                }
-            });
+        } else {
+            theme::helper(ui, "Проверяем SSH-настройки…");
         }
     }
-
-    ui.add_enabled_ui(!busy, |ui| {
-        let drafting = ssh
-            .draft
-            .as_ref()
-            .is_some_and(|d| d.target.as_str() == label.as_str());
-        if drafting {
-            if let Some(d) = ssh.draft.as_mut() {
-                ui.horizontal(|ui| {
-                    ui.label("Имя хоста:");
-                    ui.text_edit_singleline(&mut d.host);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Адрес:");
-                    ui.text_edit_singleline(&mut d.hostname);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Логин:");
-                    ui.text_edit_singleline(&mut d.user);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Порт (необязательно):");
-                    ui.text_edit_singleline(&mut d.port);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Файл ключа:");
-                    ui.text_edit_singleline(&mut d.key_file);
-                });
+    if let Some(c) = input.ssh_confirm.as_ref().filter(|c| c.target == *label) {
+        ui.label(if c.repair {
+            "Строка будет поднята первой:"
+        } else {
+            "В ваш ~/.ssh/config будет вставлена строка:"
+        });
+        theme::technical(ui, &c.line);
+        ui.horizontal_wrapped(|ui| {
+            if theme::button(
+                ui,
+                name,
+                "include-submit",
+                "Подтвердить",
+                "Подтвердить",
+                enabled,
+                ButtonKind::Primary,
+            )
+            .clicked()
+            {
+                action = Some(ListAction::ConfirmSshInclude);
             }
-            // Черновик здесь НЕ забираем: его снимает `app.rs`, и только если
-            // операция ушла в работу — как у переименования.
-            if ui.button("Сохранить хост").clicked()
-                && let Some(d) = ssh.draft.as_ref()
+            if theme::button(
+                ui,
+                name,
+                "cancel",
+                "Отмена",
+                "Отмена",
+                true,
+                ButtonKind::Neutral,
+            )
+            .clicked()
+            {
+                action = Some(ListAction::Cancel);
+            }
+        });
+    }
+    if theme::button(
+        ui,
+        name,
+        "ssh-host",
+        "Добавить хост",
+        &format!("Добавить хост {name}"),
+        enabled,
+        ButtonKind::Neutral,
+    )
+    .clicked()
+    {
+        action = Some(ListAction::BeginSshHost(label.clone()));
+    }
+    if let Some(d) = input.ssh_draft.as_mut().filter(|d| d.target == *label) {
+        let fields = [
+            theme::field(
+                ui,
+                (name, "ssh-host-field"),
+                "Имя хоста",
+                &mut d.host,
+                false,
+                enabled,
+                "devbox",
+            ),
+            theme::field(
+                ui,
+                (name, "ssh-address"),
+                "Адрес",
+                &mut d.hostname,
+                false,
+                enabled,
+                "",
+            ),
+            theme::field(
+                ui,
+                (name, "ssh-user"),
+                "Логин",
+                &mut d.user,
+                false,
+                enabled,
+                "",
+            ),
+            theme::field(
+                ui,
+                (name, "ssh-port"),
+                "Порт (необязательно)",
+                &mut d.port,
+                false,
+                enabled,
+                "",
+            ),
+            theme::field(
+                ui,
+                (name, "ssh-key"),
+                "Файл ключа",
+                &mut d.key_file,
+                false,
+                enabled,
+                "id_ed25519",
+            ),
+        ];
+        let enter = theme::enter(ui, &fields);
+        ui.horizontal_wrapped(|ui| {
+            if theme::button(
+                ui,
+                name,
+                "ssh-submit",
+                "Сохранить хост",
+                "Сохранить хост",
+                enabled,
+                ButtonKind::Primary,
+            )
+            .clicked()
+                || (enabled && enter)
             {
                 action = Some(ListAction::AddSshHost {
-                    target: d.target.clone(),
+                    target: label.clone(),
                     host: d.host.clone(),
                     hostname: d.hostname.clone(),
                     user: d.user.clone(),
@@ -607,19 +555,20 @@ fn show_ssh_section(
                     key_file: d.key_file.clone(),
                 });
             }
-            if ui.button("Отмена").clicked() {
-                *ssh.draft = None;
+            if theme::button(
+                ui,
+                name,
+                "cancel",
+                "Отмена",
+                "Отмена",
+                true,
+                ButtonKind::Neutral,
+            )
+            .clicked()
+            {
+                action = Some(ListAction::Cancel);
             }
-        } else if ui.button("Добавить хост").clicked() {
-            *ssh.draft = Some(SshHostDraft {
-                target: label.clone(),
-                host: String::new(),
-                hostname: String::new(),
-                user: String::new(),
-                port: String::new(),
-                key_file: String::new(),
-            });
-        }
-    });
+        });
+    }
     action
 }

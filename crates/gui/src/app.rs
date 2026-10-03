@@ -26,6 +26,7 @@ use secrecy::zeroize::Zeroize as _;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
+use crate::theme;
 use crate::view_create::{self, CreateAction, CreateDraft};
 use crate::view_list::{self, ListAction, ListInput, RenameDraft, SshHostDraft, UnlockDraft};
 
@@ -339,7 +340,7 @@ pub fn outcome_line(label: &Label, outcome: &lifecycle::CloseOutcome) -> String 
 #[must_use]
 pub fn error_text(err: &Error) -> String {
     match err {
-        Error::AlreadyRunning => "panzir уже запущен — закройте второе окно и повторите".to_owned(),
+        Error::AlreadyRunning => "Список хранилищ занят другой операцией. Повторите позже".to_owned(),
         Error::Schedule { cmd, status } => format!(
             "часы автозакрытия не завелись — само хранилище не закроется: «{cmd}» ({status})"
         ),
@@ -432,20 +433,13 @@ pub fn error_text(err: &Error) -> String {
 /// показывает держателей и просит закрыть программу вручную.
 #[must_use]
 pub fn busy_message(holders: &[String]) -> String {
-    match holders.len() {
-        0 => "Сейф не закрыт: его файлы заняты другой программой. \
-             Завершите программы, в которых открыт сейф, и нажмите «Закрыть»."
-            .to_owned(),
-        1 => format!(
-            "Сейф не закрыт: его использует «{}». \
-             Завершите программу и нажмите «Закрыть».",
-            holders[0]
-        ),
-        _ => format!(
-            "Сейф не закрыт: его используют {}. \
-             Завершите их и нажмите «Закрыть».",
+    if holders.is_empty() {
+        "Файлы хранилища заняты. Закройте использующие их программы и нажмите „Закрыть“".to_owned()
+    } else {
+        format!(
+            "Хранилище использует „{}“. Закройте его файлы или выйдите из его папки в этой программе, затем нажмите „Закрыть“",
             holders.join(", ")
-        ),
+        )
     }
 }
 
@@ -453,9 +447,9 @@ pub fn busy_message(holders: &[String]) -> String {
 #[must_use]
 pub fn state_text(state: &VaultState) -> &'static str {
     match state {
-        VaultState::Closed => "закрыто",
-        VaultState::Open { .. } => "открыто",
-        VaultState::Disconnected => "отключено",
+        VaultState::Closed => "Закрыто",
+        VaultState::Open { .. } => "Открыто",
+        VaultState::Disconnected => "Отключено",
     }
 }
 
@@ -463,15 +457,15 @@ pub fn state_text(state: &VaultState) -> &'static str {
 #[must_use]
 pub fn kind_text(kind: &VaultKind) -> &'static str {
     match kind {
-        VaultKind::File(_) => "файл",
-        VaultKind::Device { .. } => "флешка",
+        VaultKind::File(_) => "Файл",
+        VaultKind::Device { .. } => "Носитель",
     }
 }
 
 /// Какой экран показан. Отделён от черновика создания намеренно: черновик
 /// живёт в `Option`, а `screen` говорит, показан ли он, — тогда «ушли с формы,
 /// а черновик завис» становится ловимым состоянием (условие устаревания для
-/// `forget_stale_passphrase`, как `expanded` для разблокировки).
+/// `forget_stale_passphrase`; подробности независимы от Unlock).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Screen {
     /// Список хранилищ.
@@ -480,9 +474,156 @@ enum Screen {
     Create,
 }
 
+/// Область текущего пользовательского результата, без журнала истории.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NoticeScope {
+    Card(Label),
+    Create(Label),
+    Global,
+}
+impl NoticeScope {
+    pub(crate) fn key(&self) -> String {
+        match self {
+            Self::Card(l) => format!("card:{l}"),
+            Self::Create(l) => format!("create:{l}"),
+            Self::Global => "global".into(),
+        }
+    }
+}
+
+pub(crate) struct Notice {
+    pub(crate) scope: NoticeScope,
+    pub(crate) title: String,
+    pub(crate) text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListLoad {
+    Loading,
+    Loaded,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationKind {
+    Reload,
+    Open,
+    Close,
+    Delete,
+    Rename,
+    Create,
+    AddSsh,
+    Include,
+}
+
+/// Метаданные выполняемой операции не содержат секретов.
+#[derive(Clone)]
+pub(crate) struct Operation {
+    kind: OperationKind,
+    pub(crate) target: Option<Label>,
+    new_label: Option<Label>,
+    request: u64,
+}
+impl Operation {
+    fn from_op(op: &Op, request: u64) -> Self {
+        let (kind, target, new_label) = match op {
+            Op::Reload => (OperationKind::Reload, None, None),
+            Op::Open { label, .. } => (OperationKind::Open, Some(label.clone()), None),
+            Op::Close { label, .. } => (OperationKind::Close, Some(label.clone()), None),
+            Op::Delete { label, .. } => (OperationKind::Delete, Some(label.clone()), None),
+            Op::Rename { old, new } => {
+                (OperationKind::Rename, Some(old.clone()), Some(new.clone()))
+            }
+            Op::Create { label, .. } => (OperationKind::Create, Some(label.clone()), None),
+            Op::AddSshHost { label, .. } => (OperationKind::AddSsh, Some(label.clone()), None),
+            Op::SshInclude { label, .. } => (OperationKind::Include, Some(label.clone()), None),
+        };
+        Self {
+            kind,
+            target,
+            new_label,
+            request,
+        }
+    }
+    fn scope(&self) -> NoticeScope {
+        match (&self.kind, &self.target) {
+            (OperationKind::Create, Some(l)) => NoticeScope::Create(l.clone()),
+            (_, Some(l)) => NoticeScope::Card(l.clone()),
+            _ => NoticeScope::Global,
+        }
+    }
+    pub(crate) fn status(&self) -> String {
+        let text = match self.kind {
+            OperationKind::Reload => "Обновляем список…",
+            OperationKind::Open => "Открываем хранилище…",
+            OperationKind::Close => "Закрываем хранилище…",
+            OperationKind::Delete => "Удаляем запись…",
+            OperationKind::Rename => "Сохраняем название…",
+            OperationKind::Create => "Создаём хранилище…",
+            OperationKind::AddSsh => "Сохраняем SSH-хост…",
+            OperationKind::Include => "Настраиваем SSH-подключения…",
+        };
+        self.target
+            .as_ref()
+            .map_or(text.to_owned(), |l| format!("{text} {l}"))
+    }
+    fn error_title(&self) -> String {
+        let label = self
+            .target
+            .as_ref()
+            .map_or(String::new(), ToString::to_string);
+        match self.kind {
+            OperationKind::Reload => "Не удалось прочитать список хранилищ".into(),
+            OperationKind::Open => format!("Не удалось открыть „{label}“"),
+            OperationKind::Close => format!("Не удалось закрыть „{label}“"),
+            OperationKind::Create => format!("Не удалось создать „{label}“"),
+            OperationKind::Delete => "Не удалось удалить запись".into(),
+            OperationKind::Rename => "Не удалось сохранить название".into(),
+            OperationKind::AddSsh => "Не удалось сохранить SSH-хост".into(),
+            OperationKind::Include => "Не удалось настроить SSH-подключения".into(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SshProbeKey {
+    label: Label,
+    kind: VaultKind,
+    hosts: Vec<SshHost>,
+    resolve: bool,
+}
+
+/// Кеш одной фоновой /proc-пробы выбранных подробностей.
+pub(crate) struct HolderStatus {
+    pub(crate) label: Label,
+    pub(crate) mount_point: PathBuf,
+    pub(crate) names: Vec<String>,
+}
+
 /// Состояние главного окна.
 pub struct App {
+    #[cfg(test)]
+    test_operation: Option<fn(Op) -> OpOutcome>,
+    #[cfg(test)]
+    isolate_vault_io: bool,
     rt: Runtime,
+    ctx: egui::Context,
+    pending_meta: Option<Operation>,
+    sequence: u64,
+    load: ListLoad,
+    read_error: Option<String>,
+    notices: Vec<Notice>,
+    interaction: Option<(Label, VaultKind)>,
+    origin_role: Option<&'static str>,
+    /// Following cards in the order at entry, for focus after target invalidation.
+    interaction_following: Vec<Label>,
+    ssh_probe_key: Option<SshProbeKey>,
+    ssh_status_key: Option<SshProbeKey>,
+    holder_probe: Option<JoinHandle<HolderStatus>>,
+    holder_status: Option<HolderStatus>,
+    holder_next: f64,
+    holder_requested: Option<(Label, PathBuf)>,
+    create_result_target: Option<Label>,
     registry_path: PathBuf,
     home: PathBuf,
     /// Путь `~/.ssh/config` — параметром (инвариант 9), читает/пишет только
@@ -506,7 +647,9 @@ pub struct App {
     ssh_probe: Option<JoinHandle<SshCardStatus>>,
     /// Последний известный статус связки; инвалидируется при смене списка.
     ssh_status: Option<SshCardStatus>,
+    /// Локальная валидация отделена от сохранённых исходов операций.
     message: Option<String>,
+    validation_scope: NoticeScope,
     rename: Option<RenameDraft>,
     expanded: Option<Label>,
     unlock: Option<UnlockDraft>,
@@ -547,10 +690,31 @@ impl App {
         smoke_frames: Option<u32>,
         op_timeout: Duration,
     ) -> Self {
+        theme::apply(&cc.egui_ctx);
         let rt = Runtime::new().expect("не удалось создать рантайм tokio");
         let local_deps = deps::check_local_deps();
         let mut app = Self {
+            #[cfg(test)]
+            test_operation: None,
+            #[cfg(test)]
+            isolate_vault_io: false,
             rt,
+            ctx: cc.egui_ctx.clone(),
+            pending_meta: None,
+            sequence: 0,
+            load: ListLoad::Loading,
+            read_error: None,
+            notices: Vec::new(),
+            interaction: None,
+            origin_role: None,
+            interaction_following: Vec::new(),
+            ssh_probe_key: None,
+            ssh_status_key: None,
+            holder_probe: None,
+            holder_status: None,
+            holder_next: 0.0,
+            holder_requested: None,
+            create_result_target: None,
             registry_path,
             home,
             ssh_config,
@@ -569,6 +733,7 @@ impl App {
             ssh_probe: None,
             ssh_status: None,
             message: None,
+            validation_scope: NoticeScope::Global,
             rename: None,
             expanded: None,
             unlock: None,
@@ -614,16 +779,45 @@ impl App {
             self.message = Some("подождите: предыдущая операция ещё идёт".to_owned());
             return false;
         }
+        if let Some(handle) = self.reload_tick.take() {
+            handle.abort();
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        let meta = Operation::from_op(&op, self.sequence);
+        let scope = meta.scope();
+        self.notices.retain(|n| n.scope != scope);
+        if self.validation_scope == scope {
+            self.message = None;
+        }
+        if meta.kind == OperationKind::Create {
+            self.create_result_target = meta.target.clone();
+        }
+        self.pending_meta = Some(meta);
         let path = self.registry_path.clone();
         let home = self.home.clone();
         let ssh_config = self.ssh_config.clone();
         let scheduler = self.scheduler.clone();
         let limit = self.op_timeout;
+        #[cfg(test)]
+        let test_operation = self.test_operation;
+        #[cfg(test)]
+        let isolate_vault_io = self.isolate_vault_io;
         self.pending = Some(self.spawn_waking(ctx, async move {
+            #[cfg(test)]
+            if let Some(operation) = test_operation {
+                return operation(op);
+            }
             // Таймаут накрывает операцию ЦЕЛИКОМ, включая пробу: человеку не
             // важно, на каком шаге застряло, ему важно, что окно не висит.
-            match tokio::time::timeout(limit, run_op(&path, &home, &ssh_config, &scheduler, op))
-                .await
+            match tokio::time::timeout(limit, async {
+                #[cfg(test)]
+                if isolate_vault_io && matches!(op, Op::Open { .. } | Op::Create { .. }) {
+                    // GUI tests retain the real timeout while replacing live D-Bus I/O.
+                    return std::future::pending::<OpOutcome>().await;
+                }
+                run_op(&path, &home, &ssh_config, &scheduler, op).await
+            })
+            .await
             {
                 Ok(outcome) => outcome,
                 Err(_) => OpOutcome::Failed(format!(
@@ -642,7 +836,7 @@ impl App {
     /// должно показать это без перезапуска. Период в 5 с — баланс между
     /// свежестью картинки и нагрузкой на диск/шину.
     fn spawn_reload_tick(&mut self, ctx: &egui::Context) {
-        if self.reload_tick.is_some() {
+        if self.reload_tick.is_some() || self.pending.is_some() {
             return;
         }
         let path = self.registry_path.clone();
@@ -685,6 +879,16 @@ impl App {
         if self.ssh_probe.is_some() {
             return;
         }
+        self.ssh_probe_key =
+            self.entries
+                .iter()
+                .find(|e| e.label() == &label)
+                .map(|e| SshProbeKey {
+                    label: label.clone(),
+                    kind: e.kind().clone(),
+                    hosts: hosts.clone(),
+                    resolve,
+                });
         let config = self.ssh_config.clone();
         let home = self.home.clone();
         let timeout = self.op_timeout;
@@ -747,7 +951,7 @@ impl App {
             && let Some(handle) = self.reload_tick.take()
         {
             let outcome = self.rt.block_on(handle);
-            self.apply(outcome);
+            self.apply_read(outcome);
         }
         if self.bus_probe.as_ref().is_some_and(JoinHandle::is_finished)
             && let Some(handle) = self.bus_probe.take()
@@ -760,29 +964,199 @@ impl App {
             && let Some(handle) = self.ssh_probe.take()
             && let Ok(status) = self.rt.block_on(handle)
         {
-            self.ssh_status = Some(status);
+            self.accept_ssh_status(status);
+        }
+        if self
+            .holder_probe
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            && let Some(handle) = self.holder_probe.take()
+            && let Ok(status) = self.rt.block_on(handle)
+            && self
+                .holder_target()
+                .is_some_and(|(l, p)| l == status.label && p == status.mount_point)
+        {
+            self.holder_status = Some(status);
+        }
+    }
+
+    fn set_notice(&mut self, scope: NoticeScope, title: String, text: String) {
+        self.notices.retain(|n| n.scope != scope);
+        self.notices.push(Notice { scope, title, text });
+    }
+
+    fn replace_entries(&mut self, entries: Vec<VaultEntry>) {
+        self.entries = entries;
+        self.load = ListLoad::Loaded;
+        self.forget_stale_passphrase();
+        if self
+            .ssh_status_key
+            .as_ref()
+            .is_some_and(|key| self.current_ssh_key().as_ref() != Some(key))
+        {
+            self.ssh_status = None;
+            self.ssh_status_key = None;
+        }
+        if self.holder_status.as_ref().is_some_and(|s| {
+            self.holder_target()
+                .is_none_or(|(l, p)| l != s.label || p != s.mount_point)
+        }) {
+            self.holder_status = None;
+            self.holder_next = 0.0;
+        }
+    }
+
+    fn apply_read(&mut self, outcome: Result<OpOutcome, tokio::task::JoinError>) {
+        match outcome {
+            Ok(OpOutcome::Loaded(entries)) => {
+                self.replace_entries(entries);
+                self.read_error = None;
+            }
+            Ok(OpOutcome::LoadedWith(entries, text)) => {
+                self.replace_entries(entries);
+                self.read_error = Some(text);
+            }
+            Ok(OpOutcome::Failed(text)) => {
+                self.read_error = Some(text);
+                if self.load != ListLoad::Loaded {
+                    self.load = ListLoad::Failed;
+                }
+            }
+            Err(e) => {
+                self.read_error = Some(format!("Чтение списка не выполнилось: {e}"));
+                if self.load != ListLoad::Loaded {
+                    self.load = ListLoad::Failed;
+                }
+            }
         }
     }
 
     fn apply(&mut self, outcome: Result<OpOutcome, tokio::task::JoinError>) {
+        let meta = self.pending_meta.take();
+        if meta.as_ref().is_some_and(|o| o.request != self.sequence) {
+            return;
+        }
+        if meta
+            .as_ref()
+            .is_some_and(|o| o.kind == OperationKind::Reload)
+        {
+            self.apply_read(outcome);
+            return;
+        }
+        let success = matches!(
+            outcome,
+            Ok(OpOutcome::Loaded(_) | OpOutcome::LoadedWith(_, _))
+        );
+        let scope = meta.as_ref().map_or(NoticeScope::Global, Operation::scope);
+        let title = meta
+            .as_ref()
+            .map_or("Операция не выполнилась".into(), Operation::error_title);
+        // Наш rename переносит раскрытие; внешнее изменение такой эвристики не имеет.
+        if success
+            && let Some(op) = &meta
+            && op.kind == OperationKind::Rename
+            && self.expanded == op.target
+        {
+            self.expanded = op.new_label.clone();
+        }
         match outcome {
-            Ok(OpOutcome::Loaded(entries)) => {
-                self.entries = entries;
-                self.message = None;
-                // Список сменился — статус связки устарел, карточка
-                // переспросит его следующим кадром.
-                self.ssh_status = None;
+            Ok(OpOutcome::Loaded(entries)) => self.replace_entries(entries),
+            Ok(OpOutcome::LoadedWith(entries, text)) => {
+                self.replace_entries(entries);
+                self.set_notice(scope, "Операция выполнена с предупреждением".into(), text);
             }
-            Ok(OpOutcome::LoadedWith(entries, note)) => {
-                self.entries = entries;
-                self.message = Some(note);
+            Ok(OpOutcome::Failed(text)) => self.set_notice(scope, title, text),
+            Err(e) => self.set_notice(scope, title, format!("Операция не выполнилась: {e}")),
+        }
+        if success && let Some(op) = &meta {
+            if op.kind == OperationKind::Include {
+                // The config changed: even a probe with identical record inputs
+                // may have read it before the write. Drop completed handles too.
+                if let Some(probe) = self.ssh_probe.take() {
+                    probe.abort();
+                }
+                self.ssh_probe_key = None;
                 self.ssh_status = None;
+                self.ssh_status_key = None;
             }
-            Ok(OpOutcome::Failed(text)) => self.message = Some(text),
-            Err(e) => {
-                self.message = Some(format!("операция не выполнилась: {e}"));
+            if op.kind == OperationKind::Create && self.screen == Screen::Create {
+                self.screen = Screen::List;
+                if let Some(label) = &op.target {
+                    theme::request_focus(&self.ctx, theme::id(label.as_str(), "primary"));
+                }
+                self.forget_stale_passphrase();
+            }
+            if matches!(
+                op.kind,
+                OperationKind::Rename | OperationKind::AddSsh | OperationKind::Include
+            ) {
+                self.clear_card(false);
             }
         }
+    }
+
+    fn current_ssh_key(&self) -> Option<SshProbeKey> {
+        let label = self.expanded.as_ref()?;
+        let e = self.entries.iter().find(|e| e.label() == label)?;
+        Some(SshProbeKey {
+            label: label.clone(),
+            kind: e.kind().clone(),
+            hosts: e.ssh_hosts().to_vec(),
+            resolve: matches!(e.state(), VaultState::Open { .. }),
+        })
+    }
+
+    fn accept_ssh_status(&mut self, status: SshCardStatus) {
+        let key = self.ssh_probe_key.take();
+        if key.is_some() && key == self.current_ssh_key() {
+            self.ssh_status = Some(status);
+            self.ssh_status_key = key;
+        }
+    }
+
+    fn holder_target(&self) -> Option<(Label, PathBuf)> {
+        let label = self.expanded.as_ref()?;
+        let e = self
+            .entries
+            .iter()
+            .find(|e| e.label() == label && e.close_attempts() > 0)?;
+        if let VaultState::Open { mount_point, .. } = e.state() {
+            Some((label.clone(), mount_point.clone()))
+        } else {
+            None
+        }
+    }
+
+    fn maybe_probe_holders(&mut self, ctx: &egui::Context) {
+        let Some((label, mount_point)) = self.holder_target() else {
+            return;
+        };
+        let now = ctx.input(|i| i.time);
+        let changed = self
+            .holder_requested
+            .as_ref()
+            .is_none_or(|(l, p)| *l != label || *p != mount_point);
+        if self.holder_probe.is_some() || (!changed && now < self.holder_next) {
+            return;
+        }
+        // Дедлайн задаётся при dispatch, а не на каждом кадре.
+        if now < self.holder_next && !changed {
+            return;
+        }
+        self.holder_next = now + 5.0;
+        self.holder_requested = Some((label.clone(), mount_point.clone()));
+        self.holder_probe = Some(self.spawn_waking(ctx, async move {
+            let path = mount_point.clone();
+            let names =
+                tokio::task::spawn_blocking(move || panzir_core::holders::find_holders(&path))
+                    .await
+                    .unwrap_or_default();
+            HolderStatus {
+                label,
+                mount_point,
+                names,
+            }
+        }));
     }
 
     /// Собирает плашку окружения из локальных зависимостей и состояния шины.
@@ -832,38 +1206,148 @@ impl App {
         }
     }
 
-    /// Набранная фраза не переживает уход с карточки.
-    ///
-    /// Одно место на все пути: свернули карточку, раскрыли другую, список
-    /// перечитался — черновик перестал соответствовать раскрытой записи и
-    /// затирается. Без этого начатый и брошенный ввод просто выпадал бы из
-    /// памяти нетронутым (находка ревью Гейта-2).
-    fn forget_stale_passphrase(&mut self) {
-        // Разблокировка: черновик не соответствует раскрытой карточке.
-        let matches_card = match (&self.unlock, &self.expanded) {
-            (Some(draft), Some(label)) => draft.target.as_str() == label.as_str(),
-            _ => false,
-        };
-        if !matches_card && let Some(mut draft) = self.unlock.take() {
-            draft.text.zeroize();
+    /// Сброс восстановимой истории после последнего store поля кадра.
+    /// Обычные кадры, собственные Подробнее и unchanged reload сюда не входят.
+    fn clear_history(&self, id: egui::Id) {
+        if let Some(mut state) = egui::TextEdit::load_state(&self.ctx, id) {
+            state.clear_undoer();
+            state.store(&self.ctx, id);
         }
-        // Удаление (П-1): то же правило для фразы баннера — свернули
-        // карточку или раскрыли другую — набранное затирается (К-4).
-        let matches_card = match (&self.delete, &self.expanded) {
-            (Some(draft), Some(label)) => draft.target.as_str() == label.as_str(),
-            _ => false,
-        };
-        if !matches_card && let Some(mut draft) = self.delete.take() {
-            draft.passphrase.zeroize();
+    }
+
+    fn clear_create_passwords(&mut self) {
+        if let Some(d) = self.create.as_mut() {
+            d.passphrase.zeroize();
+            d.confirm.zeroize();
         }
-        // Создание: ушли с формы (`screen != Create`), а черновик завис —
-        // затираем оба поля пароля. Одно место на оба черновика, чтобы новую
-        // точку выхода не пришлось помнить (инвариант 5).
-        if self.screen != Screen::Create
-            && let Some(mut draft) = self.create.take()
+        self.clear_history(theme::id("create", "passphrase"));
+        self.clear_history(theme::id("create", "confirm"));
+    }
+
+    fn clear_card(&mut self, restore_focus: bool) {
+        if self
+            .interaction
+            .as_ref()
+            .is_some_and(|(label, _)| self.validation_scope == NoticeScope::Card(label.clone()))
         {
-            draft.passphrase.zeroize();
-            draft.confirm.zeroize();
+            self.message = None;
+        }
+        if let Some(d) = self.unlock.as_mut() {
+            d.text.zeroize();
+        }
+        if let Some(d) = self.delete.as_mut() {
+            d.passphrase.zeroize();
+        }
+        if let Some(d) = &self.unlock {
+            self.clear_history(theme::id(d.target.as_str(), "unlock"));
+        }
+        if let Some(d) = &self.delete {
+            self.clear_history(theme::id(d.target.as_str(), "delete-password"));
+        }
+        if restore_focus && let Some((label, kind)) = &self.interaction {
+            let role = self.origin_role.unwrap_or("primary");
+            let original_exists = self
+                .entries
+                .iter()
+                .any(|e| e.label() == label && e.kind() == kind);
+            let origin_visible = role == "primary"
+                || (self.expanded.as_ref() == Some(label)
+                    && (role != "include"
+                        || self
+                            .ssh_status
+                            .as_ref()
+                            .is_some_and(|s| s.label == *label && s.include != IncludeStatus::Ok)));
+            let target = if original_exists && origin_visible && self.pending.is_none() {
+                theme::id(label.as_str(), role)
+            } else if let Some(label) = self
+                .interaction_following
+                .iter()
+                .find(|label| self.entries.iter().any(|e| e.label() == *label))
+            {
+                theme::id(
+                    label.as_str(),
+                    if self.pending.is_some() {
+                        "details"
+                    } else {
+                        "primary"
+                    },
+                )
+            } else {
+                theme::id(
+                    "list",
+                    if self.pending.is_some() {
+                        "status"
+                    } else {
+                        "create"
+                    },
+                )
+            };
+            theme::request_focus(&self.ctx, target);
+        }
+        self.unlock = None;
+        self.delete = None;
+        self.rename = None;
+        self.ssh_draft = None;
+        self.ssh_confirm = None;
+        self.interaction = None;
+        self.origin_role = None;
+        self.interaction_following.clear();
+    }
+
+    fn begin_card(
+        &mut self,
+        label: &Label,
+        origin: &'static str,
+        field: &'static str,
+        details: bool,
+    ) -> bool {
+        self.clear_card(false);
+        let Some(index) = self.entries.iter().position(|e| e.label() == label) else {
+            return false;
+        };
+        self.interaction = Some((label.clone(), self.entries[index].kind().clone()));
+        self.interaction_following = self.entries[index + 1..]
+            .iter()
+            .map(|e| e.label().clone())
+            .collect();
+        self.origin_role = Some(origin);
+        if details {
+            self.expanded = Some(label.clone());
+        } else if self.expanded.as_ref().is_some_and(|l| l != label) {
+            self.expanded = None;
+        }
+        self.clear_history(theme::id(label.as_str(), field));
+        theme::request_focus(&self.ctx, theme::id(label.as_str(), field));
+        true
+    }
+
+    fn forget_stale_passphrase(&mut self) {
+        let invalid = self.interaction.as_ref().is_some_and(|(label, kind)| {
+            self.screen != Screen::List
+                || !self.entries.iter().any(|e| {
+                    e.label() == label
+                        && e.kind() == kind
+                        && (self.unlock.is_none() || !matches!(e.state(), VaultState::Open { .. }))
+                })
+        });
+        if invalid {
+            let target = self.interaction.as_ref().map(|(l, _)| l.clone());
+            // Resolve focus against the layout that will actually be drawn.
+            if self.expanded == target {
+                self.expanded = None;
+            }
+            self.clear_card(true);
+        }
+        if self
+            .expanded
+            .as_ref()
+            .is_some_and(|label| !self.entries.iter().any(|e| e.label() == label))
+        {
+            self.expanded = None;
+        }
+        if self.screen != Screen::Create && self.create.is_some() {
+            self.clear_create_passwords();
+            self.create = None;
         }
     }
 
@@ -889,16 +1373,82 @@ impl App {
 
     /// Отказ по носителю произносится словами: молчание здесь — тот же дефект,
     /// что и ложное сообщение (инвариант 10).
-    fn refuse_device(&mut self) {
-        self.message = Some(
-            "носители пока не поддержаны — в этом круге приложение умеет только \
-             файлы-хранилища"
-                .to_owned(),
+    fn refuse_device(&mut self, label: &Label) {
+        self.set_notice(
+            NoticeScope::Card(label.clone()),
+            "Операция недоступна".into(),
+            "Носители пока не поддерживаются: сейчас можно работать только с файлами-хранилищами"
+                .into(),
         );
     }
 
     fn handle(&mut self, ctx: &egui::Context, action: ListAction) {
+        let navigation = matches!(
+            action,
+            ListAction::Cancel | ListAction::ToggleDetails(_) | ListAction::Dismiss(_)
+        );
+        if !navigation && self.pending.is_some() {
+            self.validation_scope = NoticeScope::Global;
+            self.message = Some("Подождите: предыдущая операция ещё идёт".into());
+            return;
+        }
+        self.forget_stale_passphrase();
         match action {
+            ListAction::Cancel => self.clear_card(true),
+            ListAction::Dismiss(scope) => {
+                self.notices.retain(|n| n.scope != scope);
+                self.message = None;
+            }
+            ListAction::Reload => {
+                self.spawn_op(ctx, Op::Reload);
+            }
+            ListAction::ToggleDetails(label) => {
+                if self.expanded.as_ref() == Some(&label) {
+                    if self.interaction.as_ref().is_some_and(|(l, _)| l == &label) {
+                        self.clear_card(false);
+                    }
+                    self.expanded = None;
+                    theme::request_focus(ctx, theme::id(label.as_str(), "details"));
+                } else {
+                    if self.interaction.as_ref().is_some_and(|(l, _)| l != &label) {
+                        self.clear_card(false);
+                    }
+                    self.expanded = Some(label);
+                }
+            }
+            ListAction::BeginUnlock(label) => {
+                if self.container_of(&label).is_none() {
+                    self.clear_card(false);
+                    self.refuse_device(&label);
+                    return;
+                }
+                if self.begin_card(&label, "primary", "unlock", false) {
+                    self.unlock = Some(UnlockDraft {
+                        target: label,
+                        text: String::new(),
+                    });
+                }
+            }
+            ListAction::BeginRename(label) => {
+                if self.begin_card(&label, "rename", "rename-field", true) {
+                    self.rename = Some(RenameDraft {
+                        target: label.clone(),
+                        text: label.to_string(),
+                    });
+                }
+            }
+            ListAction::BeginSshHost(label) => {
+                if self.begin_card(&label, "ssh-host", "ssh-host-field", true) {
+                    self.ssh_draft = Some(SshHostDraft {
+                        target: label,
+                        host: String::new(),
+                        hostname: String::new(),
+                        user: String::new(),
+                        port: String::new(),
+                        key_file: String::new(),
+                    });
+                }
+            }
             ListAction::Open(label) => {
                 // Секрет забирается `mem::take`: буфер виджета остаётся пустой
                 // строкой, копии не создаётся, а черновик снимается сразу — и
@@ -906,12 +1456,19 @@ impl App {
                 // поправить опечатку» значило бы не выполнить единственное
                 // обещание, которое мы дали: защитить участок от клавиши до
                 // `SecretString`.
+                if self
+                    .unlock
+                    .as_ref()
+                    .is_none_or(|d| d.target != label || d.text.is_empty())
+                {
+                    return;
+                }
                 let typed = self
                     .unlock
                     .as_mut()
                     .filter(|d| d.target.as_str() == label.as_str())
                     .map(|d| std::mem::take(&mut d.text));
-                self.unlock = None;
+                self.clear_card(false);
                 let Some(mut typed) = typed else { return };
                 // Секрет строится из `&str`: `SecretString` копирует его в
                 // собственный буфер, который затирает при уничтожении, — а
@@ -935,17 +1492,18 @@ impl App {
                             },
                         );
                     }
-                    None => self.refuse_device(),
+                    None => self.refuse_device(&label),
                 }
             }
             ListAction::Close(label) => {
+                self.clear_card(false);
                 // Путь контейнера берём из записи: в `Op` он приходит уже
                 // разобранным, чтобы фоновая задача не читала реестр второй раз.
                 match self.container_of(&label) {
                     Some(container) => {
                         self.spawn_op(ctx, Op::Close { label, container });
                     }
-                    None => self.refuse_device(),
+                    None => self.refuse_device(&label),
                 }
             }
             ListAction::AskDelete(label) => {
@@ -957,11 +1515,17 @@ impl App {
                         // Осиротелость — проверкой пути в момент клика
                         // (гриль 6), не кэшем списка.
                         let orphan = !container.exists();
-                        // Прежний черновик мог держать набранную фразу (клик
-                        // по «Удалить из списка» при висевшем баннере): снятие
-                        // — только с затиранием, не прямым присваиванием (К-4).
-                        if let Some(mut old) = self.delete.take() {
-                            old.passphrase.zeroize();
+                        if !self.begin_card(
+                            &label,
+                            "delete",
+                            if orphan {
+                                "delete-submit"
+                            } else {
+                                "delete-password"
+                            },
+                            true,
+                        ) {
+                            return;
                         }
                         self.delete = Some(DeleteDraft {
                             target: label.clone(),
@@ -972,7 +1536,10 @@ impl App {
                         // подтверждение осталось бы невидимым.
                         self.expanded = Some(label);
                     }
-                    None => self.refuse_device(),
+                    None => {
+                        self.clear_card(false);
+                        self.refuse_device(&label);
+                    }
                 }
             }
             ListAction::ConfirmDelete => {
@@ -981,11 +1548,15 @@ impl App {
                 let Some(draft) = self.delete.as_mut() else {
                     return;
                 };
+                if !draft.orphan && draft.passphrase.is_empty() {
+                    return;
+                }
                 let orphan = draft.orphan;
                 let label = draft.target.clone();
                 let mut typed = std::mem::take(&mut draft.passphrase);
-                self.delete = None;
+                self.clear_card(false);
                 let (container, passphrase) = if orphan {
+                    typed.zeroize();
                     (None, None)
                 } else {
                     let Some(container) = self.container_of(&label) else {
@@ -1017,15 +1588,21 @@ impl App {
                 Ok(new) => {
                     // Черновик снимается только если операция реально началась:
                     // иначе набранное имя исчезло бы вместе с полем.
-                    if self.spawn_op(ctx, Op::Rename { old, new }) {
-                        self.rename = None;
-                    }
+                    self.spawn_op(ctx, Op::Rename { old, new });
                 }
-                Err(e) => self.message = Some(error_text(&e)),
+                Err(e) => {
+                    self.validation_scope = NoticeScope::Card(old);
+                    self.message = Some(error_text(&e));
+                }
             },
             ListAction::StartCreate => {
+                self.clear_card(false);
+                self.clear_create_passwords();
                 self.screen = Screen::Create;
                 self.create = Some(CreateDraft::default());
+                self.create_result_target = None;
+                self.message = None;
+                theme::request_focus(ctx, theme::id("create", "label"));
             }
             ListAction::AddSshHost {
                 target,
@@ -1041,8 +1618,9 @@ impl App {
                     raw => match raw.parse::<u16>() {
                         Ok(p) => Some(p),
                         Err(_) => {
+                            self.validation_scope = NoticeScope::Card(target.clone());
                             self.message = Some(
-                                "порт не подходит: целое число от 1 до 65535, либо пусто"
+                                "порт не подходит: целое число от 0 до 65535 или оставьте поле пустым"
                                     .to_owned(),
                             );
                             return;
@@ -1060,10 +1638,13 @@ impl App {
                                 host,
                             },
                         ) {
-                            self.ssh_draft = None;
+                            // Несекретный ввод остаётся доступен после отказа.
                         }
                     }
-                    Err(e) => self.message = Some(error_text(&Error::from(e))),
+                    Err(e) => {
+                        self.validation_scope = NoticeScope::Card(target);
+                        self.message = Some(error_text(&Error::from(e)));
+                    }
                 }
             }
             ListAction::AskSshInclude { target, repair } => {
@@ -1075,6 +1656,9 @@ impl App {
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .to_path_buf();
                 let line = ssh::include_line(&ssh::snippet_path(&config_dir, &target));
+                if !self.begin_card(&target, "include", "include-submit", true) {
+                    return;
+                }
                 self.ssh_confirm = Some(SshConfirm {
                     target,
                     repair,
@@ -1094,7 +1678,7 @@ impl App {
                         repair: confirm.repair,
                     },
                 ) {
-                    self.ssh_confirm = None;
+                    // Подтверждение снимается успешным результатом.
                 }
             }
         }
@@ -1103,12 +1687,46 @@ impl App {
     /// Экран создания: Cancel уводит на список (черновик затрёт `forget`),
     /// Submit валидирует, строит секрет и запускает `Op::Create`.
     fn handle_create(&mut self, ctx: &egui::Context, action: CreateAction) {
-        let CreateAction::Submit = action else {
-            // Cancel: уходим на список; черновик (с секретом) затрёт
-            // `forget_stale_passphrase`, увидев `screen != Create`.
-            self.screen = Screen::List;
+        match action {
+            CreateAction::Dismiss(scope) => {
+                self.notices.retain(|n| n.scope != scope);
+                self.message = None;
+                return;
+            }
+            CreateAction::Cancel => {
+                if matches!(self.validation_scope, NoticeScope::Create(_)) {
+                    self.message = None;
+                }
+                self.clear_create_passwords();
+                self.screen = Screen::List;
+                self.create = None;
+                theme::request_focus(
+                    ctx,
+                    if self.pending.is_some() {
+                        theme::id("list", "status")
+                    } else {
+                        theme::id("list", "create")
+                    },
+                );
+                return;
+            }
+            CreateAction::Submit => {}
+        }
+        if self.pending.is_some() {
             return;
-        };
+        }
+        if self
+            .create
+            .as_ref()
+            .is_none_or(|d| d.passphrase.is_empty() || d.passphrase != d.confirm)
+        {
+            return;
+        }
+        if let Some(d) = self.create.as_ref()
+            && let Ok(label) = Label::new(&d.label)
+        {
+            self.validation_scope = NoticeScope::Create(label);
+        }
         // 1. Читаем и валидируем — секрет НЕ трогаем, пока не убедились.
         let parsed = self
             .create
@@ -1152,9 +1770,10 @@ impl App {
             typed.zeroize();
             secret
         };
+        self.clear_create_passwords();
         // 3. Запускаем; черновик (уже без секрета) снимет `forget` при `screen = List`.
         let container = container_path(&self.home, &label);
-        if self.spawn_op(
+        self.spawn_op(
             ctx,
             Op::Create {
                 label,
@@ -1162,9 +1781,7 @@ impl App {
                 size_bytes,
                 passphrase,
             },
-        ) {
-            self.screen = Screen::List;
-        }
+        );
     }
 
     /// Ждёт завершения операции по её собственному сигналу и применяет исход.
@@ -1195,7 +1812,7 @@ impl App {
                 .block_on(async move { tokio::time::timeout(TEST_DEADLINE, handle).await })
                 .expect("проба SSH-связки не завершилась за отведённое время")
         {
-            self.ssh_status = Some(status);
+            self.accept_ssh_status(status);
         }
         if let Some(handle) = self.pending.take() {
             let outcome = self
@@ -1209,8 +1826,27 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        theme::BACKGROUND.to_normalized_gamma_f32()
+    }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.take_finished();
+        self.forget_stale_passphrase();
+        if self.pending_meta.is_none()
+            && self
+                .ctx
+                .data(|d| d.get_temp::<egui::Id>(egui::Id::new("panzir-focus-request")))
+                == Some(theme::id("list", "status"))
+        {
+            let target = self
+                .create_result_target
+                .as_ref()
+                .filter(|l| self.entries.iter().any(|e| e.label() == *l))
+                .map_or(theme::id("list", "create"), |l| {
+                    theme::id(l.as_str(), "details")
+                });
+            theme::request_focus(&self.ctx, target);
+        }
 
         // E-minimal: если есть открытые тома, перечитываем реестр в фоне,
         // чтобы показать отложенное автозакрытие, записанное закрывателем.
@@ -1231,9 +1867,15 @@ impl eframe::App for App {
                         entries: &self.entries,
                         env: &self.env,
                         message: self.message.as_deref(),
+                        validation_scope: &self.validation_scope,
                         busy: self.pending.is_some(),
+                        notices: &self.notices,
+                        read_error: self.read_error.as_deref(),
+                        load: self.load,
+                        operation: self.pending_meta.as_ref(),
+                        holder: self.holder_status.as_ref(),
                         rename: &mut self.rename,
-                        expanded: &mut self.expanded,
+                        expanded: &self.expanded,
                         unlock: &mut self.unlock,
                         ssh_draft: &mut self.ssh_draft,
                         ssh_status: &self.ssh_status,
@@ -1248,23 +1890,30 @@ impl eframe::App for App {
             Screen::Create => {
                 let busy = self.pending.is_some();
                 let message = self.message.as_deref();
-                let action = self
-                    .create
-                    .as_mut()
-                    .and_then(|draft| view_create::show(ui, draft, busy, message));
+                let action = self.create.as_mut().and_then(|draft| {
+                    view_create::show(ui, draft, busy, message, &self.entries, &self.notices)
+                });
                 if let Some(action) = action {
                     self.handle_create(&ctx, action);
                 }
             }
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            match self.screen {
+                Screen::Create => self.handle_create(&ctx, CreateAction::Cancel),
+                Screen::List => self.clear_card(true),
+            }
+        }
         self.forget_stale_passphrase();
+        self.maybe_probe_holders(&ctx);
 
         // Проба связки — для раскрытой карточки с хостами, когда статус
         // устарел (список сменился) или ещё не запрошен.
         if self.screen == Screen::List
             && self.ssh_probe.is_none()
             && let Some(label) = self.expanded.clone()
-            && self.ssh_status.as_ref().is_none_or(|s| s.label != label)
+            && (self.ssh_status.is_none()
+                || self.ssh_status_key.as_ref() != self.current_ssh_key().as_ref())
             && let Some(entry) = self.entries.iter().find(|e| e.label() == &label)
             && !entry.ssh_hosts().is_empty()
         {
@@ -1276,6 +1925,13 @@ impl eframe::App for App {
         }
 
         self.tick_smoke(ui.ctx());
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.clear_card(false);
+        self.clear_create_passwords();
     }
 }
 
@@ -1787,6 +2443,7 @@ where
     reason = "тесты: unwrap не используется, только expect с текстом"
 )]
 mod tests {
+    include!("redesign_tests.rs");
     use std::path::Path;
 
     use egui_kittest::Harness;
@@ -2016,7 +2673,7 @@ mod tests {
     fn already_running_is_explained_in_plain_words() {
         let text = error_text(&Error::AlreadyRunning);
         assert!(
-            text.contains("уже запущен"),
+            text.contains("занят другой операцией"),
             "текст не объясняет причину: {text}"
         );
         assert_ne!(text, Error::AlreadyRunning.to_string());
@@ -2105,13 +2762,9 @@ mod tests {
 
     /// Раскрыть карточку первой записи и открыть поле ввода фразы.
     fn start_typing_passphrase(harness: &mut Harness<'static, App>) {
-        harness
-            .get_all_by_label("Подробнее")
-            .next()
-            .expect("кнопка раскрытия первой записи")
-            .click();
+        harness.get_by_label("Подробнее t-alpha").click();
         harness.run();
-        harness.get_by_label("Открыть").click();
+        harness.get_by_label("Открыть хранилище t-alpha").click();
         harness.run();
     }
 
@@ -2130,7 +2783,7 @@ mod tests {
             .as_mut()
             .expect("черновик ввода")
             .text = "фраза-которая-не-должна-остаться".to_owned();
-        harness.get_by_label("Открыть").click();
+        harness.get_by_label("Открыть с паролем t-alpha").click();
         harness.run();
 
         assert!(
@@ -2149,15 +2802,11 @@ mod tests {
     fn card_actions_are_disabled_while_an_operation_runs() {
         let dir = tempfile::tempdir().expect("временный каталог");
         let mut harness = harness_at(fixture(dir.path()));
-        harness
-            .get_all_by_label("Подробнее")
-            .next()
-            .expect("кнопка раскрытия первой записи")
-            .click();
+        harness.get_by_label("Подробнее t-alpha").click();
         harness.run();
         assert!(
             !harness
-                .get_by_label("Открыть")
+                .get_by_label("Открыть хранилище t-alpha")
                 .accesskit_node()
                 .is_disabled(),
             "до опыта кнопка уже неактивна — проверка ничего не докажет"
@@ -2172,7 +2821,7 @@ mod tests {
 
         assert!(
             harness
-                .get_by_label("Открыть")
+                .get_by_label("Открыть хранилище t-alpha")
                 .accesskit_node()
                 .is_disabled(),
             "во время операции действие карточки осталось доступным"
@@ -2206,7 +2855,7 @@ mod tests {
             "черновика нет до опыта — проверять нечего"
         );
 
-        harness.get_by_label("Свернуть").click();
+        harness.get_by_label("Свернуть t-alpha").click();
         harness.run();
 
         assert!(
@@ -2239,14 +2888,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("временный каталог");
         let mut harness = harness_at(fixture(dir.path()));
         start_create(&mut harness);
-        for field in ["Метка:", "Размер, МиБ:", "Пароль:", "Повтор:"] {
+        for field in [
+            "Название",
+            "Размер, МиБ",
+            "Пароль хранилища",
+            "Повторите пароль",
+        ] {
             assert!(
                 harness.query_by_label(field).is_some(),
                 "на форме создания нет поля {field}"
             );
         }
         assert!(
-            harness.query_by_label("Создать").is_some(),
+            harness.query_by_label("Создать хранилище").is_some(),
             "нет кнопки «Создать»"
         );
         assert!(
@@ -2270,7 +2924,7 @@ mod tests {
         harness.run();
         assert!(
             harness
-                .get_by_label("Создать")
+                .get_by_label("Создать хранилище")
                 .accesskit_node()
                 .is_disabled(),
             "«Создать» активна при несовпадающих паролях"
@@ -2285,7 +2939,7 @@ mod tests {
         harness.run();
         assert!(
             !harness
-                .get_by_label("Создать")
+                .get_by_label("Создать хранилище")
                 .accesskit_node()
                 .is_disabled(),
             "«Создать» неактивна при совпадающих валидных полях"
@@ -2301,7 +2955,7 @@ mod tests {
         harness.run();
         assert!(
             !harness
-                .get_by_label("Создать")
+                .get_by_label("Создать хранилище")
                 .accesskit_node()
                 .is_disabled(),
             "до опыта кнопка уже неактивна — проверка ничего не докажет"
@@ -2315,7 +2969,7 @@ mod tests {
         harness.run();
         assert!(
             harness
-                .get_by_label("Создать")
+                .get_by_label("Создать хранилище")
                 .accesskit_node()
                 .is_disabled(),
             "«Создать» осталась активной во время операции"
@@ -2413,8 +3067,8 @@ mod tests {
         );
         assert_eq!(
             harness.state().screen,
-            Screen::List,
-            "экран не вернулся на список после Submit"
+            Screen::Create,
+            "создание должно оставаться на форме до результата"
         );
         assert!(
             harness
@@ -2477,14 +3131,10 @@ mod tests {
         let mut harness = harness_at(fixture(dir.path()));
 
         // t-alpha (File) — первая запись: раскрываем её карточку.
-        harness
-            .get_all_by_label("Подробнее")
-            .next()
-            .expect("кнопка раскрытия файловой записи")
-            .click();
+        harness.get_by_label("Подробнее t-alpha").click();
         harness.run();
         assert!(
-            harness.query_by_label_contains("Файл:").is_some(),
+            harness.query_by_label_contains("Файл хранилища").is_some(),
             "раскрыта не файловая карточка — контроль канала пуст"
         );
         assert!(
@@ -2495,16 +3145,10 @@ mod tests {
         );
 
         // t-beta (Device): после раскрытия t-alpha единственный «Подробнее» — её.
-        harness
-            .get_all_by_label("Подробнее")
-            .next()
-            .expect("кнопка раскрытия записи на носителе")
-            .click();
+        harness.get_by_label("Подробнее t-beta").click();
         harness.run();
         assert!(
-            harness
-                .query_by_label_contains("Носитель, UUID тома")
-                .is_some(),
+            harness.query_by_label_contains("UUID тома").is_some(),
             "раскрыта не карточка носителя — контроль канала пуст"
         );
         assert!(
@@ -2564,7 +3208,7 @@ mod tests {
             .as_mut()
             .expect("черновик ввода")
             .text = "любая".to_owned();
-        harness.get_by_label("Открыть").click();
+        harness.get_by_label("Открыть с паролем t-alpha").click();
         harness.run();
         harness.state_mut().block_until_idle();
         harness.run();
@@ -2637,6 +3281,10 @@ mod tests {
     }
 
     fn harness_at(registry: std::path::PathBuf) -> Harness<'static, App> {
+        harness_at_size(registry, [760.0, 1600.0])
+    }
+
+    fn harness_at_size(registry: std::path::PathBuf, size: [f32; 2]) -> Harness<'static, App> {
         let home = registry
             .parent()
             .expect("у фикстуры есть каталог")
@@ -2649,6 +3297,7 @@ mod tests {
             // четырёх шагов по умолчанию на это не хватает. Это конечные
             // всплески, не вечный repaint: run() всё равно останавливается,
             // когда задачи кончились.
+            .with_size(size)
             .with_max_steps(64)
             .build_eframe(move |cc| {
                 App::new(
@@ -2661,6 +3310,7 @@ mod tests {
                     Duration::from_secs(5),
                 )
             });
+        harness.state_mut().isolate_vault_io = true;
         harness.state_mut().block_until_idle();
         harness.run();
         harness
@@ -2670,13 +3320,9 @@ mod tests {
 
     /// Раскрыть карточку первой записи и начать черновик добавления хоста.
     fn start_ssh_draft(harness: &mut Harness<'static, App>) {
-        harness
-            .get_all_by_label("Подробнее")
-            .next()
-            .expect("кнопка раскрытия первой записи")
-            .click();
+        harness.get_by_label("Подробнее t-alpha").click();
         harness.run();
-        harness.get_by_label("Добавить хост").click();
+        harness.get_by_label("Добавить хост t-alpha").click();
         harness.run();
     }
 
@@ -2816,16 +3462,14 @@ mod tests {
     }
 
     fn expand_first_card(harness: &mut Harness<'static, App>) {
-        harness
-            .get_all_by_label("Подробнее")
-            .next()
-            .expect("кнопка раскрытия первой записи")
-            .click();
+        harness.get_by_label("Подробнее t-alpha").click();
         harness.run();
     }
 
     /// Кадр → дождаться фоновых задач → кадр.
     fn settle(harness: &mut Harness<'static, App>) {
+        harness.run();
+        harness.state_mut().block_until_idle();
         harness.run();
         harness.state_mut().block_until_idle();
         harness.run();
@@ -2843,7 +3487,7 @@ mod tests {
         expand_first_card(&mut harness);
         settle(&mut harness);
 
-        harness.get_by_label("Включить SSH-связку").click();
+        harness.get_by_label("Включить SSH-связку t-alpha").click();
         harness.run();
         // Точная строка показана ДО записи — и записи без подтверждения нет.
         harness.get_by_label_contains(&line);
@@ -2878,7 +3522,9 @@ mod tests {
         settle(&mut harness);
 
         harness.get_by_label_contains("съехала");
-        harness.get_by_label("Поднять строку первой").click();
+        harness
+            .get_by_label("Поднять строку первой t-alpha")
+            .click();
         harness.run();
         harness.get_by_label_contains(&line);
 
@@ -2952,6 +3598,13 @@ mod tests {
     }
 
     fn inject_ssh_status(harness: &mut Harness<'static, App>, resolutions: Vec<SshResolution>) {
+        let key = harness.state().entries.first().map(|e| SshProbeKey {
+            label: e.label().clone(),
+            kind: e.kind().clone(),
+            hosts: e.ssh_hosts().to_vec(),
+            resolve: matches!(e.state(), VaultState::Open { .. }),
+        });
+        harness.state_mut().ssh_status_key = key;
         harness.state_mut().ssh_status = Some(SshCardStatus {
             label: Label::new("t-alpha").expect("метка"),
             include: IncludeStatus::Ok,
@@ -3024,8 +3677,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("временный каталог");
         let harness = harness_at(fixture(dir.path()));
 
-        harness.get_by_label_contains("t-alpha");
-        harness.get_by_label_contains("t-beta");
+        harness.get_by_label("t-alpha");
+        harness.get_by_label("t-beta");
     }
 
     /// П-1: клик «Удалить из списка» сам по себе ничего не удаляет — открывает
@@ -3041,11 +3694,14 @@ mod tests {
         let mut harness = harness_at(fixture(dir.path()));
         assert!(container.exists(), "фикстура не создала файл — тест слеп");
 
-        harness
-            .get_all_by_label("Удалить из списка")
-            .next()
-            .expect("кнопка удаления первой записи")
-            .click();
+        if harness
+            .query_by_label("Удалить из списка t-alpha")
+            .is_none()
+        {
+            harness.get_by_label("Подробнее t-alpha").click();
+            harness.run();
+        }
+        harness.get_by_label("Удалить из списка t-alpha").click();
         harness.run();
 
         // Баннер с ратифицированным текстом и полем фразы.
@@ -3120,11 +3776,14 @@ mod tests {
 
     /// Открыть баннер удаления первой записи (t-alpha).
     fn open_delete_banner(harness: &mut Harness<'static, App>) {
-        harness
-            .get_all_by_label("Удалить из списка")
-            .next()
-            .expect("кнопка удаления первой записи")
-            .click();
+        if harness
+            .query_by_label("Удалить из списка t-alpha")
+            .is_none()
+        {
+            harness.get_by_label("Подробнее t-alpha").click();
+            harness.run();
+        }
+        harness.get_by_label("Удалить из списка t-alpha").click();
         harness.run();
     }
 
@@ -3162,7 +3821,7 @@ mod tests {
             harness.query_by_label_contains("t-alpha ·").is_none(),
             "запись сироты осталась в списке"
         );
-        harness.get_by_label_contains("t-beta");
+        harness.get_by_label("t-beta");
         let text = std::fs::read_to_string(dir.path().join("vaults.toml")).expect("registry");
         assert!(
             !text.contains("t-alpha"),
@@ -3179,14 +3838,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("временный каталог");
         let mut harness = harness_at(fixture(dir.path()));
 
-        harness
-            .get_all_by_label("Удалить из списка")
-            .nth(1)
-            .expect("кнопка удаления второй записи (t-beta, носитель)")
-            .click();
+        if harness.query_by_label("Удалить из списка t-beta").is_none() {
+            harness.get_by_label("Подробнее t-beta").click();
+            harness.run();
+        }
+        harness.get_by_label("Удалить из списка t-beta").click();
         harness.run();
 
-        harness.get_by_label_contains("носители пока не поддержаны");
+        harness.get_by_label_contains("Носители пока не поддерживаются");
         assert!(
             harness.query_by_label_contains("Будет удалено").is_none(),
             "баннер открылся на носителе"
@@ -3283,7 +3942,7 @@ mod tests {
             harness.state().delete.is_some(),
             "черновика нет до опыта — проверять нечего"
         );
-        harness.get_by_label("Свернуть").click();
+        harness.get_by_label("Свернуть t-alpha").click();
         harness.run();
         assert!(
             harness.state().delete.is_none(),
@@ -3374,7 +4033,7 @@ mod tests {
             .arg(container)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("запустить cryptsetup");
         // Фраза уходит через stdin, как в `Passphrase::write_to_stdin`:
@@ -3384,8 +4043,13 @@ mod tests {
             .write_all(passphrase.as_bytes())
             .expect("передать фразу");
         drop(stdin);
-        let status = child.wait().expect("дождаться cryptsetup");
-        assert!(status.success(), "luksFormat завершился с {status}");
+        let output = child.wait_with_output().expect("дождаться cryptsetup");
+        assert!(
+            output.status.success(),
+            "luksFormat завершился с {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// Полный путь (критерий приёмки 2): баннер → верная фраза → «Удалить»
@@ -3422,7 +4086,7 @@ mod tests {
         settle(&mut harness);
 
         assert!(
-            harness.query_by_label_contains("t-alpha").is_none(),
+            harness.query_by_label("t-alpha").is_none(),
             "запись осталась в списке после полного пути"
         );
         let text = std::fs::read_to_string(dir.path().join("vaults.toml")).expect("registry");
@@ -3442,11 +4106,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("временный каталог");
         let mut harness = harness_at(fixture(dir.path()));
 
-        harness
-            .get_all_by_label("Переименовать")
-            .next()
-            .expect("кнопка переименования первой записи")
-            .click();
+        if harness.query_by_label("Переименовать t-alpha").is_none() {
+            harness.get_by_label("Подробнее t-alpha").click();
+            harness.run();
+        }
+        harness.get_by_label("Переименовать t-alpha").click();
         harness.run();
 
         harness.state_mut().rename.as_mut().expect("черновик").text = "t-beta".to_owned();
@@ -3456,7 +4120,7 @@ mod tests {
         harness.run();
 
         harness.get_by_label_contains("уже занято");
-        harness.get_by_label_contains("t-alpha");
+        harness.get_by_label("t-alpha");
     }
 
     #[test]
@@ -3464,11 +4128,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("временный каталог");
         let mut harness = harness_at(fixture(dir.path()));
 
-        harness
-            .get_all_by_label("Переименовать")
-            .next()
-            .expect("кнопка переименования первой записи")
-            .click();
+        if harness.query_by_label("Переименовать t-alpha").is_none() {
+            harness.get_by_label("Подробнее t-alpha").click();
+            harness.run();
+        }
+        harness.get_by_label("Переименовать t-alpha").click();
         harness.run();
 
         harness.state_mut().rename.as_mut().expect("черновик").text = "t-gamma".to_owned();
@@ -3477,10 +4141,10 @@ mod tests {
         harness.state_mut().block_until_idle();
         harness.run();
 
-        harness.get_by_label_contains("t-gamma");
-        harness.get_by_label_contains("t-beta");
+        harness.get_by_label("t-gamma");
+        harness.get_by_label("t-beta");
         assert!(
-            harness.query_by_label_contains("t-alpha").is_none(),
+            harness.query_by_label("t-alpha").is_none(),
             "старая метка осталась в списке"
         );
         assert!(
@@ -3576,11 +4240,14 @@ mod tests {
             .expect("дождаться, пока лок взят");
         assert_eq!(line.trim(), "held");
 
-        harness
-            .get_all_by_label("Удалить из списка")
-            .next()
-            .expect("кнопка удаления")
-            .click();
+        if harness
+            .query_by_label("Удалить из списка t-alpha")
+            .is_none()
+        {
+            harness.get_by_label("Подробнее t-alpha").click();
+            harness.run();
+        }
+        harness.get_by_label("Удалить из списка t-alpha").click();
         harness.run();
         // Баннер сироты: поля фразы нет, удаление — кнопкой «Удалить».
         harness.get_by_label_contains("Файла хранилища нет на месте");
@@ -3589,9 +4256,9 @@ mod tests {
         harness.state_mut().block_until_idle();
         harness.run();
 
-        harness.get_by_label_contains("уже запущен");
+        harness.get_by_label_contains("занят другой операцией");
         // Запись осталась в списке: строка записи, а не упоминание в баннере.
-        harness.get_by_label_contains("t-alpha · файл · закрыто");
+        harness.get_by_label("t-alpha");
 
         holder.kill().expect("снять держателя лока");
         holder.wait().expect("дождаться держателя");
@@ -3635,7 +4302,7 @@ mod tests {
             state
                 .message
                 .as_deref()
-                .is_some_and(|m| m.contains("подождите")),
+                .is_some_and(|m| m.contains("Подождите")),
             "отказ не объяснён человеку: {:?}",
             state.message
         );
@@ -3678,18 +4345,18 @@ mod tests {
         let unknown: Vec<String> = vec![];
         let text = busy_message(&unknown);
         assert!(
-            text.contains("другой программой"),
+            text.contains("использующие их программы"),
             "fallback must be general: {text}"
         );
-        assert!(text.contains("«Закрыть»"));
+        assert!(text.contains("„Закрыть“"));
 
         let one = vec!["vim".to_owned()];
         let text = busy_message(&one);
         assert!(
-            text.contains("«vim»"),
+            text.contains("„vim“"),
             "single holder must be quoted: {text}"
         );
-        assert!(text.contains("Завершите программу"));
+        assert!(text.contains("Закройте его файлы"));
 
         let many = vec!["vim".to_owned(), "bash".to_owned()];
         let text = busy_message(&many);
@@ -3697,7 +4364,7 @@ mod tests {
             text.contains("vim, bash"),
             "multiple holders must be listed: {text}"
         );
-        assert!(text.contains("Завершите их"));
+        assert!(text.contains("Закройте его файлы"));
     }
 
     #[test]
@@ -3710,6 +4377,33 @@ mod tests {
         assert!(
             harness.query_by_label("Удалить из списка").is_none(),
             "кнопки записей на пустом экране"
+        );
+    }
+    #[test]
+    fn redesign_primary_action_is_visible_without_details() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let harness = harness_at(fixture(dir.path()));
+        assert!(
+            harness
+                .query_by_label("Открыть хранилище t-alpha")
+                .is_some(),
+            "основное действие скрыто за Подробнее"
+        );
+    }
+
+    #[test]
+    fn redesign_reload_preserves_foreground_failure() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let mut harness = harness_at(fixture(dir.path()));
+        let entries = harness.state().entries.clone();
+        harness
+            .state_mut()
+            .apply(Ok(OpOutcome::Failed("synthetic operation failure".into())));
+        harness.state_mut().apply(Ok(OpOutcome::Loaded(entries)));
+        assert_eq!(
+            harness.state().notices.last().map(|n| n.text.as_str()),
+            Some("synthetic operation failure"),
+            "reload потерял отказ операции"
         );
     }
 }

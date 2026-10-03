@@ -44,6 +44,8 @@ pub enum CreateAction {
     Submit,
     /// Уйти без создания.
     Cancel,
+    /// Скрыть текущий результат создания.
+    Dismiss(crate::app::NoticeScope),
 }
 
 /// Размер из строки ввода в байты. Чистая функция (тестируема без окна).
@@ -70,71 +72,97 @@ pub fn show(
     draft: &mut CreateDraft,
     busy: bool,
     message: Option<&str>,
+    entries: &[panzir_core::registry::VaultEntry],
+    notices: &[crate::app::Notice],
 ) -> Option<CreateAction> {
-    let mut action = None;
-
-    ui.heading("Новое хранилище");
-    // Отказ ядра обязан быть виден и на этом экране, а не только на списке
-    // (инвариант 10): без этого сообщение об ошибке предыдущей операции тонет
-    // при переходе на форму.
-    if let Some(text) = message {
-        ui.colored_label(ui.visuals().error_fg_color, text);
-    }
-
-    let label_ok = Label::new(&draft.label).is_ok();
-    let size_ok = parse_size(&draft.size).is_some();
-    let passwords_match = !draft.passphrase.is_empty() && draft.passphrase == draft.confirm;
-
-    ui.horizontal(|ui| {
-        ui.label("Метка:");
-        ui.text_edit_singleline(&mut draft.label);
-    });
-    if !draft.label.is_empty() && !label_ok {
-        ui.colored_label(
-            ui.visuals().error_fg_color,
-            "метка: строчные буквы, цифры, дефис; до 16 символов, не с дефиса",
+    use crate::theme::{self, ButtonKind};
+    theme::centered(ui, 480.0, |ui| {
+        let mut action = None;
+        ui.heading("Новое хранилище");
+        ui.add_space(8.0);
+        // Footer получает место до ScrollArea, но рисуется после полей (Tab).
+        let stacked = ui.available_width() < 400.0;
+        let footer_height = if stacked { 144.0 } else { 98.0 };
+        let fields_height = (ui.available_height() - footer_height - 12.0).max(1.0);
+        let mut responses = Vec::new();
+        egui::ScrollArea::vertical().id_salt("create-scroll")
+            .max_height(fields_height).auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if let Some(text) = message { ui.colored_label(theme::DANGER, text); }
+                for n in notices.iter().filter(|n| matches!(&n.scope, crate::app::NoticeScope::Create(_))) {
+                    if let Some(crate::view_list::ListAction::Dismiss(scope)) = crate::view_list::notice(ui, n) { action = Some(CreateAction::Dismiss(scope)); }
+                }
+                responses.push(theme::field(ui, ("create", "label"), "Название", &mut draft.label, false, !busy, "Например, work-keys"));
+                theme::helper(ui, "Строчные латинские буквы, цифры и дефис; до 16 символов, без дефиса в начале и конце");
+                if !draft.label.is_empty() && Label::new(&draft.label).is_err() { ui.colored_label(theme::DANGER, "Название не подходит"); }
+                if entries.iter().any(|e| e.label().as_str() == draft.label) { ui.colored_label(theme::DANGER, "Это название уже используется"); }
+                ui.add_space(8.0);
+                responses.push(theme::field(ui, ("create", "size"), "Размер, МиБ", &mut draft.size, false, !busy, "1024"));
+                theme::helper(ui, "Не меньше 32 МиБ. 1024 МиБ = 1 ГиБ");
+                if !draft.size.is_empty() && parse_size(&draft.size).is_none() { ui.colored_label(theme::DANGER, "Размер не подходит: требуется целое число МиБ в поддерживаемом диапазоне"); }
+                ui.add_space(8.0);
+                responses.push(theme::field(ui, ("create", "passphrase"), "Пароль хранилища", &mut draft.passphrase, true, !busy, ""));
+                ui.add_space(8.0);
+                responses.push(theme::field(ui, ("create", "confirm"), "Повторите пароль", &mut draft.confirm, true, !busy, ""));
+                if !draft.confirm.is_empty() && draft.passphrase != draft.confirm { ui.colored_label(theme::DANGER, "Пароли не совпадают"); }
+            });
+        let valid = Label::new(&draft.label).is_ok()
+            && parse_size(&draft.size).is_some()
+            && !entries.iter().any(|e| e.label().as_str() == draft.label)
+            && !draft.passphrase.is_empty()
+            && draft.passphrase == draft.confirm
+            && !busy;
+        let enter = theme::enter(ui, &responses);
+        ui.add_space(12.0);
+        theme::helper(
+            ui,
+            if busy {
+                "Создание продолжается"
+            } else {
+                "После создания хранилище откроется"
+            },
         );
-    }
-
-    ui.horizontal(|ui| {
-        ui.label("Размер, МиБ:");
-        ui.text_edit_singleline(&mut draft.size);
-    });
-    if !draft.size.is_empty() && !size_ok {
-        ui.colored_label(
-            ui.visuals().error_fg_color,
-            format!("размер: целое число МиБ, не меньше {MIN_SIZE_MIB}"),
-        );
-    }
-
-    // Поля пароля замаскированы, как на разблокировке (переключателя показа нет —
-    // повтор ниже ловит опечатку, инвариант 5).
-    ui.horizontal(|ui| {
-        ui.label("Пароль:");
-        ui.add(egui::TextEdit::singleline(&mut draft.passphrase).password(true));
-    });
-    ui.horizontal(|ui| {
-        ui.label("Повтор:");
-        ui.add(egui::TextEdit::singleline(&mut draft.confirm).password(true));
-    });
-    if !draft.confirm.is_empty() && !passwords_match {
-        ui.colored_label(ui.visuals().error_fg_color, "пароли не совпадают");
-    }
-
-    let can_create = label_ok && size_ok && passwords_match;
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(can_create && !busy, egui::Button::new("Создать"))
+        let mut buttons = |ui: &mut egui::Ui| {
+            let cancel = if busy {
+                "К списку"
+            } else {
+                "Отмена"
+            };
+            if theme::button(
+                ui,
+                "create",
+                "cancel",
+                cancel,
+                cancel,
+                true,
+                ButtonKind::Neutral,
+            )
             .clicked()
-        {
-            action = Some(CreateAction::Submit);
+            {
+                action = Some(CreateAction::Cancel);
+            }
+            if theme::button(
+                ui,
+                "create",
+                "submit",
+                "Создать хранилище",
+                "Создать хранилище",
+                valid,
+                ButtonKind::Primary,
+            )
+            .clicked()
+                || (valid && enter)
+            {
+                action = Some(CreateAction::Submit);
+            }
+        };
+        if stacked {
+            ui.vertical(&mut buttons);
+        } else {
+            ui.horizontal(&mut buttons);
         }
-        if ui.button("Отмена").clicked() {
-            action = Some(CreateAction::Cancel);
-        }
-    });
-
-    action
+        action
+    })
 }
 
 #[cfg(test)]
