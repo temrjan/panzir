@@ -371,6 +371,9 @@ impl Udisks {
             Value::from(passphrase.expose_secret()),
         );
         options.insert("label", Value::from(label));
+        // Only newly formatted filesystems: ownership is assigned by the
+        // daemon to the caller, without a separate privileged operation.
+        options.insert("take-ownership", Value::from(true));
         Ok(block.format("ext4", options).await?)
     }
 

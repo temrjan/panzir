@@ -281,3 +281,59 @@ async fn double_insert_is_noop_and_still_resolves() {
         &field.symlink.join("id_ed25519")
     ));
 }
+
+/// Explicit identities accumulate even below our Include: they must not
+/// produce a positive vault-only configuration check.
+#[tokio::test]
+async fn additional_identity_file_is_not_confirmed() {
+    require_ssh!();
+    let field = Field::new();
+    field.write_snippet().await;
+    apply_include(&field.config, &field.snippet)
+        .await
+        .expect("include");
+    let config = format!(
+        "{}Host devbox\n    IdentityFile /outside/vault/key\n",
+        field.read_config()
+    );
+    std::fs::write(&field.config, config).expect("foreign key");
+    let resolved = field.resolves("devbox").await;
+    assert_eq!(
+        resolved.identity_files.len(),
+        2,
+        "the SSH channel must observe both keys"
+    );
+    assert!(
+        !resolution_confirms(&resolved, &field.symlink.join("id_ed25519")),
+        "an additional key can work after the vault closes"
+    );
+}
+
+/// Check effective OpenSSH policy, rather than the generated text alone.
+#[tokio::test]
+async fn managed_hosts_disable_agent_and_password_fallback() {
+    require_ssh!();
+    let field = Field::new();
+    field.write_snippet().await;
+    apply_include(&field.config, &field.snippet)
+        .await
+        .expect("include");
+    let output = tokio::process::Command::new("ssh")
+        .args(["-G", "-F"])
+        .arg(&field.config)
+        .arg("devbox")
+        .output()
+        .await
+        .expect("ssh runs");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("ssh output");
+    assert!(
+        text.lines().any(|line| line == "identityagent none"),
+        "agent must be disabled"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line == "preferredauthentications publickey"),
+        "password fallback must be disabled"
+    );
+}

@@ -180,6 +180,10 @@ async fn t14_open_close_open_keeps_container_file() {
     // Положительный контроль ДО утверждения «ноль» (М-14).
     assert_counter_can_see(&container, 1);
 
+    let root_before = std::fs::metadata(&created.mount_point).expect("root before close");
+    let marker = created.mount_point.join("persistent-user-file");
+    std::fs::write(&marker, b"survives close and reopen").expect("new volume must be writable");
+
     // Закрываем продуктовым путём — файл обязан остаться.
     close_file_vault(&ud, &created.loop_object, &label, &home, true, &NoScheduler)
         .await
@@ -201,6 +205,18 @@ async fn t14_open_close_open_keeps_container_file() {
     let opened = open_file_vault(&ud, &container, &label, &pass, &home, &NoScheduler, None)
         .await
         .expect("reopen must succeed");
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let root_after = std::fs::metadata(&opened.mount_point).expect("root after reopen");
+    assert_eq!(root_after.uid(), root_before.uid());
+    assert_eq!(root_after.gid(), root_before.gid());
+    assert_eq!(root_after.permissions().mode() & 0o7777, 0o700);
+    let marker = opened.mount_point.join("persistent-user-file");
+    assert_eq!(
+        std::fs::read(&marker).expect("persistent read"),
+        b"survives close and reopen"
+    );
+    std::fs::write(&marker, b"writable after reopen").expect("write after reopen");
+    std::fs::remove_file(&marker).expect("remove after reopen");
     assert!(
         !opened.loop_was_reused,
         "we raised this loop ourselves, so loop_was_reused must be false"
