@@ -87,7 +87,8 @@ pub fn include_line(snippet: &Path) -> String {
 ///
 /// `IdentityFile` указывает на ключ внутри открытого тома через симлинк
 /// `~/panzir-<метка>`; `IdentitiesOnly yes` — всегда (спека Ш-7), чтобы
-/// посторонние ключи по умолчанию не участвовали. `Port` пишется только при
+/// посторонние ключи по умолчанию не участвовали. Агент отключён, разрешена
+/// только аутентификация файлом ключа. `Port` пишется только при
 /// `Some`. Экранирование не нужно: поля валидированы в [`SshHost::new`].
 #[must_use]
 pub fn render_snippet(hosts: &[SshHost], symlink: &Path) -> String {
@@ -107,7 +108,7 @@ pub fn render_snippet(hosts: &[SshHost], symlink: &Path) -> String {
         }
         out.push_str("    IdentityFile ");
         out.push_str(&symlink.join(&h.key_file).display().to_string());
-        out.push_str("\n    IdentitiesOnly yes\n");
+        out.push_str("\n    IdentitiesOnly yes\n    IdentityAgent none\n    PreferredAuthentications publickey\n");
     }
     out
 }
@@ -303,6 +304,10 @@ pub struct ResolvedHost {
     pub identity_files: Vec<String>,
     /// `identitiesonly yes` в выводе.
     pub identities_only: bool,
+    /// `identityagent none`: ключ не берётся из памяти агента.
+    pub identity_agent_disabled: bool,
+    /// `preferredauthentications publickey`: без других способов входа.
+    pub public_key_only: bool,
 }
 
 /// Разбор вывода `ssh -G` (шов «текст на входе», как `holders_from_entries`).
@@ -311,26 +316,33 @@ pub fn parse_ssh_g(output: &str) -> ResolvedHost {
     let mut resolved = ResolvedHost {
         identity_files: Vec::new(),
         identities_only: false,
+        identity_agent_disabled: false,
+        public_key_only: false,
     };
     for line in output.lines() {
         if let Some(rest) = line.strip_prefix("identityfile ") {
             resolved.identity_files.push(rest.trim().to_owned());
         } else if line.trim() == "identitiesonly yes" {
             resolved.identities_only = true;
+        } else if line.trim() == "identityagent none" {
+            resolved.identity_agent_disabled = true;
+        } else if line.trim() == "preferredauthentications publickey" {
+            resolved.public_key_only = true;
         }
     }
     resolved
 }
 
-/// Связка подтверждена резолюцией: `identitiesonly yes` и наш ключ —
-/// среди `identityfile`.
+/// Связка подтверждена: ровно наш файл ключа, без агента и других способов
+/// аутентификации. Дополнительные IdentityFile накапливаются в OpenSSH даже
+/// ниже нашего Include и могут оставаться доступны после закрытия тома.
 #[must_use]
 pub fn resolution_confirms(resolved: &ResolvedHost, expected_identity: &Path) -> bool {
     resolved.identities_only
-        && resolved
-            .identity_files
-            .iter()
-            .any(|f| f == &expected_identity.display().to_string())
+        && resolved.identity_agent_disabled
+        && resolved.public_key_only
+        && resolved.identity_files.len() == 1
+        && resolved.identity_files[0] == expected_identity.display().to_string()
 }
 
 /// Вызов `ssh -G <host>` с таймаутом.
@@ -638,31 +650,49 @@ mod tests {
             "identitiesonly no\nidentityfile ~/.ssh/id_rsa\nidentityfile ~/.ssh/id_ed25519\n",
         );
         assert!(!r.identities_only);
+        assert!(!r.identity_agent_disabled);
+        assert!(!r.public_key_only);
         assert_eq!(r.identity_files.len(), 2);
     }
 
-    /// Подтверждение связки: identitiesonly yes И наш ключ в identityfile;
-    /// чужой набор ключей — не подтверждение.
+    /// Подтверждение требует только наш ключ и ограниченную политику.
     #[test]
     fn resolution_confirms_only_with_our_key_and_identities_only() {
         let expected = Path::new("/home/u/panzir-work/id_ed25519");
         let good = ResolvedHost {
             identity_files: vec!["/home/u/panzir-work/id_ed25519".to_owned()],
             identities_only: true,
+            identity_agent_disabled: true,
+            public_key_only: true,
         };
         assert!(resolution_confirms(&good, expected));
         // Посторонний ключ по умолчанию вместо нашего.
         let foreign = ResolvedHost {
             identity_files: vec!["~/.ssh/id_ed25519".to_owned()],
-            identities_only: true,
+            ..good.clone()
         };
         assert!(!resolution_confirms(&foreign, expected));
         // Наш ключ, но без identitiesonly — посторонний ключ тоже участвует.
         let loose = ResolvedHost {
-            identity_files: good.identity_files.clone(),
             identities_only: false,
+            ..good.clone()
         };
         assert!(!resolution_confirms(&loose, expected));
+        let agent = ResolvedHost {
+            identity_agent_disabled: false,
+            ..good.clone()
+        };
+        assert!(!resolution_confirms(&agent, expected));
+        let password = ResolvedHost {
+            public_key_only: false,
+            ..good.clone()
+        };
+        assert!(!resolution_confirms(&password, expected));
+        let absent = ResolvedHost {
+            identity_files: Vec::new(),
+            ..good
+        };
+        assert!(!resolution_confirms(&absent, expected));
     }
 
     #[test]
@@ -678,7 +708,7 @@ mod tests {
         let out = render_snippet(&[devbox()], Path::new("/home/u/panzir-work"));
         assert_eq!(
             out,
-            "Host devbox\n    HostName 192.0.2.10\n    User devbox\n    Port 9281\n    IdentityFile /home/u/panzir-work/id_ed25519\n    IdentitiesOnly yes\n"
+            "Host devbox\n    HostName 192.0.2.10\n    User devbox\n    Port 9281\n    IdentityFile /home/u/panzir-work/id_ed25519\n    IdentitiesOnly yes\n    IdentityAgent none\n    PreferredAuthentications publickey\n"
         );
     }
 

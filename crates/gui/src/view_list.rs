@@ -46,7 +46,7 @@ pub(crate) struct SshHostDraft {
     pub(crate) user: String,
     /// Порт — пусто или число (`Port` пишется только при числе).
     pub(crate) port: String,
-    /// Имя файла ключа внутри хранилища.
+    /// Относительный путь ключа внутри хранилища.
     pub(crate) key_file: String,
 }
 
@@ -428,7 +428,7 @@ fn show_ssh(
                 if r.ok {
                     ui.label(format!("{}: ssh -G подтверждает связку", r.host));
                 } else {
-                    ui.colored_label(theme::DANGER, format!("{}: {}", r.host, r.detail.as_deref().unwrap_or("ssh -G не подтверждает связку — нет нашего identityfile или identitiesonly yes")));
+                    ui.colored_label(theme::DANGER, format!("{}: {}", r.host, r.detail.as_deref().unwrap_or("ssh -G не подтверждает связку — нужен только ключ этого хранилища, без агента и входа по паролю")));
                 }
             }
         } else {
@@ -525,11 +525,11 @@ fn show_ssh(
             theme::field(
                 ui,
                 (name, "ssh-key"),
-                "Файл ключа",
+                "Путь ключа в хранилище",
                 &mut d.key_file,
                 false,
                 enabled,
-                "id_ed25519",
+                "ssh/id_ed25519",
             ),
         ];
         let enter = theme::enter(ui, &fields);

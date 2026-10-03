@@ -199,7 +199,7 @@ pub struct SshHost {
     /// Порт (`Port`); `None` — строка не пишется, действует дефолт ssh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
-    /// Имя файла ключа внутри хранилища (basename); полный путь строится
+    /// Относительный путь ключа внутри хранилища; полный путь строится
     /// через симлинк `~/panzir-<метка>` при рендере сниппета.
     pub key_file: String,
 }
@@ -207,8 +207,8 @@ pub struct SshHost {
 impl SshHost {
     /// Проверить поля и собрать запись.
     ///
-    /// `host` и `key_file` — белый список `[a-z0-9._-]` (образец [`Label`]):
-    /// оба попадают в генерируемый конфиг, `key_file` ещё и в путь.
+    /// `host` и компоненты `key_file` — белый список `[a-z0-9._-]`
+    /// (образец [`Label`]); путь ключа относительный, без `.` и `..`.
     /// `hostname` и `user` — непустые строки без пробельных символов и `#`
     /// (иначе — инъекция лишней строки в генерируемый конфиг).
     ///
@@ -255,7 +255,12 @@ impl SshHost {
         strict("host", host)?;
         loose("hostname", hostname)?;
         loose("user", user)?;
-        strict("key_file", key_file)?;
+        for component in key_file.split('/') {
+            strict("key_file", component).map_err(|_| SshError::InvalidField {
+                field: "key_file",
+                value: key_file.to_owned(),
+            })?;
+        }
         Ok(Self {
             host: host.to_owned(),
             hostname: hostname.to_owned(),
@@ -683,7 +688,7 @@ mod tests {
                     .expect("valid host"),
             );
             a.add_ssh_host(
-                SshHost::new("nas", "nas.lan", "root", None, "id_nas").expect("valid host"),
+                SshHost::new("nas", "nas.lan", "root", None, "ssh/id_nas").expect("valid host"),
             );
             r.add(a)?;
             r.add(entry("b"))
@@ -707,6 +712,7 @@ mod tests {
         assert_eq!(a.ssh_hosts()[0].port, Some(9281));
         assert_eq!(a.ssh_hosts()[1].host, "nas");
         assert_eq!(a.ssh_hosts()[1].port, None);
+        assert_eq!(a.ssh_hosts()[1].key_file, "ssh/id_nas");
         assert!(
             reg.entries()[1].ssh_hosts().is_empty(),
             "entry without hosts stays empty"
@@ -730,6 +736,31 @@ mod tests {
             .await
             .expect("old file must parse");
         assert!(reg.entries()[0].ssh_hosts().is_empty());
+    }
+
+    #[test]
+    fn ssh_host_accepts_nested_key_paths_and_rejects_escape() {
+        for key in ["id_ed25519", "ssh/id_ed25519", "archive/ssh/work.key"] {
+            assert!(SshHost::new("devbox", "192.0.2.10", "u", None, key).is_ok());
+        }
+        for key in [
+            "/ssh/id",
+            "ssh/../id",
+            "ssh/./id",
+            "ssh//id",
+            "ssh/",
+            "../id",
+            "~/id",
+            "ssh\\id",
+            "ssh/id key",
+            "ssh/id\nHost evil",
+        ] {
+            assert!(
+                SshHost::new("devbox", "192.0.2.10", "u", None, key).is_err(),
+                "must reject {key:?}"
+            );
+        }
+        assert!(SshHost::new("dev/box", "192.0.2.10", "u", None, "id").is_err());
     }
 
     #[test]

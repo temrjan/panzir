@@ -410,9 +410,10 @@ pub fn error_text(err: &Error) -> String {
         }
         Error::Ssh(SshError::InvalidField { field, value }) => {
             let rule = match *field {
-                "host" | "key_file" => {
+                "host" => {
                     "разрешены строчные буквы, цифры, точка, дефис и подчёркивание"
                 }
+                "key_file" => "нужен относительный путь внутри хранилища: строчные буквы, цифры, точка, дефис и подчёркивание; каталоги через /, без пустых частей, . и ..",
                 _ => "без пробелов и символа «#»",
             };
             format!("SSH-хост: поле «{field}» не подходит: «{value}» — {rule}")
@@ -3346,6 +3347,12 @@ mod tests {
         let mut harness = harness_at(fixture(dir.path()));
         start_ssh_draft(&mut harness);
         fill_ssh_draft(&mut harness, "devbox", "9281");
+        harness
+            .state_mut()
+            .ssh_draft
+            .as_mut()
+            .expect("draft")
+            .key_file = "ssh/id_ed25519".to_owned();
 
         harness.get_by_label("Сохранить хост").click();
         harness.run();
@@ -3369,7 +3376,7 @@ mod tests {
         );
         assert!(
             content.contains(&format!(
-                "IdentityFile {}/panzir-t-alpha/id_ed25519\n",
+                "IdentityFile {}/panzir-t-alpha/ssh/id_ed25519\n",
                 dir.path().display()
             )),
             "snippet:\n{content}"

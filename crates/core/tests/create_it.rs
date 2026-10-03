@@ -150,6 +150,27 @@ async fn t1_created_container_is_genuine_luks2() {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "container mode is {mode:o}, expected 600");
+
+        use std::os::unix::fs::MetadataExt as _;
+        let root = std::fs::metadata(&created.mount_point).expect("mount root");
+        assert_eq!(
+            root.uid(),
+            rustix::process::getuid().as_raw(),
+            "new volume must belong to its creator"
+        );
+        assert_eq!(
+            root.gid(),
+            rustix::process::getgid().as_raw(),
+            "new volume group"
+        );
+        assert_eq!(root.permissions().mode() & 0o7777, 0o700);
+        let marker = created.mount_point.join("user-write-check");
+        std::fs::write(&marker, b"new vault is writable").expect("unprivileged write");
+        assert_eq!(
+            std::fs::read(&marker).expect("read"),
+            b"new vault is writable"
+        );
+        std::fs::remove_file(&marker).expect("unprivileged remove");
     })
     .await;
 }
