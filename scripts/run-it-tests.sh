@@ -4,6 +4,12 @@ set -euo pipefail
 POLKIT_RULE="/etc/polkit-1/rules.d/99-panzir-test.rules"
 ORIG_AUTOMOUNT=""
 USER_NAME=$(id -un)
+DESKTOP_POLICY=false
+if [[ "${1:-}" == --desktop-policy ]]; then
+    # Exercise the real desktop: keep normal polkit policy and automount.
+    DESKTOP_POLICY=true
+    shift
+fi
 
 # T-3 (btrfs) ищет каталог в PANZIR_IT_DIR. Если переменная не задана, а $HOME
 # лежит на btrfs — используем его, чтобы тест бежал из коробки на Fedora.
@@ -35,6 +41,24 @@ is_our_test_container() {
         return 1
     fi
     [[ "$base" =~ ^panzir-t[0-9]+(-[0-9]+)?\.vault$ ]]
+}
+
+has_leftover_loops() {
+    if [[ "$DESKTOP_POLICY" == false ]]; then
+        command -v losetup >/dev/null && [[ -n $(losetup -a) ]]
+        return
+    fi
+    # Normal-policy acceptance can run while a real user vault is open.
+    # Only test-owned devices participate in this check and in the sweep.
+    local backing vault_path
+    for backing in /sys/block/loop*/loop/backing_file; do
+        [[ -f "$backing" ]] || continue
+        vault_path=$(cat "$backing")
+        if is_our_test_container "$vault_path"; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 sweep_panzir() {
@@ -93,7 +117,7 @@ cleanup() {
     # Восстановление настроек. Свип выполнен первым: loop-delete после Lock
     # работает только пока polkit-правило даёт нашему uid право на операции
     # с loop-устройством.
-    if sudo test -f "$POLKIT_RULE"; then
+    if [[ "$DESKTOP_POLICY" == false ]] && sudo test -f "$POLKIT_RULE"; then
         sudo rm -f "$POLKIT_RULE"
     fi
     if [[ -n "$ORIG_AUTOMOUNT" ]] && command -v gsettings >/dev/null; then
@@ -103,7 +127,7 @@ cleanup() {
 trap cleanup EXIT
 
 # 1. Polkit rule if missing.
-if [[ ! -f "$POLKIT_RULE" ]]; then
+if [[ "$DESKTOP_POLICY" == false && ! -f "$POLKIT_RULE" ]]; then
     sudo tee "$POLKIT_RULE" >/dev/null <<EOF
 /* panzir-test-rule: auto-managed by scripts/run-it-tests.sh */
 polkit.addRule(function(action, subject) {
@@ -116,7 +140,7 @@ EOF
 fi
 
 # 2. Disable GNOME automount.
-if command -v gsettings >/dev/null; then
+if [[ "$DESKTOP_POLICY" == false ]] && command -v gsettings >/dev/null; then
     ORIG_AUTOMOUNT=$(gsettings get org.gnome.desktop.media-handling automount)
     gsettings set org.gnome.desktop.media-handling automount false
 fi
@@ -124,7 +148,7 @@ fi
 # 3. Pre-flight sanity check.
 # Trade-off: проверка общемашинная — любой сторонний loop сделает прогон красным.
 # Это приемлемо для локальной рабочей машины; в CI скрипт не используется.
-if command -v losetup >/dev/null && [[ -n $(losetup -a) ]]; then
+if has_leftover_loops; then
     echo "ERROR: leftover loop devices" >&2
     exit 1
 fi
@@ -152,7 +176,7 @@ PANZIR_IT=1 cargo test -p panzir-core --test pr2_it -- --ignored $FILTER
 PANZIR_IT=1 cargo test -p panzir-core --test lifecycle_it -- --ignored $FILTER
 
 # 5. Post-run sanity check (same as pre-flight).
-if command -v losetup >/dev/null && [[ -n $(losetup -a) ]]; then
+if has_leftover_loops; then
     echo "ERROR: tests left behind loop devices" >&2
     exit 1
 fi
