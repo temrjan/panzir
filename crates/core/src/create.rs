@@ -85,6 +85,7 @@ pub async fn create_file_container(
     label: &Label,
     passphrase: &SecretString,
 ) -> Result<CreatedVault> {
+    let _automount = crate::udisks::inhibit_automount().await?;
     let parent = path
         .parent()
         .ok_or_else(|| Error::InvalidContainerPath(path.display().to_string()))?;

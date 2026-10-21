@@ -35,6 +35,47 @@ fn no_interaction_options() -> Options<'static> {
     opts
 }
 
+/// Keep a dedicated session connection alive for the duration of a vault
+/// operation. GNOME releases its automount inhibitor when this connection
+/// drops, including on cancellation. No persistent desktop setting is changed.
+pub(crate) async fn inhibit_automount() -> Result<Option<Connection>> {
+    let conn = match Connection::session().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::debug!("desktop session bus unavailable: {e}");
+            return Ok(None);
+        }
+    };
+    let session = zbus::Proxy::new(
+        &conn,
+        "org.gnome.SessionManager",
+        "/org/gnome/SessionManager",
+        "org.gnome.SessionManager",
+    )
+    .await?;
+    let result: zbus::Result<u32> = session
+        .call(
+            "Inhibit",
+            &("panzir", 0_u32, "Opening an encrypted vault", 16_u32),
+        )
+        .await;
+    match result {
+        Ok(_) => {
+            drop(session);
+            Ok(Some(conn))
+        }
+        Err(e)
+            if dbus_error_is(&e, "org.freedesktop.DBus.Error.ServiceUnknown")
+                || dbus_error_is(&e, "org.freedesktop.DBus.Error.NameHasNoOwner") =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(Error::UnexpectedUdisksState(format!(
+            "cannot inhibit desktop automount: {e}"
+        ))),
+    }
+}
+
 /// D-Bus ошибка-метод с заданным именем (таксономия udisks2 — только здесь).
 fn dbus_error_is(e: &zbus::Error, name: &str) -> bool {
     matches!(e, zbus::Error::MethodError(n, _, _) if n.as_str() == name)
@@ -298,7 +339,9 @@ impl Udisks {
     pub async fn loop_setup(&self, file: std::fs::File) -> Result<ObjPath> {
         let mgr = ManagerProxy::new(&self.conn).await?;
         let fd = Fd::from(std::os::fd::OwnedFd::from(file));
-        Ok(ObjPath::from_owned(mgr.loop_setup(fd, no_options()).await?))
+        Ok(ObjPath::from_owned(
+            mgr.loop_setup(fd, no_interaction_options()).await?,
+        ))
     }
 
     /// Включить autoclear — поток закрытия файл-контейнера:
@@ -364,7 +407,7 @@ impl Udisks {
             .path(block_object.as_zbus()?)?
             .build()
             .await?;
-        let mut options = Options::new();
+        let mut options = no_interaction_options();
         options.insert("encrypt.type", Value::from("luks2"));
         options.insert(
             "encrypt.passphrase",
@@ -385,7 +428,8 @@ impl Udisks {
     ) -> Result<ObjPath> {
         let enc = self.encrypted_proxy(block_object).await?;
         Ok(ObjPath::from_owned(
-            enc.unlock(passphrase.expose_secret(), no_options()).await?,
+            enc.unlock(passphrase.expose_secret(), no_interaction_options())
+                .await?,
         ))
     }
 
@@ -499,7 +543,7 @@ impl Udisks {
 
     async fn try_mount_noexec(&self, block_object: &ObjPath) -> Result<PathBuf> {
         let fs = self.fs_proxy(block_object).await?;
-        let mut options = Options::new();
+        let mut options = no_interaction_options();
         options.insert("options", Value::from("noexec"));
         Ok(PathBuf::from(fs.mount(options).await?))
     }

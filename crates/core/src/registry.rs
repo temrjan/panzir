@@ -851,7 +851,7 @@ mod tests {
     }
 
     /// Старый `vaults.toml` (до автозакрытия) читается без миграции: срок —
-    /// 15 минут по умолчанию, дедлайна у открытого тома нет.
+    /// 180 minutes by default; an open volume has no recorded deadline.
     #[tokio::test]
     async fn load_registry_without_auto_close_fields_uses_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");

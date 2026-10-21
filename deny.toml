@@ -7,7 +7,18 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# These informational notices describe crates merged into zbus 6, not known
+# vulnerabilities. Released AccessKit/AT-SPI dependencies still require zbus 5
+# (checked 2026-10-21), including the latest published GUI dependency versions.
+# https://github.com/z-galaxy/zbus/issues/2043
+# Remove these exceptions after the upstream accessibility stack migrates.
+# Stale exceptions fail the audit; all other advisories remain checked.
+unused-ignored-advisory = "deny"
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "Informational zvariant deprecation after its merge into zbus 6; required by the released AccessKit/AT-SPI stack. Remove after upstream migration." },
+    { id = "RUSTSEC-2026-0371", reason = "Informational zbus_names deprecation after its merge into zbus 6; required by the released AccessKit/AT-SPI stack. Remove after upstream migration." },
+    { id = "RUSTSEC-2026-0372", reason = "Informational zvariant_derive deprecation after its merge into zbus 6; required by the released AccessKit/AT-SPI stack. Remove after upstream migration." },
+]
 
 [licenses]
 version = 2

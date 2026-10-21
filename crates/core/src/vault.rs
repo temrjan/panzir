@@ -10,10 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
-/// Срок автозакрытия по умолчанию — 15 минут (решение Капитана 27.08:
-/// между «одно действие подряд» у sudo/polkit и «заметная часть часа»
-/// у ssh-ключей gpg-agent).
-pub const DEFAULT_AUTO_CLOSE: Duration = Duration::from_secs(15 * 60);
+/// Default auto-close period: three hours for long-running agent sessions.
+pub const DEFAULT_AUTO_CLOSE: Duration = Duration::from_secs(180 * 60);
 
 /// Метка хранилища: валидированная пользовательская строка.
 ///

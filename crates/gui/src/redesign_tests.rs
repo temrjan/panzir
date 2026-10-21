@@ -814,8 +814,8 @@ const NATIVE_SCENES: &[(&str, [f32; 2], f32)] = &[
     ("keyboard-small-125", [560.0, 440.0], 1.25),
 ];
 impl eframe::App for NativeFixture {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        theme::BACKGROUND.to_normalized_gamma_f32()
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        eframe::App::clear_color(&self.app, visuals)
     }
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         use std::io::Write as _;
@@ -854,6 +854,16 @@ impl eframe::App for NativeFixture {
                 "native capture {name}: {}x{}",
                 image.width(),
                 image.height()
+            );
+            println!(
+                "native alpha {name}: corners={:?}, center={}",
+                [
+                    image[(0, 0)].a(),
+                    image[(image.width() - 1, 0)].a(),
+                    image[(0, image.height() - 1)].a(),
+                    image[(image.width() - 1, image.height() - 1)].a(),
+                ],
+                image[(image.width() / 2, image.height() / 2)].a()
             );
             self.scene += 1;
             self.frames = 0;

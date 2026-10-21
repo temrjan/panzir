@@ -269,6 +269,9 @@ pub async fn open_file_vault(
     scheduler: &impl Scheduler,
     auto_close: Option<Duration>,
 ) -> Result<OpenedVault> {
+    // Acquire before LoopSetup publishes a volume: otherwise GNOME asks for
+    // the same passphrase and starts a competing mount from its own process.
+    let _automount = crate::udisks::inhibit_automount().await?;
     // Стартовая точка: что система уже сделала — и что предстоит сделать нам.
     let (mut guard, cleartext, mount_point) = match probe_file_vault(ud, container).await? {
         VaultProbe::Foreign { uid, .. } => {

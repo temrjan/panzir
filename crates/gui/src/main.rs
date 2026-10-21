@@ -136,6 +136,8 @@ fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("panzir")
+            .with_decorations(false)
+            .with_transparent(true)
             .with_inner_size([760.0, 560.0])
             .with_min_inner_size([560.0, 440.0]),
         ..Default::default()

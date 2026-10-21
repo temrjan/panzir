@@ -16,6 +16,11 @@ Linux-приложение «сейф»: именованные LUKS2-храни
 Ошибки остаются у соответствующего хранилища до скрытия или новой попытки.
 На снимке показаны тестовые записи. Работа с носителями пока не поддерживается.
 
+File vaults close automatically 180 minutes after opening by default.
+Each entry stores its own timeout in `~/.config/panzir/vaults.toml` as
+`auto_close_sec` (10800 seconds = 180 minutes). An existing saved value takes
+precedence over the default; a changed timeout applies on the next opening.
+
 ## SSH-связка
 
 Хранилище можно связать с SSH: на карточке хранилища добавляются хосты
