@@ -12,6 +12,8 @@ pub(crate) const ACCENT: Color32 = Color32::from_rgb(100, 213, 179);
 pub(crate) const DANGER: Color32 = Color32::from_rgb(233, 161, 155);
 pub(crate) const DANGER_BG: Color32 = Color32::from_rgb(48, 33, 31);
 pub(crate) const DANGER_BORDER: Color32 = Color32::from_rgb(114, 73, 69);
+pub(crate) const WINDOW_RADIUS: u8 = 22;
+pub(crate) const CONTROL_RADIUS: u8 = 12;
 
 pub(crate) fn apply(ctx: &egui::Context) {
     let mut style = egui::Style {
@@ -36,11 +38,13 @@ pub(crate) fn apply(ctx: &egui::Context) {
         widget.weak_bg_fill = CARD;
         widget.bg_stroke = Stroke::new(1.0, FIELD_BORDER);
         widget.fg_stroke = Stroke::new(1.0, TEXT);
-        widget.corner_radius = 7.into();
+        widget.corner_radius = CONTROL_RADIUS.into();
     }
     style.visuals.widgets.active.bg_stroke = Stroke::new(2.0, ACCENT);
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(33, 49, 45);
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    style.visuals.widgets.noninteractive.corner_radius = CONTROL_RADIUS.into();
+    style.visuals.window_corner_radius = 16.into();
     style.spacing.item_spacing = egui::vec2(12.0, 12.0);
     style.spacing.button_padding = egui::vec2(16.0, 10.0);
     style.spacing.interact_size = egui::vec2(42.0, 42.0);
@@ -54,6 +58,100 @@ pub(crate) fn apply(ctx: &egui::Context) {
     .into();
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_style_of(egui::Theme::Dark, style);
+}
+
+/// Draw a single transparent window surface, including its title bar, so
+/// all four outer corners have the same radius on Wayland and X11.
+pub(crate) fn window(ui: &mut Ui, contents: impl FnOnce(&mut Ui)) {
+    let rect = ui.max_rect().shrink(1.0);
+    let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+    ui.painter().rect(
+        rect,
+        if maximized { 0 } else { WINDOW_RADIUS },
+        BACKGROUND,
+        Stroke::new(1.0, BORDER),
+        egui::StrokeKind::Inside,
+    );
+    let title = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 36.0));
+    let drag = ui.interact(title, id("window", "drag"), egui::Sense::click_and_drag());
+    if drag.double_clicked() {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+    } else if drag.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    ui.painter().text(
+        title.left_center() + egui::vec2(18.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        "panzir",
+        FontId::proportional(14.0),
+        MUTED,
+    );
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::Vec2::ZERO;
+        ui.spacing_mut().interact_size = egui::vec2(28.0, 28.0);
+        for (index, (label, name, command)) in [
+            ("×", "Закрыть окно", egui::ViewportCommand::Close),
+            (
+                "□",
+                "Развернуть окно",
+                egui::ViewportCommand::Maximized(!maximized),
+            ),
+            ("−", "Свернуть окно", egui::ViewportCommand::Minimized(true)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let center = egui::pos2(title.right() - 22.0 - index as f32 * 32.0, title.center().y);
+            let response = ui.put(
+                egui::Rect::from_center_size(center, egui::vec2(28.0, 28.0)),
+                egui::Button::new(RichText::new(label).size(16.0))
+                    .corner_radius(14)
+                    .fill(CARD)
+                    .stroke(Stroke::NONE),
+            );
+            response
+                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+            if response.clicked() {
+                ui.ctx().send_viewport_cmd(command);
+            }
+        }
+    });
+    let content = egui::Rect::from_min_max(egui::pos2(rect.left(), title.bottom()), rect.max);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+        ui.set_clip_rect(content.shrink(2.0));
+        contents(ui);
+    });
+    if !maximized {
+        resize_window(ui, rect);
+    }
+}
+
+fn resize_window(ui: &Ui, rect: egui::Rect) {
+    use egui::{CursorIcon, ResizeDirection};
+    let Some(pos) = ui.ctx().pointer_hover_pos() else {
+        return;
+    };
+    let left = pos.x < rect.left() + 6.0;
+    let right = pos.x > rect.right() - 6.0;
+    let top = pos.y < rect.top() + 6.0;
+    let bottom = pos.y > rect.bottom() - 6.0;
+    let (direction, cursor) = match (left, right, top, bottom) {
+        (true, _, true, _) => (ResizeDirection::NorthWest, CursorIcon::ResizeNwSe),
+        (_, true, true, _) => (ResizeDirection::NorthEast, CursorIcon::ResizeNeSw),
+        (true, _, _, true) => (ResizeDirection::SouthWest, CursorIcon::ResizeNeSw),
+        (_, true, _, true) => (ResizeDirection::SouthEast, CursorIcon::ResizeNwSe),
+        (true, _, _, _) => (ResizeDirection::West, CursorIcon::ResizeHorizontal),
+        (_, true, _, _) => (ResizeDirection::East, CursorIcon::ResizeHorizontal),
+        (_, _, true, _) => (ResizeDirection::North, CursorIcon::ResizeVertical),
+        (_, _, _, true) => (ResizeDirection::South, CursorIcon::ResizeVertical),
+        _ => return,
+    };
+    ui.ctx().set_cursor_icon(cursor);
+    if ui.input(|i| i.pointer.primary_pressed()) {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+    }
 }
 
 pub(crate) fn id(target: &str, role: &str) -> Id {
@@ -180,7 +278,7 @@ pub(crate) fn card(ui: &Ui) -> egui::Frame {
     egui::Frame::new()
         .fill(CARD)
         .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(10)
+        .corner_radius(16)
         .inner_margin(if ui.available_width() <= 600.0 {
             18
         } else {

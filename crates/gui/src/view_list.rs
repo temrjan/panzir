@@ -111,7 +111,7 @@ pub(crate) fn notice(ui: &mut egui::Ui, n: &Notice) -> Option<ListAction> {
     egui::Frame::new()
         .fill(theme::DANGER_BG)
         .stroke(egui::Stroke::new(1.0, theme::DANGER_BORDER))
-        .corner_radius(7)
+        .corner_radius(theme::CONTROL_RADIUS)
         .inner_margin(14)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());

@@ -1828,9 +1828,15 @@ impl App {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        theme::BACKGROUND.to_normalized_gamma_f32()
+        egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        theme::window(ui, |ui| self.show_contents(ui));
+    }
+}
+
+impl App {
+    fn show_contents(&mut self, ui: &mut egui::Ui) {
         self.take_finished();
         self.forget_stale_passphrase();
         if self.pending_meta.is_none()
